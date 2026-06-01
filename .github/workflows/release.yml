@@ -87,7 +87,7 @@ jobs:
       version: ${{ steps.compute.outputs.version }}
     steps:
       - name: Check out source (full history for git describe)
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           # ``git describe --tags --abbrev=0`` needs the tag refs in the
           # local clone. ``fetch-depth: 0`` pulls full history + all
