@@ -1,0 +1,383 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arbez"
+version = "0.1.0"
+description = "Python SDK for the Arbez open-source barcode + QR detector."
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+# Apache-2.0 commitment (S-054, 2026-05-15). Covers SDK code AND the
+# bundled object-detection model at src/arbez/_assets/arbez_yolox_s.onnx
+# (which is also Apache-2.0 — see src/arbez/_assets/NOTICE).
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{name = "The arbez authors", email = "13718822+tke1973@users.noreply.github.com"}]
+keywords = ["barcode", "qr", "detection", "decoding", "onnx", "coreml"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    # Note: per PEP 639, the License classifier is omitted in favor of
+    # the SPDX `license = "Apache-2.0"` field above. Modern PyPI +
+    # setuptools surface the license from that field directly.
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+
+# Default install: CPU-only ONNX Runtime + Pillow + zxing-cpp. No
+# PyTorch, no OpenCV, no Apple frameworks. Goal is ~35 MB / single-
+# wheel install that works on macOS arm64, Linux x86_64, Linux
+# aarch64, and Windows x86_64 out of the box, and gives a fully
+# working `Scanner()` from `pip install arbez` alone (S-034). Every
+# other backend / engine is opt-in below.
+#
+# Why zxing-cpp is core (S-034): from v0.0.20, `Scanner()` defaults
+# to ArbezEngine. ArbezEngine's pipeline is YOLOX-s (detect) +
+# zxing-cpp (decode each detected region). Without zxing-cpp the
+# default scanner would detect but not decode — useless for end
+# users. zxing-cpp ships pre-built wheels on every supported cell;
+# net wheel size is ~5 MB.
+dependencies = [
+    "numpy>=1.24",
+    # pillow floor set to 10.3 on 2026-05-15 (S-048, superseding S-047).
+    # 10.3 closes the 3 Dependabot alerts whose vulnerable code paths
+    # are actually reachable from Scanner.scan(): GHSA-3f63-hfp8-52jq
+    # (critical, RCE via image parsing, fix 10.2.0); GHSA-j7hp-h8jx-5ppr
+    # (high, libwebp OOB, fix 10.0.1); GHSA-44wm-f244-xhp3 (high, buffer
+    # overflow in image parsing, fix 10.3.0). The other 2 medium alerts
+    # (font integer overflow, PDF parser DoS) require Pillow 12.2 to fix
+    # but are not reachable from arbez — Scanner.scan() never loads fonts
+    # or parses PDFs — and are dismissed in Dependabot as not_used.
+    # Keeping the floor at 10.3 (not 12.2) preserves install compat with
+    # downstream apps that pin Pillow 10.x or 11.x.
+    "pillow>=10.3",
+    "onnxruntime>=1.18",
+    # NOTE: floor 3.0 — see comment in the legacy [zxing] alias below
+    # for why 2.2 was bumped. Pinned identically in
+    # constraints/floor.txt so install-smoke-min catches drift.
+    "zxing-cpp>=3.0",
+    # S-084 (2026-05-18): pyobjc-framework-Vision + pyobjc-framework-Quartz
+    # auto-pulled on Darwin so `pip install arbez` on macOS gives a fully
+    # working AppleVisionEngine out of the box. Pre-S-084 these lived
+    # behind the [apple-vision] extra; macOS users had to opt in via
+    # `pip install 'arbez[apple-vision]'`. The opt-in dance produced a
+    # real user papercut (see S-081 / issue #43) when a fallback-chain
+    # caller assumed apple_vision was available and the SDK returned a
+    # raw ModuleNotFoundError from the first scan().
+    #
+    # Linux / Windows installs are unchanged — the `platform_system ==
+    # 'Darwin'` marker excludes them. Net impact: ~12 MB of pyobjc into
+    # every macOS install (acceptable; users wanting the smallest
+    # possible base install on macOS can `pip install --no-deps arbez`
+    # and re-add what they want manually).
+    #
+    # The [apple-vision] extra below is kept as a no-op alias so old
+    # `pip install 'arbez[apple-vision]'` recipes keep working. Same
+    # back-compat pattern as [zxing] post-S-034.
+    "pyobjc-framework-Vision>=10.0; platform_system == 'Darwin'",
+    "pyobjc-framework-Quartz>=10.0; platform_system == 'Darwin'",
+]
+
+[project.optional-dependencies]
+# ── Backends ──────────────────────────────────────────────────────────
+coreml = [
+    "coremltools>=8.0; platform_system == 'Darwin'",
+]
+cuda = [
+    # NVIDIA CUDA execution provider for the future ArbezEngine (the
+    # ONNX-Runtime-backed Arbez model engine, ships with the v0.1.0
+    # trained weights). Today this is groundwork — none of
+    # the built-in engines use ONNX-Runtime, so installing this extra
+    # has no runtime effect on Scanner.scan() output.
+    #
+    # CAVEAT — known install conflict: ``onnxruntime`` (CPU, in the
+    # default install) and ``onnxruntime-gpu`` both provide the
+    # ``onnxruntime`` Python module. When both are installed, the
+    # last one wins. Documented in README "CUDA support" section.
+    # Recommended install pattern:
+    #   pip install arbez                  # default — CPU onnxruntime
+    #   pip install 'arbez[cuda]' --upgrade  # swap to GPU variant
+    #
+    # macOS is excluded by platform marker — Apple Silicon has no
+    # CUDA, and onnxruntime-gpu wheels don't exist for darwin anyway.
+    # Linux aarch64 doesn't get official onnxruntime-gpu wheels
+    # either (Jetson users build from source); the audit-wheels job
+    # restricts the CUDA cell to linux_x86_64 + windows_x86_64.
+    "onnxruntime-gpu>=1.18; platform_system != 'Darwin'",
+]
+# [torch] extra removed (2026-05-14). S-010 rejected PyTorch as a
+# runtime backend — onnxruntime is faster on CPU, the CUDA story is
+# simpler, and torch's 800 MB+ dependency cost isn't justified by any
+# active use case. Reinstate the extra only if a concrete use case
+# (e.g. on-device fine-tuning, training-aware inference) emerges.
+
+# ── Consensus engines ─────────────────────────────────────────────────
+apple-vision = [
+    # S-084 (2026-05-18): pyobjc-framework-Vision +
+    # pyobjc-framework-Quartz moved into core `dependencies` above with
+    # `platform_system == 'Darwin'` markers. This extra is kept as a
+    # no-op alias so `pip install 'arbez[apple-vision]'` recipes from
+    # older docs / scripts / tutorials still resolve cleanly. New
+    # macOS users can just `pip install arbez`. Same back-compat
+    # pattern as [zxing] post-S-034.
+]
+wechat = [
+    # opencv-contrib-python ships the WeChat QR detector model files
+    "opencv-contrib-python>=4.9",
+]
+zxing = [
+    # S-034 (v0.0.20): zxing-cpp is now a core dependency — included in
+    # the bare `pip install arbez`. This extra is kept as a no-op alias
+    # so `pip install 'arbez[zxing]'` from older docs / scripts /
+    # tutorials keeps working. New code should use `pip install arbez`.
+    #
+    # NOTE: floor bumped 2.2 -> 3.0 on 2026-05-13 after install-smoke-min
+    # caught AttributeError: BarcodeFormat.MicroPDF417 on the 2.2 floor.
+    # Our engine table references symbols that ONLY exist in zxing-cpp 3.0+.
+    # Keep this honest with constraints/floor.txt.
+    "zxing-cpp>=3.0",
+]
+
+# ── Image format extras (S-019) ──────────────────────────────────────
+# Optional Pillow plugins for input file formats not in core Pillow.
+# Registered lazily by arbez.engines.helpers.coerce_to_pil on first
+# call — installing the extra is the only setup needed.
+heic = [
+    # HEIC / HEIF — iPhone photo format since 2017. Wheels available
+    # on every platform we support.
+    "pillow-heif>=0.18",
+]
+avif = [
+    # AVIF — modern web image format. Same opt-in pattern.
+    "pillow-avif-plugin>=1.4",
+]
+
+# ── Bundles ──────────────────────────────────────────────────────────
+# Order mirrors the canonical engine order from S-034:
+# arbez (core) -> apple_vision -> zxing (core alias) -> wechat. The
+# [zxing] reference is a no-op alias post-S-034 but kept for explicit
+# intent and backwards compat.
+consensus = [
+    "arbez[apple-vision]",
+    "arbez[zxing]",
+    "arbez[wechat]",
+]
+all = [
+    "arbez[coreml]",
+    "arbez[consensus]",
+    "arbez[heic]",
+    "arbez[avif]",
+]
+
+# ── Profiling tools (S-035) ──────────────────────────────────────────
+# Optional dev/CI dependency for `tools/profile_scan.py` and the
+# recipes in docs/profiling.md. Both ship pure-Python wheels for
+# every supported (OS, py) cell.
+profile = [
+    # Statistical (sampling) profiler — low-overhead end-to-end
+    # wall-clock breakdown; complements stdlib cProfile.
+    "pyinstrument>=4.6",
+    # Interactive flame-graph viewer for .prof files produced by
+    # cProfile. Launches a small HTTP server with a clickable
+    # SVG; pure-Python so installs everywhere.
+    "snakeviz>=2.2",
+]
+
+# ── Dev tooling ──────────────────────────────────────────────────────
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "build>=1.2",
+    # Tests need real engines + synthetic-fixture generators. Pure-Python only
+    # so CI doesn't need system libs (no ghostscript, libdmtx, etc.).
+    "zxing-cpp>=3.0",  # matches the floor in the [zxing] extra above
+    "opencv-contrib-python>=4.9",  # matches the floor in the [wechat] extra above
+    # Apple Vision deps are Darwin-only by marker. On Linux/Windows CI
+    # cells these silently no-op, so the Apple Vision tests skip via
+    # ``pytest.importorskip("Vision")``.
+    "pyobjc-framework-Vision>=10.0; platform_system == 'Darwin'",
+    "pyobjc-framework-Quartz>=10.0; platform_system == 'Darwin'",
+    "qrcode>=7.4",
+    "python-barcode>=0.15",
+    # Hypothesis powers tests/test_fuzz.py — property-based testing for
+    # Scanner / Detection / Symbology invariants on arbitrary inputs.
+    # Pure-Python, broad platform wheels, no native deps. Defaults to
+    # 100 examples per test which is fine for our wall-clock budget;
+    # the fuzz tests cap individually via @settings.
+    "hypothesis>=6.100",
+    # Matplotlib powers the PNG charts emitted by
+    # ``examples/arbez_benchmark3.py`` alongside its CSV + JSON + MD
+    # output. Lazy-imported by the benchmark; not pulled in by any
+    # SDK code path. Dev-only dep — users running the benchmark
+    # against their own corpus install via ``pip install 'arbez[dev]'``.
+    "matplotlib>=3.9",
+    # S-086: ``arbez_benchmark3.py --pdf`` consumes these to render a
+    # single-file PDF combining REPORT.md + the 4 PNG charts. Both
+    # ship pure-Python ``py3-none-any`` wheels on every supported
+    # cell so the wheel-audit policy isn't disturbed. Lazy-imported
+    # — bench runs without ``--pdf`` don't touch them.
+    "markdown>=3.5",   # MD → HTML for fpdf2.write_html
+    "fpdf2>=2.7.4",    # HTML + image → multi-page PDF; pure-Python wheel
+    # Chart pages embed matplotlib's native PDF output via pypdf
+    # page-stamping: matplotlib writes each chart as a real PDF
+    # (TrueType-embedded fonts, selectable text, true vector
+    # geometry); pypdf overlays it onto the report's chart pages.
+    # Avoids the SVG-px-to-PDF-pt conversion the earlier SVG-embed
+    # path had to patch around. Pure-Python wheel.
+    "pypdf>=4.0",
+    # Barcode rendering for the symbology-samples appendix of the
+    # PDF report. ~15k× faster per render than treepoem; ships
+    # pure-Python wheels with libzint statically linked.
+    "pyzint>=0.1",
+]
+
+[project.urls]
+# These URLs surface on PyPI listings + in pip's package metadata.
+# Some URLs may 404 until the corresponding pages are published.
+Homepage = "https://github.com/arbez-org/arbez-sdk-python"
+Repository = "https://github.com/arbez-org/arbez-sdk-python"
+Issues = "https://github.com/arbez-org/arbez-sdk-python/issues"
+# External docs site — keep the URL stable so PyPI metadata
+# doesn't drift between releases.
+Documentation = "https://arbez.org/sdk/python"
+Changelog = "https://github.com/arbez-org/arbez-sdk-python/blob/main/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["arbez*"]
+
+[tool.setuptools.package-data]
+# PEP 561 marker: tells downstream mypy/pyright that ``arbez`` ships
+# inline type hints. Without it, ``from arbez import Detection`` shows
+# up as Any in user code, defeating our strict-mypy posture.
+#
+# Also bundle the YOLOX-s weights (S-029) — ~36 MB ONNX file
+# loaded by ArbezEngine() when no model_path is supplied.
+#
+# Pin the exact filename (not a ``*.onnx`` glob): a glob can sweep an
+# unrelated ``.onnx`` left in a stale ``build/`` staging dir into the
+# wheel. Only the one tracked asset ships.
+#
+# Plus the model-specific LICENSE + NOTICE next to the .onnx (S-054):
+# Apache-2.0 covers both code and weights; the in-tree LICENSE +
+# NOTICE files ride along in the wheel so downstream users always
+# have the model's license + attribution at hand without having
+# to consult the source repo.
+"arbez" = ["py.typed", "_assets/arbez_yolox_s.onnx", "_assets/LICENSE", "_assets/NOTICE"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF", "D"]
+ignore = [
+    "E501",  # line length handled by formatter
+    # ── pydocstyle ignores (S-057) ──────────────────────────────────
+    # Skip the docstring rules we deliberately don't enforce, per the
+    # stratified-strictness model. Rationale per S-057 in DECISIONS.md.
+    "D105",  # undocumented magic methods (__repr__ etc. — usually obvious)
+    "D107",  # undocumented __init__ (we document the class instead)
+    "D203",  # incorrect-blank-line-before-class (conflicts with D211; ruff prefers D211)
+    "D205",  # 1 blank line between summary + description — too strict for
+             # arbez's writing style. Many docstrings have a long first-line
+             # paragraph that wraps to a second line as part of the same
+             # sentence; D205 reads that as "summary + description without
+             # blank" but the content IS the summary. Forcing one-line
+             # summaries would degrade readability of legitimately complex
+             # function descriptions. D100/D101/D102/D103 already enforce
+             # that docstrings exist; D400 enforces period termination.
+    "D213",  # multi-line-summary-second-line (conflicts with D212; we use first-line summary)
+    "D401",  # non-imperative mood (style debate, not correctness)
+    "D301",  # escape-sequence-in-docstring (false positives on code examples)
+    "D404",  # docstring starts with "This" (style preference, low signal)
+    "D415",  # first line should end with punctuation (D400 already covers periods)
+]
+
+# S-057: docstring requirements relax outside of the public-API surface.
+# Tests and tools need module-level docs (so a maintainer knows what each
+# file is for) but per-class/method/function docstrings are optional
+# scaffolding-quality decisions.
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D101", "D102", "D103", "D106", "D209", "D413"]
+"tools/**" = ["D101", "D102", "D103", "D106", "D209", "D413"]
+"examples/**" = ["D101", "D102", "D103", "D106", "D209", "D413"]
+
+# Pydocstyle config — no convention (we use freeform Sphinx-flavored
+# docstrings, not Google or NumPy style). Setting convention="pep257"
+# would auto-enable a subset we don't want; explicit `select` above
+# is the source of truth.
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+# The checkpoint-to-ONNX conversion tool imports torch + yolox + onnx —
+# build-time only, NOT runtime deps (S-030 / S-031). The script runs on
+# a developer machine that has these installed; CI doesn't, and we don't
+# want to pay the ~800 MB torch wheel + yolox install to satisfy mypy
+# strict. Exclude the file entirely.
+exclude = [
+    "tools/convert_.*ckpt_to_onnx\\.py$",
+]
+
+# zxing-cpp / qrcode / python-barcode / cv2 ship no type stubs as of 2026-05.
+# Treat them as Any inside the SDK rather than peppering ``# type: ignore``
+# at every callsite. When upstream stubs land, remove these overrides.
+[[tool.mypy.overrides]]
+# No upstream type stubs for any of these as of 2026-05.
+# Listed top-level only (not ``.*`` submodule globs) — the SDK only
+# imports the top-level name in every case, and unused override sections
+# emit a mypy note we'd rather not see.
+module = [
+    "zxingcpp",
+    "qrcode",
+    "barcode",
+    "barcode.writer",
+    "cv2",
+    # Optional Pillow plugins for HEIC / AVIF (S-019). Loaded lazily;
+    # treat as Any when not installed. The lazy-load path catches
+    # ImportError gracefully — type-checker just needs to not whine.
+    "pillow_heif",
+    "pillow_avif",
+    # ONNX Runtime — its py.typed marker is inconsistent across the
+    # onnxruntime / onnxruntime-gpu variants; treat as Any. arbez.acceleration
+    # only uses get_available_providers() which is well-typed via the
+    # tuple[str, ...] return contract we wrap it in.
+    "onnxruntime",
+    # pyobjc frameworks (Darwin-only). On non-Darwin runners these
+    # aren't installed; mypy treats the imports as Any either way.
+    "Vision",
+    "Foundation",
+    "Quartz",
+    # pyobjc-core itself — ``objc.autorelease_pool`` is used by
+    # ``AppleVisionEngine.detect_and_decode`` (S-042 leak fix). No
+    # py.typed in pyobjc-core as of 12.1; whole module is Any.
+    "objc",
+    # hypothesis has its own stubs but its strategies API uses heavy
+    # typing patterns that don't always survive strict mypy; let the
+    # tests-side decorators be Any.
+    "hypothesis",
+    "hypothesis.strategies",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"

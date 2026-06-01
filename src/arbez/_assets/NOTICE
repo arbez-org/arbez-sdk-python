@@ -1,0 +1,38 @@
+arbez_yolox_s.onnx — bundled object-detection model
+Copyright 2026 The arbez authors
+Licensed under the Apache License, Version 2.0 (see ./LICENSE in this
+directory; identical to the top-level repository LICENSE).
+
+
+Model architecture
+------------------
+Derived from YOLOX-s.
+Source: https://github.com/Megvii-BaseDetection/YOLOX
+Copyright (c) 2021-2022 Megvii Inc.
+Licensed under the Apache License, Version 2.0.
+
+
+Training pipeline + dataset attributions
+-----------------------------------------
+Full provenance — training corpus, augmentation pipeline, training
+hyperparameters, evaluation methodology — is documented in the project
+repository.
+
+
+Model version
+-------------
+``model_version = 0.1.0``.
+
+These weights are the detection model bundled with this SDK release.
+Training corpus, augmentation, and evaluation methodology are documented
+in the project repository.
+
+
+License
+-------
+This model file (``arbez_yolox_s.onnx``) and any subsequent versions
+bundled into the arbez SDK distribution are licensed under the Apache
+License, Version 2.0.
+
+No additional use restrictions apply beyond the standard Apache-2.0
+terms (attribution, patent grant, redistribution, no warranty).

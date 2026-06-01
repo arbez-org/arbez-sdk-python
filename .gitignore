@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Test + coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Type-checker caches
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Model artefacts (downloaded to a user cache, never committed)
+# Exception: the bundled YOLOX-s model weights ship in the wheel.
+# Anything ELSE matching the patterns below stays ignored.
+*.onnx
+!src/arbez/_assets/*.onnx
+*.mlpackage/
+*.mlmodel
+*.tflite
+*.pt
+*.ckpt
+
+# Local data — never commit images or test corpora
+data/
+fixtures/large/
+tests/_local_only/
+.private/

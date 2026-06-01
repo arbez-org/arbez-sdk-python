@@ -1,0 +1,58 @@
+# Floor versions — the LOWEST version of every direct dep we advertise
+# in pyproject.toml. Used by the install-smoke-min CI job to verify our
+# advertised ranges aren't lies.
+#
+# When you bump a `>=` lower bound in pyproject.toml, bump the matching
+# pin here. When pip resolves the install with `--constraint floor.txt`,
+# pip MUST pick this exact version (constraints "==" beat range lower
+# bounds). The install-smoke-min job then runs the 5-liner against this
+# floor, proving the advertised range actually works.
+#
+# Single source of truth — keep in lockstep with pyproject.toml's
+# `dependencies` and the relevant extras.
+#
+# Not for end users. End users install arbez normally and let pip pick
+# the latest of everything within our advertised ranges.
+#
+# DEPENDABOT-IGNORED (S-085, 2026-05-18): every dep pinned in this file
+# is listed in `.github/dependabot.yml` under the `pip` ecosystem's
+# `ignore:` block so dependabot never proposes a floor bump
+# automatically. Floor bumps must be DELIBERATE (a paired pyproject +
+# floor.txt change in a real ADR — e.g. "we're dropping py3.10 support,
+# so the numpy floor moves from 1.24 to X"). The original false-fire
+# was PR #42 (closed 2026-05-18); see ADR S-085 in DECISIONS.md. When
+# adding a new dep here, ALSO add it to dependabot.yml's `ignore:`
+# block — otherwise the same misfire repeats on the next patch cycle.
+# Note: security alerts (dependabot's separate vulnerability flow) are
+# NOT affected by `ignore:` and will still open PRs for known-vulnerable
+# versions of these deps.
+
+# ── default install ───────────────────────────────────────────────────
+# zxing-cpp moved into core deps in v0.0.20 (S-034) — `pip install
+# arbez` (no extras) now pulls it for the default ArbezEngine's
+# classical-decoder pass.
+#
+# zxing-cpp bumped 2.2 -> 3.0 on 2026-05-13. install-smoke-min on
+# py3.10 caught AttributeError: BarcodeFormat.MicroPDF417 — the symbol
+# doesn't exist until zxing-cpp 3.0. The advertised pyproject floor
+# must match.
+numpy==1.24.0
+# pillow floor at 10.3.0 (S-048, superseding S-047). 10.3 closes the
+# 3 Dependabot alerts whose vulnerable code paths are reachable from
+# Scanner.scan() (RCE, libwebp OOB, buffer overflow); the remaining
+# 2 medium alerts (fonts, PDF parser) are dismissed in Dependabot
+# as not_used. install-smoke-min validates this floor on every CI run.
+pillow==10.3.0
+onnxruntime==1.18.0
+zxing-cpp==3.0.0
+
+# S-084 (2026-05-18): pyobjc-framework-Vision + pyobjc-framework-Quartz
+# moved into core dependencies, auto-pulled on Darwin so a bare
+# `pip install arbez` on macOS gets a working AppleVisionEngine.
+# Platform marker matches the one in pyproject.toml; Linux/Windows
+# install-smoke runs ignore these floors entirely (no wheel installed).
+pyobjc-framework-Vision==10.0  ; platform_system == 'Darwin'
+pyobjc-framework-Quartz==10.0  ; platform_system == 'Darwin'
+
+# ── arbez[wechat] extra (not yet exercised by smoke; pin for parity) ──
+opencv-contrib-python==4.9.0.80

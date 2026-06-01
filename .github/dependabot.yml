@@ -1,0 +1,81 @@
+# Dependabot version-updates configuration (S-043).
+#
+# Three Dependabot features are now active on this repo:
+#   1. Alerts        — flags known-vulnerable dep versions (via API, no
+#                      config file needed; runs on GitHub's advisory db).
+#   2. Security updates — auto-opens PRs to bump vulnerable deps to a
+#                         fixed version. Also configured via the API.
+#   3. Version updates — auto-opens PRs to keep dep versions fresh
+#                        (NOT vulnerability-driven). This file
+#                        configures #3.
+#
+# Cadence: weekly, off-hours Singapore time, capped at small batches
+# so we don't get flooded.
+
+version: 2
+updates:
+  # ── Python package deps (pyproject.toml) ──────────────────────────
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Singapore"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "python"
+    # Group minor / patch bumps into a single PR per ecosystem; major
+    # bumps get their own PR each (more likely to be breaking).
+    groups:
+      python-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    # Ignore deps surfaced exclusively from ``constraints/floor.txt``
+    # (S-085, 2026-05-18). That file pins each dep to the LOWEST version
+    # we advertise in pyproject.toml's ``>=`` bounds; the FLOOR-smoke
+    # CI job uses it to verify our advertised ranges aren't lies.
+    # Bumping a floor pin via dependabot would turn a "test against the
+    # lowest we promise" guarantee into a "test against latest" run and
+    # silently mask the next floor-drift bug. Floor bumps should always
+    # be deliberate (paired pyproject + floor.txt change in a real ADR).
+    #
+    # The ``ignore`` directive applies per dependency name; we list the
+    # exact deps that have FLOOR pins. New deps added to floor.txt MUST
+    # also be added here — otherwise dependabot will try to bump the
+    # floor again and PR #42 (closed 2026-05-18, the original false-fire)
+    # will repeat. Lockstep with constraints/floor.txt.
+    ignore:
+      - dependency-name: "numpy"
+      - dependency-name: "pillow"
+      - dependency-name: "onnxruntime"
+      - dependency-name: "zxing-cpp"
+      - dependency-name: "pyobjc-framework-Vision"
+      - dependency-name: "pyobjc-framework-Quartz"
+      - dependency-name: "opencv-contrib-python"
+    # Default reviewer: the maintainer. (Adding a placeholder; can be
+    # updated when the team grows.)
+    reviewers:
+      - "tke1973"
+
+  # ── GitHub Actions workflows (.github/workflows/*.yml) ────────────
+  # Pin third-party actions to a SHA, not just a version — GitHub's
+  # docs recommend this for supply-chain safety. Dependabot keeps the
+  # SHA + the human-readable version comment in sync.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Asia/Singapore"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "github-actions"
+    reviewers:
+      - "tke1973"
