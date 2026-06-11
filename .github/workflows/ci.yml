@@ -1,0 +1,302 @@
+name: CI — lint + types + tests + wheel matrix + install smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Catch upstream regressions even when we're not pushing: a weekly wheel
+  # audit will red-CI the day a dep drops a cell from our matrix.
+  schedule:
+    - cron: "37 6 * * 1"  # Monday 06:37 UTC — off the :00 to dodge fleet contention
+
+permissions:
+  contents: read
+
+env:
+  # Opt every action into Node 24 ahead of GitHub's June-2026 forced flip.
+  # Even ``actions/*@v5`` actions still ship Node-20 binaries today; this
+  # silences the deprecation warning on every run and prevents a surprise
+  # break-day when GitHub forces the switch. Per the GH announcement at
+  # https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  # ── Job 1 — lint + types + tests, in the same shape we run locally ─────
+  lint-test:
+    name: lint + types + tests (py${{ matrix.python }} on ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        # macos-latest = Apple Silicon (arm64). Intel-Mac (macos-13) is
+        # intentionally out — see DECISIONS.md S-006 update 2026-05-13.
+        # ubuntu-24.04-arm = native aarch64, no QEMU emulation tax.
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      # Use ``python -m pip`` (not bare ``pip``) for self-upgrade — bare pip
+      # refuses to overwrite itself in-place on Windows. Caught by py3.11
+      # × windows-latest in run 25809092803. Apply the same rule everywhere
+      # so the workflow doesn't have OS-specific branches.
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: ruff check src/ tests/ tools/
+      # tests/ is now type-checked under strict mode too — tests/__init__.py
+      # makes the directory a proper package and the corpus + parametrize
+      # blocks were written with explicit ``set[str]`` annotations etc.
+      - run: mypy src/arbez/ tools/ tests/
+      - run: pytest -q tests/
+
+  # ── Job 2 — wheel-matrix audit (the S-006 contract) ────────────────────
+  # Doesn't actually install on every platform — it asks pip "would you
+  # be able to install our native deps as wheels on platform X with
+  # python Y?" for every cell in the S-006 matrix. Runs on a single
+  # ubuntu runner because `pip download --platform=...` is host-agnostic.
+  audit-wheels:
+    name: wheel audit (every cell strict)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: python -m pip install --upgrade pip
+      - run: python tools/audit_wheels.py --strict --python 3.10 3.11 3.12 3.13 3.14
+
+  # ── Job 3 — build the universal sdist + wheel and verify with twine ───
+  # We ship one ``py3-none-any`` wheel. This job builds it and runs
+  # ``twine check`` to catch README / metadata bugs before PyPI does.
+  # The artifact is consumed by install-smoke below so we test the
+  # SAME wheel users will get from PyPI, not an editable install.
+  build-sdist-wheel:
+    name: build sdist + universal wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: python -m pip install --upgrade pip build twine
+      - run: python -m build
+      - run: twine check dist/*
+      - uses: actions/upload-artifact@v5
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  # ── Job 4 — install smoke (S-006 "5-liner always works" guarantee) ─────
+  # Does what a real user does: fresh venv → pip install the built wheel
+  # → import → run the literal five-liner against a synthetic QR. If
+  # this is ever red, S-006's promise is broken (audit_wheels.py proves
+  # wheels EXIST; this proves they IMPORT + RUN on a clean machine).
+  install-smoke:
+    name: install smoke (py${{ matrix.python }} on ${{ matrix.os }})
+    needs: build-sdist-wheel
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v5
+        with:
+          name: dist
+          path: dist/
+      # Build a brand-new venv that has NOTHING but the wheel + the
+      # consensus extras + qrcode (smoke driver generates the test QR).
+      # No dev extras, no editable, no system Python state — same
+      # surface a first-time end user sees.
+      - name: Create fresh venv + install built wheel
+        shell: bash
+        run: |
+          python -m venv /tmp/freshvenv
+          if [ -f /tmp/freshvenv/bin/python ]; then
+              VPY=/tmp/freshvenv/bin/python
+          else
+              VPY=/tmp/freshvenv/Scripts/python.exe
+          fi
+          echo "VPY=$VPY" >> "$GITHUB_ENV"
+          "$VPY" -m pip install --upgrade pip
+          # Install built wheel + both consensus extras (each adds an
+          # engine our 5-liner / Scanner may invoke) + qrcode for the
+          # smoke fixture. One pip call so resolver sees all deps.
+          WHEEL=$(ls dist/arbez-*.whl | head -1)
+          "$VPY" -m pip install "${WHEEL}[zxing,wechat]" qrcode
+      - name: Verify the 5-liner (ZXing) runs against a freshly-generated QR
+        shell: bash
+        run: |
+          "$VPY" examples/five_liner_smoke.py
+      - name: Verify WeChat engine decodes the same QR
+        # Inline — single quick check that the [wechat] extra resolves
+        # AND WeChatEngine runs end-to-end on this (OS, py) cell.
+        shell: bash
+        run: |
+          "$VPY" -c "
+          import qrcode
+          from arbez.engines.wechat import WeChatEngine
+          qr = qrcode.QRCode(version=2, box_size=10, border=4)
+          qr.add_data('https://arbez.org/wechat-install-smoke')
+          qr.make(fit=True)
+          img = qr.make_image(fill_color='black', back_color='white').convert('RGB')
+          dets = WeChatEngine().detect_and_decode(img)
+          assert len(dets) == 1, 'WeChat: expected 1 detection'
+          assert dets[0].payload == 'https://arbez.org/wechat-install-smoke'
+          print('[OK] WeChat install smoke: decoded', dets[0].payload)
+          "
+      # ── macOS-only Apple Vision smoke ─────────────────────────────────
+      # [apple-vision] is gated by ``platform_system == 'Darwin'`` in
+      # pyproject — non-Darwin runners can't install it, so the install
+      # AND the smoke step both run only when the runner is macOS.
+      - name: Install [apple-vision] extra (macOS only)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          "$VPY" -m pip install "$(ls dist/arbez-*.whl | head -1)[apple-vision]"
+      - name: Verify Apple Vision decodes the same QR (macOS only)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          "$VPY" -c "
+          import qrcode
+          from arbez.engines.apple_vision import AppleVisionEngine
+          qr = qrcode.QRCode(version=2, box_size=10, border=4)
+          qr.add_data('https://arbez.org/vision-install-smoke')
+          qr.make(fit=True)
+          img = qr.make_image(fill_color='black', back_color='white').convert('RGB')
+          dets = AppleVisionEngine().detect_and_decode(img)
+          assert len(dets) == 1, 'Apple Vision: expected 1 detection'
+          assert dets[0].payload == 'https://arbez.org/vision-install-smoke'
+          assert dets[0].score > 0.5, 'Apple Vision: low confidence'
+          print('[OK] Apple Vision install smoke: decoded',
+                dets[0].payload, 'confidence=', dets[0].score)
+          "
+
+      # ── Run a curated test subset against the BUILT wheel ─────────────
+      # Closes the gap between lint-test (editable install on every
+      # cell) and install-smoke (BUILT wheel, single 5-liner check).
+      # Three test modules give ~80 assertions of real coverage on the
+      # SHIPPING surface — not on the editable source tree:
+      #
+      #   test_smoke.py        public API + Scanner default + Symbology
+      #                        invariants
+      #   test_fuzz.py         Hypothesis property tests — Scanner +
+      #                        Detection + coerce_to_pil invariants
+      #                        against arbitrary inputs
+      #   test_corpus.py       per-engine round-trip on 16 deterministic
+      #                        specimens (every supported symbology)
+      #
+      # Intentionally NOT included:
+      #   test_corpus_composite.py — slower (~37 cases), and lint-test
+      #     already covers it on the same matrix.
+      #   test_zxing.py / test_wechat.py / test_apple_vision.py — engine
+      #     internals don't change between editable + wheel install.
+      #   test_engine_protocol.py / test_scanner_auto.py — public-API
+      #     surface tests covered by test_smoke.py for wheel purposes.
+      #
+      # Apple Vision tests auto-skip on non-Darwin via
+      # ``pytest.importorskip("Vision")``; same for hypothesis-driven
+      # tests on platforms without test deps installed.
+      - name: Install test dependencies into the fresh venv
+        shell: bash
+        run: |
+          "$VPY" -m pip install pytest hypothesis python-barcode
+      - name: Run curated test subset against the BUILT wheel
+        shell: bash
+        run: |
+          "$VPY" -m pytest -q \
+              tests/test_smoke.py \
+              tests/test_fuzz.py \
+              tests/test_corpus.py
+
+      - name: Show what got installed (for debug on failures)
+        if: failure()
+        shell: bash
+        run: |
+          "$VPY" -m pip list
+          "$VPY" -c "import arbez, sys; print('arbez at', arbez.__file__); print('python', sys.version)"
+
+  # ── Job 5 — install smoke at the FLOOR versions (S-006 range honesty) ──
+  # Proves arbez actually works at the bottom of every advertised range.
+  # Reading pyproject.toml's ``numpy>=1.24`` is just a claim until something
+  # installs numpy==1.24 and runs the 5-liner against it. Without this
+  # job, a user with another lib that forces ``numpy<2.0`` could install
+  # arbez fine (resolver finds numpy 1.x), then crash at import because
+  # we silently used a numpy 2.x-only API.
+  #
+  # Python 3.10 ONLY — because the advertised floor (numpy==1.24.0,
+  # pillow==10.0.0, onnxruntime==1.18.0, zxing-cpp==2.2.0) doesn't have
+  # pre-built wheels for Python 3.11+ on every (dep, version) pair.
+  # numpy 1.24 in particular has no cp313 wheels — Python 3.13 support
+  # arrived in numpy 2.0. The "effective" floor on py3.11+ is whatever
+  # the lowest version with wheels is for that Python, which pip
+  # discovers naturally. Running the floor smoke on py3.10 catches
+  # API-version regressions (e.g. "we silently used a numpy 2.x-only
+  # function") on the one Python where the advertised floor is real.
+  install-smoke-min:
+    name: install smoke @ FLOOR versions (py3.10 on linux)
+    needs: build-sdist-wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - uses: actions/download-artifact@v5
+        with:
+          name: dist
+          path: dist/
+      - name: Install at FLOOR versions (wheel-only — no sdist fallback)
+        run: |
+          python -m venv /tmp/floorvenv
+          /tmp/floorvenv/bin/python -m pip install --upgrade pip
+          WHEEL=$(ls dist/arbez-*.whl | head -1)
+          # ``--only-binary=:all:`` ensures the floor versions resolve
+          # to actual pre-built wheels, not sdist-then-compile (which is
+          # what catches the case where our advertised floor doesn't
+          # ship a wheel for this cell — that's itself a real-user
+          # failure mode, not a CI-config bug).
+          # Install BOTH consensus extras so every engine's floor is
+          # exercised in one job — previous WeChat floor bug would
+          # have hid behind a [zxing]-only install.
+          /tmp/floorvenv/bin/python -m pip install \
+              --only-binary=:all: \
+              --constraint constraints/floor.txt \
+              "${WHEEL}[zxing,wechat]" qrcode
+      - name: Verify ZXing 5-liner against the floor stack
+        run: /tmp/floorvenv/bin/python examples/five_liner_smoke.py
+      - name: Verify WeChat engine works against the floor stack
+        # Inline rather than a separate script — we want the floor
+        # check to exercise WeChatEngine().detect_and_decode() ONCE,
+        # not become a parallel five_liner.
+        run: |
+          /tmp/floorvenv/bin/python -c "
+          import qrcode
+          from arbez.engines.wechat import WeChatEngine
+          qr = qrcode.QRCode(version=2, box_size=10, border=4)
+          qr.add_data('https://arbez.org/wechat-floor-smoke')
+          qr.make(fit=True)
+          img = qr.make_image(fill_color='black', back_color='white').convert('RGB')
+          dets = WeChatEngine().detect_and_decode(img)
+          assert len(dets) == 1, f'expected 1 detection, got {len(dets)}'
+          assert dets[0].payload == 'https://arbez.org/wechat-floor-smoke'
+          print('[OK] WeChat floor smoke: decoded', dets[0].payload)
+          "
+      - name: Dump installed versions (always — useful baseline)
+        if: always()
+        run: /tmp/floorvenv/bin/python -m pip list

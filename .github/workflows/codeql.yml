@@ -1,0 +1,76 @@
+name: CodeQL — security-and-quality (explicit)
+
+# Explicit CodeQL workflow (S-022). Replaces the GitHub-managed
+# "Code Quality: Push on main" Default Setup workflow that GitHub
+# auto-injects when Code Security is enabled. Reasons to make it
+# explicit:
+#
+# 1. **Query suite control.** Default Setup uses the ``security``
+#    query pack. We want ``security-and-quality`` — strictly larger
+#    set, catches additional code-quality issues like dead code,
+#    inconsistent return types, suspicious comparisons that the
+#    security-only pack skips.
+#
+# 2. **Visibility.** A file in .github/workflows/ is reviewable +
+#    editable + versioned. The dynamic GitHub-managed workflow is
+#    invisible to contributors and can't be modified.
+#
+# 3. **Schedule.** Default Setup runs on push + on a weekly cron
+#    that GitHub picks; we set our own (Monday 06:51 UTC, off the
+#    :00 to dodge fleet contention — same logic as ci.yml's
+#    weekly audit-wheels).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly. Catches upstream CodeQL query updates without waiting
+    # for a manual push.
+    - cron: "51 6 * * 1"  # Monday 06:51 UTC
+
+permissions:
+  # Required for SARIF upload to the Security tab.
+  security-events: write
+  # Required for the analysis itself.
+  contents: read
+  actions: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Python is the only first-party language. GitHub Actions
+        # YAML doesn't need a separate analysis pass on a Python-only
+        # repo (the dynamic workflow analyzes "actions" too, which
+        # is just lint on the workflow files — limited value).
+        language: ["python"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          # ``security-and-quality`` is the broadest query suite —
+          # strictly a superset of the default ``security`` suite.
+          # Adds code-quality queries (unused imports, unreachable
+          # code, suspicious-comparisons, etc.) on top of the
+          # security queries.
+          queries: security-and-quality
+
+      - name: Autobuild (if needed)
+        uses: github/codeql-action/autobuild@v4
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"

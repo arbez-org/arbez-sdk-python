@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using these metadata."
+title: "arbez — Python SDK for the Arbez barcode and QR detector"
+authors:
+  - name: "The arbez authors"
+url: "https://github.com/arbez-org/arbez-sdk-python"
+repository-code: "https://github.com/arbez-org/arbez-sdk-python"
+license: Apache-2.0
+type: software
+version: "0.1.0"
+date-released: "2026-06-11"
+keywords:
+  - barcode
+  - qr-code
+  - object-detection
+  - apple-neural-engine
+  - onnx
+  - core-ml
+  - computer-vision

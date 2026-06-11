@@ -1,0 +1,13 @@
+{
+  "assets": {
+    "arbez_yolox_s.onnx": {
+      "arch": "yolox_s",
+      "num_classes": 14,
+      "path": "src/arbez/_assets/arbez_yolox_s.onnx",
+      "post_clean_sha256": "6840f35c9ac85187ac7e6f5281b0df1b9a17ef875618f01118f7ff24c475e64c",
+      "post_clean_size_bytes": 36313222
+    }
+  },
+  "comment": "Records the sha256 and size of the bundled ONNX model. CI verifies the bundled ONNX sha256 against this file at release time.",
+  "version": 1
+}

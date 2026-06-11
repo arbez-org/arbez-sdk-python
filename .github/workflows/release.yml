@@ -1,0 +1,328 @@
+# S-063 (2026-05-16) — Split publish targets:
+#
+#   - every push to ``main`` → TestPyPI (continuous-deploy dev train)
+#   - every ``v*`` tag       → Production PyPI
+#
+# Refined by S-074 (2026-05-17): the v0.1.0+ gate on production
+# PyPI was removed. Any maintainer-tagged ``vX.Y.Z`` (including
+# early ``0.0.x`` milestones) publishes to real PyPI now, so
+# users get clean ``pip install arbez`` access to the latest
+# tagged milestone without needing TestPyPI knowledge.
+#
+# Triggers:
+#   - ``push`` to ``main``           → TestPyPI publish, version
+#                                       computed as ``<pyproject-version>.dev<run_number>``
+#                                       per PEP 440.
+#   - ``push`` of a ``v*`` tag        → Production PyPI publish, version
+#                                       from the tag (any vX.Y.Z accepted
+#                                       since S-074; previously v0.1.0+ only).
+#   - ``workflow_dispatch``           → same dev-version path as a main
+#                                       push, useful for dry-runs.
+#
+# Why the split: untagged main commits are dev-train noise meant
+# for maintainer validation; tags are the explicit "this one is
+# ready for end users" act. TestPyPI gets every commit; PyPI gets
+# every maintainer-blessed tag.
+#
+# Authentication: **PyPI Trusted Publishing via OIDC** on both indexes.
+# No API tokens are stored in the repo. Chain of trust:
+#
+#   TestPyPI:
+#     1. test.pypi.org has a "pending publisher" registered for
+#        project=arbez, owner=arbez-org, repo=arbez-sdk-python,
+#        workflow=release.yml, environment=testpypi.
+#     2. The ``publish-testpypi`` job declares ``environment: testpypi``
+#        and requests an OIDC token via ``id-token: write``.
+#     3. ``pypa/gh-action-pypi-publish`` exchanges that token for a
+#        short-lived upload token via TestPyPI's API.
+#     4. Action uploads the dist files.
+#
+#   Production PyPI:
+#     1. pypi.org has a "pending publisher" registered for
+#        project=arbez, owner=arbez-org, repo=arbez-sdk-python,
+#        workflow=release.yml, environment=pypi.
+#     2. Same OIDC dance, against pypi.org instead of test.pypi.org.
+#
+# Setup the maintainer must do once per index (browser-only, no API):
+# register the pending publisher. Documented in DECISIONS.md S-056
+# (TestPyPI) and S-063 (PyPI prod + this split).
+#
+# Dev-version scheme (TestPyPI publishes):
+#   ``pyproject.toml`` and ``src/arbez/__init__.py`` carry the version
+#   of the release UNDER DEVELOPMENT (e.g. ``0.1.0`` before the v0.1.0
+#   tag exists). The build step injects a dev suffix at build time
+#   only — the working tree never carries it. Pattern:
+#
+#     <pyproject-version>.dev<github_run_number>
+#
+#   Example: while pyproject.toml says 0.1.0, run #425 publishes
+#   ``arbez-0.1.0.dev425`` to TestPyPI. PEP 440 sorts
+#   ``0.0.38.post9 < 0.1.0.dev425 < 0.1.0`` — the dev train sorts
+#   above every previously released version and below the final
+#   release, so the latest dev build always wins on TestPyPI, even
+#   in a repo with no tags yet. (Dev releases are pre-releases to
+#   pip: ``pip install --index-url https://test.pypi.org/simple/
+#   --pre arbez`` to pull the dev train.)
+
+name: release — TestPyPI on push to main, PyPI on any vX.Y.Z tag
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Why the manual run (recorded in run log)"
+        required: false
+        default: "manual dry-run"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build sdist + wheel (with target detection)
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.compute.outputs.target }}
+      version: ${{ steps.compute.outputs.version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build
+
+      - name: Verify bundled-model manifest (S-064)
+        # The bundled ONNX(s) under src/arbez/_assets/ are managed by
+        # tools/sync_bundled_model.py and pinned by sha256 in
+        # bundled_model.lock.json at the repo root. CI re-computes the
+        # sha256 of every asset on disk and fails if any drifts from
+        # the manifest — catches hand-edits, accidental commits of an
+        # un-cleaned model, or any tampering between sync time and
+        # publish time. This step runs for EVERY trigger (push to
+        # main, tag, workflow_dispatch) so the dev train and the
+        # tagged release are both gated.
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          manifest_path = pathlib.Path("bundled_model.lock.json")
+          if not manifest_path.is_file():
+              print("ERROR: bundled_model.lock.json missing at repo root.")
+              print("       Run: python tools/sync_bundled_model.py")
+              sys.exit(1)
+
+          manifest = json.loads(manifest_path.read_text())
+          assets = manifest.get("assets", {})
+          if not assets:
+              print("ERROR: bundled_model.lock.json has no assets entries.")
+              sys.exit(1)
+
+          ok = True
+          for asset_name, info in assets.items():
+              p = pathlib.Path(info["path"])
+              expected = info["post_clean_sha256"]
+              if not p.is_file():
+                  print(f"FAIL: {p} listed in manifest but missing on disk")
+                  ok = False
+                  continue
+              h = hashlib.sha256()
+              with p.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1 << 20), b""):
+                      h.update(chunk)
+              actual = h.hexdigest()
+              if actual != expected:
+                  print(f"FAIL: {p} sha256 mismatch")
+                  print(f"  expected: {expected}")
+                  print(f"  actual:   {actual}")
+                  print(f"  source:   {info.get('source', {}).get('s3_uri', 'n/a')}")
+                  ok = False
+              else:
+                  print(f"OK: {p} sha256 matches manifest")
+
+          if not ok:
+              print()
+              print("::error::Bundled model sha256(s) drifted from manifest.")
+              print("::error::To fix: re-run `python tools/sync_bundled_model.py`")
+              print("::error::and commit BOTH the updated asset and the")
+              print("::error::regenerated bundled_model.lock.json.")
+              sys.exit(1)
+          PY
+
+      - name: Compute target + version
+        id: compute
+        env:
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # ─── Tag push → Production PyPI ─────────────────────────
+            tag_version="${GITHUB_REF#refs/tags/v}"
+            pkg_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+
+            if [ "$tag_version" != "$pkg_version" ]; then
+              echo "::error::Tag v${tag_version} does not match pyproject version ${pkg_version}."
+              echo "::error::Bump pyproject.toml + src/arbez/__init__.py + CHANGELOG.md + docs/README.md to ${tag_version} before tagging."
+              exit 1
+            fi
+
+            # S-074 (2026-05-17): the pre-v0.1.0 hard gate was
+            # removed. Any maintainer-tagged ``vX.Y.Z`` push now
+            # publishes to production PyPI, including ``0.0.x``
+            # milestones. Rationale: the dev train +
+            # ``.devN`` covers continuous validation on TestPyPI;
+            # the tag is the explicit maintainer act of "this one
+            # is ready for end users." S-063's split (dev train on
+            # main -> TestPyPI; tag -> PyPI) is preserved; only
+            # the v0.1.0+ gate was removed.
+
+            echo "target=pypi" >> "$GITHUB_OUTPUT"
+            echo "version=${tag_version}" >> "$GITHUB_OUTPUT"
+            echo "OK: will publish ${tag_version} to production PyPI."
+
+          else
+            # ─── Push to main or workflow_dispatch → TestPyPI dev ───
+            # Base the dev version on pyproject.toml's version — the
+            # release under development. PEP 440 sorts ``<base>.devN``
+            # below the final ``<base>`` and above every earlier
+            # release, so the latest dev build always wins on TestPyPI
+            # even in a repo with no tags yet.
+            pkg_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+            dev_version="${pkg_version}.dev${GITHUB_RUN_NUMBER}"
+
+            echo "target=testpypi" >> "$GITHUB_OUTPUT"
+            echo "version=${dev_version}" >> "$GITHUB_OUTPUT"
+            echo "OK: will publish ${dev_version} to TestPyPI (dev train)."
+          fi
+
+      - name: Inject computed version into pyproject.toml + __init__.py
+        # Only needed for the TestPyPI path. Tag publishes use the
+        # version that's already in the working tree (verified above
+        # to match the tag).
+        if: steps.compute.outputs.target == 'testpypi'
+        env:
+          TARGET_VERSION: ${{ steps.compute.outputs.version }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          target = os.environ["TARGET_VERSION"]
+
+          # 1. pyproject.toml
+          pp = pathlib.Path("pyproject.toml")
+          text = pp.read_text()
+          new_text, n = re.subn(
+              r'^version\s*=\s*".*"',
+              f'version = "{target}"',
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          assert n == 1, "did not find/replace version line in pyproject.toml"
+          pp.write_text(new_text)
+          print(f"pyproject.toml version → {target}")
+
+          # 2. src/arbez/__init__.py
+          init = pathlib.Path("src/arbez/__init__.py")
+          itxt = init.read_text()
+          new_itxt, n2 = re.subn(
+              r'^__version__\s*=\s*".*"',
+              f'__version__ = "{target}"',
+              itxt,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          assert n2 == 1, "did not find/replace __version__ line in __init__.py"
+          init.write_text(new_itxt)
+          print(f"src/arbez/__init__.py __version__ → {target}")
+          PY
+
+      - name: Build sdist + wheel
+        run: python -m build
+        # ``python -m build`` runs the PEP 517 backend isolated;
+        # produces both ``dist/arbez-<version>.tar.gz`` (sdist) and
+        # ``dist/arbez-<version>-py3-none-any.whl`` (wheel).
+
+      - name: List built artifacts
+        run: ls -la dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: python-package-distributions
+          path: dist/
+          retention-days: 7
+
+  publish-testpypi:
+    name: publish to TestPyPI (dev train)
+    needs: build
+    if: needs.build.outputs.target == 'testpypi'
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/arbez
+    permissions:
+      id-token: write   # OIDC for Trusted Publishing — no API token needed
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish to TestPyPI
+        # SHA-pinned (not tag-pinned): this job holds ``id-token: write``,
+        # so the action it hands the OIDC token to is pinned to an exact,
+        # immutable commit for supply-chain safety.
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # v1.14.0
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # ``skip-existing: true`` makes re-runs idempotent if the same
+          # version was already uploaded (rare for dev train since the
+          # run_number is monotonic, but useful for manual dry-runs).
+          skip-existing: true
+
+  publish-pypi:
+    name: publish to production PyPI (any vX.Y.Z tag, S-074)
+    needs: build
+    if: needs.build.outputs.target == 'pypi'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/arbez
+    permissions:
+      id-token: write   # OIDC for Trusted Publishing — no API token needed
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v5
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish to PyPI
+        # SHA-pinned (not tag-pinned): this job holds ``id-token: write``,
+        # so the action it hands the OIDC token to is pinned to an exact,
+        # immutable commit for supply-chain safety.
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # v1.14.0
+        # No ``repository-url`` → action defaults to https://upload.pypi.org/legacy/
+        with:
+          # Tag publishes must be fresh — collisions on prod indicate
+          # something is wrong (re-tagging the same version, etc.) and
+          # should fail loudly rather than silently skip.
+          skip-existing: false

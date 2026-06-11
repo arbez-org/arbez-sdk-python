@@ -1,0 +1,32 @@
+arbez — Python SDK for the Arbez barcode + QR detector
+https://github.com/arbez-org/arbez-sdk-python
+Copyright 2026 The arbez authors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+
+This product includes software developed by third parties:
+
+* YOLOX (https://github.com/Megvii-BaseDetection/YOLOX)
+  Copyright (c) 2021-2022 Megvii Inc.
+  Licensed under the Apache License, Version 2.0.
+
+  The bundled object-detection model
+  (``src/arbez/_assets/arbez_yolox_s.onnx``) is derived from the
+  YOLOX-s architecture. See ``src/arbez/_assets/NOTICE`` for full
+  model attribution + version / provenance.
+
+
+Runtime dependencies installed via pip remain governed by their own
+licenses (see each package on PyPI). The arbez SDK does not bundle
+these libraries; pip resolves and installs them at install time.
+The most prominent transitive dependencies are:
+
+* numpy — BSD-3-Clause
+* Pillow — MIT-CMU
+* onnxruntime — MIT
+* zxing-cpp — Apache-2.0
+
+Optional runtime dependencies (installed via arbez[<extra>] extras)
+follow the same model — each carries its own license; consult the
+project's PyPI page for the authoritative statement.
