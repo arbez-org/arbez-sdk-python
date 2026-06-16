@@ -40,20 +40,20 @@ Distinct codes decoded over 4,290 images (4,276 corpus + 14 synthesized exotic-f
 
 ### By symbology
 
-Distinct codes decoded **per engine** — each engine leads on different symbologies, which is exactly why `Scanner()` unions them:
+Distinct codes decoded by symbology. Each code is attributed to the symbology `Scanner()` votes for it (the **cross-engine consensus label**, not each engine's self-report), so the columns are consistent and `Scanner()` ≥ every engine on each row. Different engines lead different symbologies — which is exactly why `Scanner()` unions them:
 
-| Symbology | arbez | Apple Vision | ZXing | WeChat |
-|---|--:|--:|--:|--:|
-| QR | **2,615** | 2,357 | 2,357 | 2,084 |
-| Code 128 | 670 | **1,564** | 996 | – |
-| Data Matrix | 234 | **505** | 254 | – |
-| Code 39 | 111 | **156** | 121 | – |
-| ITF | – | **154** | 100 | – |
-| PDF417 | 51 | **85** | 54 | – |
-| EAN-13 | – | **81** | 50 | – |
-| Aztec | – | **14** | 10 | – |
+| Symbology | arbez | Apple Vision | ZXing | WeChat | **`Scanner()`** |
+|---|--:|--:|--:|--:|--:|
+| QR | **2,364** | 2,360 | 2,360 | 2,075 | **2,398** |
+| Code 128 | 645 | **1,564** | 1,000 | 4 | **1,603** |
+| Data Matrix | 322 | **507** | 256 | 2 | **518** |
+| Code 39 | 63 | **164** | 123 | – | **171** |
+| ITF | 13 | **151** | 98 | – | **156** |
+| PDF417 | 41 | **84** | 53 | 1 | **95** |
+| EAN-13 | 24 | **72** | 43 | – | **81** |
+| Aztec | 8 | **14** | 8 | – | **14** |
 
-*Bold = best single engine for that symbology. arbez (bundled detector + libdmtx) leads QR; Apple Vision leads the 1D/linear family and Data Matrix on this macOS host; ZXing is the broad cross-platform decoder; WeChat is QR-only ("–" = not targeted). These are raw per-engine distinct payloads — `Scanner()` unions all of them (see the yield table above), deduplicating and cross-voting per physical code, so its per-symbology totals are not a simple column sum.*
+*Bold (engine columns) = best single engine for that symbology. The label is the consensus symbology — arbez is a detector **and** decoder, so its raw class is corrected here by what was actually decoded (e.g. Data Matrix its detector had filed as "QR"). arbez leads QR; Apple Vision leads the linear family and Data Matrix on this macOS host; ZXing is the broad cross-platform decoder; WeChat is QR-only (its handful of non-QR entries are QR-detector misreads). `Scanner()` unions all engines, so it meets or beats every single engine on every symbology.*
 
 ### Methodology
 
