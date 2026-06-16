@@ -368,23 +368,35 @@ def test_installed_consensus_engines_includes_arbez_first() -> None:
 
 
 def test_engines_subset_accepts_arbez() -> None:
-    """``Scanner(engines=("arbez",))`` validates and stores — exercises S-027 in combination with
-    the arbez wiring."""
+    """``Scanner(engines=("arbez",))`` validates the name against the install
+    state. S-093: a one-element subset has nothing to vote on, so it degrades to
+    the single-engine path — ``engine_name == "arbez"`` and ``engines is None``."""
     s = Scanner(engines=("arbez",))
-    assert s.engines == ("arbez",)
+    assert s.engine_name == "arbez"
+    assert s.engines is None
 
 
-def test_scanner_auto_prefers_arbez_when_available() -> None:
-    """S-034 (v0.0.20): auto-resolution picks ArbezEngine as the default — first-party YOLOX-s +
-    zxing-cpp pipeline with bundled production-tier v0.0.1 weights.
+def test_engines_subset_with_arbez_and_zxing_engages_consensus() -> None:
+    """``Scanner(engines=("arbez", "zxing"))`` is a 2-engine subset that engages
+    the multi-engine path, exposing the chosen set on ``engines`` (S-093)."""
+    s = Scanner(engines=("arbez", "zxing"))
+    assert s.engine_name == "consensus"
+    assert s.engines == ("arbez", "zxing")
 
-    Supersedes the S-028/S-029/S-031 'opt-in until production weights ship' gate.
+
+def test_scanner_engine_arbez_resolves_to_arbez() -> None:
+    """S-034 (v0.0.20): ArbezEngine is the production default detector —
+    first-party YOLOX-s + zxing-cpp pipeline with bundled v0.0.1 weights.
+
+    S-093 (0.2.0) removed ``engine="auto"``; name it explicitly instead.
+    ``Scanner(engine="arbez")`` is the single-engine arbez path.
     """
-    s = Scanner(engine="auto")
+    s = Scanner(engine="arbez")
     assert s.engine_name == "arbez", (
-        f"S-034 contract: Scanner(engine='auto') must pick 'arbez' as "
-        f"the production default; got {s.engine_name!r}"
+        f"Scanner(engine='arbez') must select the arbez engine; got "
+        f"{s.engine_name!r}"
     )
+    assert s.engines is None
 
 
 # ── S-029 + S-030 — YOLOX-s + classical decoder pipeline ─────────────────

@@ -49,11 +49,14 @@ import logging
 import statistics
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from arbez.types import Detection, Symbology
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from PIL.Image import Image as PILImage
 
     from arbez.engines.base import Engine
@@ -61,14 +64,34 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 
-def run_consensus(
+@dataclass(frozen=True, slots=True)
+class ConsensusResult:
+    """Return of :func:`run_consensus_detailed` (S-093).
+
+    * ``detections`` — the merged, per-code consensus result (each
+      ``Detection`` tagged ``engine="consensus"`` with ``extras["voted_by"]``).
+    * ``per_engine`` — ``{engine_name: that engine's own raw detections}``,
+      i.e. what each voter saw BEFORE clustering/voting. Lets a caller see
+      detections that didn't reach the vote threshold.
+    """
+
+    detections: tuple[Detection, ...]
+    per_engine: Mapping[str, tuple[Detection, ...]]
+
+
+def run_consensus_detailed(
     pil_image: PILImage,
     engines: dict[str, Engine],
     *,
     min_votes: int = 2,
     iou_threshold: float = 0.5,
-) -> tuple[Detection, ...]:
-    """Vote across multiple engines on one image.
+) -> ConsensusResult:
+    """Vote across multiple engines on one image; return merged + per-engine.
+
+    Same voting logic as :func:`run_consensus`, but returns a
+    :class:`ConsensusResult` carrying both the merged consensus
+    ``detections`` and the ``per_engine`` breakdown (S-093). ``Scanner``
+    uses this so ``Result.per_engine`` can expose each voter's raw finds.
 
     Args:
         pil_image: RGB PIL image (already coerced by Scanner).
@@ -83,9 +106,10 @@ def run_consensus(
             same physical barcode.
 
     Returns:
-        Tuple of consensus :class:`~arbez.Detection` sorted by
-        descending score. Empty tuple if no detection cluster reaches
-        ``min_votes``. Each output Detection has ``engine="consensus"``.
+        A :class:`ConsensusResult`: ``.detections`` is the merged
+        consensus tuple (sorted by descending score, each tagged
+        ``engine="consensus"``; empty if no cluster reaches ``min_votes``),
+        and ``.per_engine`` maps each voter to its own raw detections.
 
     Per-engine exception handling:
         If an individual engine's ``detect_and_decode`` raises any
@@ -173,12 +197,18 @@ def run_consensus(
                     )
                     per_engine[name] = ()
 
+    # Freeze the per-engine breakdown (each engine's own raw detections,
+    # before clustering/voting) for the ConsensusResult.
+    breakdown: dict[str, tuple[Detection, ...]] = {
+        name: tuple(dets) for name, dets in per_engine.items()
+    }
+
     # Stage 2: tag each detection with its source engine + flatten.
     tagged: list[tuple[str, Detection]] = [
         (name, d) for name, dets in per_engine.items() for d in dets
     ]
     if not tagged:
-        return ()
+        return ConsensusResult(detections=(), per_engine=breakdown)
     # Sort by descending score so the highest-confidence detection
     # seeds each cluster.
     tagged.sort(key=lambda nd: nd[1].score, reverse=True)
@@ -211,7 +241,26 @@ def run_consensus(
 
     # Engine Protocol contract: sort by descending score.
     accepted.sort(key=lambda d: d.score, reverse=True)
-    return tuple(accepted)
+    return ConsensusResult(detections=tuple(accepted), per_engine=breakdown)
+
+
+def run_consensus(
+    pil_image: PILImage,
+    engines: dict[str, Engine],
+    *,
+    min_votes: int = 2,
+    iou_threshold: float = 0.5,
+) -> tuple[Detection, ...]:
+    """Vote across multiple engines on one image (merged result only).
+
+    Thin wrapper over :func:`run_consensus_detailed` that returns just the
+    merged consensus ``detections`` tuple — the historical S-032 signature.
+    Use :func:`run_consensus_detailed` when you also need the per-engine
+    breakdown. See that function for the full voting-policy docs.
+    """
+    return run_consensus_detailed(
+        pil_image, engines, min_votes=min_votes, iou_threshold=iou_threshold
+    ).detections
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────

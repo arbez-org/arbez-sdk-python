@@ -35,12 +35,14 @@ decoder library. They do exactly one thing.
 
 **`Scanner`** is the orchestrator. It:
 
-1. Picks an engine (auto-selected per platform, or one you forced).
+1. Runs one engine you named (`engine=`), or unions every installed
+   engine when you name none (the default).
 2. Coerces input formats (PIL / numpy / path) into the canonical RGB
    `PIL.Image` the engines expect.
-3. Wraps the engine output in a `Result` with image dimensions and
-   per-stage timings.
-4. Coordinates multi-engine consensus voting via `consensus="vote"`.
+3. Wraps the engine output in a `Result` with image dimensions,
+   per-engine raw detections, and per-stage timings.
+4. Merges multi-engine results, optionally filtering to the codes
+   that `consensus=N` engines agree on.
 
 If you only ever scan one image at a time and want the path of least
 resistance, use `Scanner`. If you're embedding into a larger pipeline
@@ -109,11 +111,14 @@ A few subtle points worth knowing:
 ```python
 Result(
     detections=(
-        Detection(...),       # sorted descending by score
+        Detection(...),       # the merged, per-code result, sorted descending by score
         Detection(...),
     ),
     image_size=(1920, 1080),  # (width, height) in pixels
     timings_ms={"engine": 12.4},
+    per_engine={             # each engine's own raw detections, before the merge
+        "arbez": (Detection(...),),
+    },
 )
 ```
 
@@ -121,14 +126,24 @@ Result(
 
 `timings_ms` carries per-stage wall-clock. Keys you may see:
 `"engine"` (the engine's `detect_and_decode` time, single-engine
-mode), `"consensus"` (the full parallel-vote wall-clock when
-`consensus="vote"`), and `"preprocess"` when `preprocess="auto"`
-kicks in. Useful for benchmarking, debugging slow scans, and
-latency monitoring in production.
+path), `"consensus"` (the full parallel-merge wall-clock on the
+multi-engine path — bare `Scanner()` or any `consensus=N`), and
+`"preprocess"` when `preprocess="auto"` kicks in. Useful for
+benchmarking, debugging slow scans, and latency monitoring in
+production.
 
 `image_size` exists so client overlay code doesn't need to re-open
 the source image just to know its dimensions — handy when scaling
 detections to fit a UI canvas.
+
+`per_engine` maps each engine name to **its own raw detections** —
+what that engine independently saw, before the merge. It's always
+populated for every engine that ran (just the one key on the
+single-engine path). `detections` is the merged, per-code view;
+`per_engine` is the un-merged breakdown, so you can answer "which
+engine actually found this code?" without re-running anything. On
+the multi-engine path each merged `Detection` also carries
+`extras["voted_by"]`, the engines that agreed on that code.
 
 ## Symbology — the barcode classes
 
@@ -222,10 +237,11 @@ Scanner(engine=ZXingEngine(formats={Symbology.QR}))
 ```
 
 Either form gets you the Scanner's `Result` wrapper (with image
-dimensions + per-stage timings). Consensus voting is driven by name
-from the installed-engine set; passing a custom Engine instance
-alongside `consensus="vote"` raises `ValueError`. The Engine-instance
-+ Result-wrapper contract is locked from v0.1.0; see
+dimensions + per-stage timings). The instance form is single-engine
+only; the multi-engine path is driven by name from the
+installed-engine set, so combining `engine=` with `engines=` or
+`consensus > 1` raises `ValueError`. The Engine-instance + Result-
+wrapper contract is locked from v0.1.0; see
 [`DECISIONS.md`](../DECISIONS.md) for the rationale.
 
 Why a Protocol instead of an ABC? Two reasons:
@@ -247,76 +263,60 @@ For a runnable example of writing your own engine, see
 [`examples/custom_engine.py`](../examples/custom_engine.py) and the
 how-to [Write your own engine](how-to.md#write-your-own-engine).
 
-## What `Scanner()` does (and how `engine="auto"` differs)
+## What `Scanner()` does (and how `engine=` differs)
 
-The bare `Scanner()` call is **NOT** the same as
-`Scanner(engine="auto")`. The two paths express different intents:
+The bare `Scanner()` call is **NOT** the same as a single-engine
+`Scanner(engine=...)`. The two paths express different intents:
 
 | Constructor | What you get |
 |---|---|
-| `Scanner()` | **2-engine consensus** of `arbez` + `zxing` (union mode, `min_votes=1`). The default. |
-| `Scanner(engine="auto")` | **Single-engine** auto-pick (the explicit single-engine escape hatch). |
-| `Scanner(engine="arbez")` | Single-engine arbez (or any other explicit name). |
-| `Scanner(consensus="vote")` | N-engine majority vote across **all** installed engines (`min_votes=2` default). |
+| `Scanner()` | **Every installed engine**, unioned (the default `consensus=1`). Max yield — whatever any engine detects is returned. |
+| `Scanner(engine="arbez")` | **Single-engine** — exactly that engine (or any other explicit name / `Engine` instance), no consensus. |
+| `Scanner(engines=["arbez", "zxing"])` | Union over just that subset. |
+| `Scanner(consensus=2)` | Keep only codes **>= 2** installed engines agree on (clustered per code via IoU). |
+| `Scanner(consensus=2, engines=[...])` | Keep only codes >= 2 of that subset agree on. |
 
 ### The bare-Scanner default (`Scanner()`)
 
-The default consensus runs both always-installed engines:
+The default unions **every installed engine** — whatever any engine
+can detect is returned. On a stock macOS install that's:
 
 * `arbez` (bundled YOLOX-s + zxing-cpp decoder) — strong matrix-code
   recall (QR, Data Matrix, PDF417, Code 128)
 * `zxing` (classical decoder alone) — long-tail coverage (EAN-13
   and the other 1D families, plus 2D codes like Aztec) that arbez's
   training set under-weights
+* `apple_vision` (macOS only) — strong on 1D linear types
 
-Detections from either engine survive (`min_votes=1` = union mode).
-The combined engine set covers more symbologies than either alone
-at no measurable latency cost: the engines run in parallel threads,
-so wall-clock is `max(per-engine time)` ≈ arbez's p50.
+`arbez` and `zxing` are always installed, so on Linux / Windows the
+union is at least those two; install `arbez[wechat]` and `wechat`
+joins as well. Detections from **any** engine survive (the default
+`consensus=1` = union mode). The combined engine set covers more
+symbologies than any one alone at no measurable latency cost: the
+engines run in parallel threads, so wall-clock is `max(per-engine
+time)` ≈ the slowest engine's p50.
 
-If `zxing` is somehow absent (broken install / stripped frozen-app
-build), `Scanner()` silently degrades to single-engine `arbez`
-rather than failing — the bare construction must never raise on a
-working install.
+`Scanner().engine_name` is `"consensus"` and `Scanner().engines`
+returns the resolved all-installed set. Raising the threshold with
+`consensus=N` filters that union down to the codes at least `N`
+engines agree on. To run exactly one engine instead, pass `engine=`.
 
-### The single-engine auto-pick (`Scanner(engine="auto")`)
+### Single-engine mode (`Scanner(engine=...)`)
 
-Runs once at construction time and is cached in `self.engine_name`.
-The priority order:
+Pass an explicit engine name (or a pre-constructed `Engine` instance)
+to bypass consensus entirely and run just that one engine. The
+canonical names are `"arbez"`, `"apple_vision"`, `"zxing"`, and
+`"wechat"`; naming an engine that isn't installed raises
+`EngineUnavailable` at construction. In this mode `scanner.engine_name`
+is the resolved engine name (not `"consensus"`) and `scanner.engines`
+is `None`.
 
-```
-1. arbez          — always available on a normal install
-                     (probe: arbez.engines.arbez importable)
-2. Apple Vision   — if platform.system() == "Darwin"
-                     AND pyobjc-framework-Vision installed
-                     AND pyobjc-framework-Quartz installed
-                     AND Foundation importable
-3. ZXing          — if zxingcpp installed (always true on a stock
-                     `pip install arbez` — zxing-cpp is a core dep)
-4. WeChat         — if cv2 installed (QR-only fallback)
-5. EngineUnavailable raised (only reachable if the install is broken
-                              AND no classical engine is present)
-```
+`ArbezEngine` is the first-party default detector — a **14-class
+YOLOX-s detector** (mAP@50 = 0.833 on QR, 0.370 overall, with
+detection on 14 distinct symbologies) — and the engine a stock
+install resolves first. To run it alone, `Scanner(engine="arbez")`.
 
-`ArbezEngine` is at the front of the auto-pick order. The bundled
-weights are a **14-class YOLOX-s detector** (mAP@50 = 0.833 on QR,
-0.370 overall, with detection on 14 distinct symbologies).
-
-The probe uses `importlib.util.find_spec` — fast (no imports), pure
-introspection. The pick happens at construction time so `repr(scanner)`
-and `scanner.engine_name` always reflect the actual engine, never the
-literal `"auto"`.
-
-You can introspect what auto would pick on this host without
-instantiating the Scanner:
-
-```python
-from arbez.scanner import resolve_auto_engine
-print(resolve_auto_engine())   # "arbez" on a normal install
-```
-
-To override the pick, pass an explicit engine name. See
-[How-to → Pick an engine](how-to.md#pick-an-engine) for the
+See [How-to → Pick an engine](how-to.md#pick-an-engine) for the
 trade-offs.
 
 ## Input coercion — what your image goes through
@@ -434,10 +434,10 @@ across custom instances goes through `run_consensus` directly.)
 Full contract in
 [`bring-your-own-weights.md`](bring-your-own-weights.md).
 
-**Auto-pick** (`Scanner(engine="auto")`) resolves to ArbezEngine on
-a stock install — see the priority table earlier in this doc.
-(Note: bare `Scanner()` runs the 2-engine consensus default;
-`engine="auto"` is the explicit single-engine path.)
+On a stock install `arbez` is the first engine the bare `Scanner()`
+union resolves, and `Scanner(engine="arbez")` runs it alone. (Note:
+bare `Scanner()` unions every installed engine; pass `engine=` for
+the single-engine path.)
 
 ### Distribution
 
@@ -549,37 +549,47 @@ eventually adds free-threaded cells, you'll see it in the output.
 
 ## Consensus — multi-engine voting
 
-`Scanner(consensus="vote")` runs every installed engine in parallel
-on the same image and merges their detections into one consensus
-output. Engines run one-thread-each; detections are grouped by bbox
-IoU, then accepted if at least `min_votes` unique engines
-contributed.
+Whenever more than one engine runs — bare `Scanner()` (every
+installed engine) or any subset via `engines=` — the Scanner merges
+their detections into one per-code result. Engines run
+one-thread-each; detections are grouped by bbox IoU into one cluster
+per physical code. The integer `consensus=` threshold then decides
+which clusters survive:
+
+- `consensus=1` (the default) = **union** — keep every cluster, so
+  anything any engine detected is returned. This is what bare
+  `Scanner()` does.
+- `consensus=N` (N > 1) = keep only clusters that **>= N distinct
+  engines agree on** — a precision filter over the union.
 
 ```python
 from arbez import Scanner
 
-s = Scanner(consensus="vote", min_votes=2)
+s = Scanner(consensus=2)              # >= 2 installed engines must agree
 result = s.scan("photo.jpg")
 for d in result.detections:
     assert d.engine == "consensus"
-    print(d.extras["voted_by"])     # ('apple_vision', 'arbez', 'wechat', 'zxing') — alphabetically sorted
-    print(d.extras["vote_count"])   # 4
-    print(d.payload)                # majority-vote payload
+    print(d.extras["voted_by"])       # ('apple_vision', 'arbez', 'wechat', 'zxing'), alphabetically sorted
+    print(d.extras["vote_count"])     # 4
+    print(d.payload)                  # majority-vote payload
 ```
 
 **Aggregation policy (summary):**
 
-- **bbox** = per-corner median across the group (robust to one
+- **bbox** = per-corner median across the cluster (robust to one
   engine's bbox being off).
 - **symbology** = most-common; tiebreak to the highest-scored
   detection's symbology.
 - **payload** = most-common non-None; tiebreak to the highest-scored
   detection's payload. `None` if no engine decoded the crop.
-- **score** = mean of group members' scores.
+- **score** = mean of cluster members' scores.
 - **engine** = literal string `"consensus"` — downstream code can
   branch on this.
 - **extras** carries `voted_by` (sorted tuple of contributing engine
   names), `vote_count`, `agreed_payloads`, and `source_count`.
+
+Each engine's un-merged detections are also available on
+`Result.per_engine` (keyed by engine name) if you want the raw view.
 
 Full field-by-field spec including the one named non-determinism
 source (tied-score seeding): see
@@ -589,22 +599,23 @@ source (tied-score seeding): see
 
 | Param | Default | Effect |
 |---|---|---|
-| `min_votes` | `2` | Min unique engines that must agree per cluster. `1` = union (max recall), `len(engines)` = unanimous (max precision). |
+| `consensus` | `1` | Min distinct engines that must agree per cluster. `1` = union (max recall), `len(engines)` = unanimous (max precision). Greater than the number of participating engines raises `ValueError`. |
 | `iou_threshold` | `0.5` | Bbox IoU >= this groups two detections as the same physical barcode. |
-| `engines` | `None` (all installed) | Subset of engines that vote. Validated eagerly. |
+| `engines` | `None` (all installed) | Subset of engines that participate. Validated eagerly. |
 
-**Why use it:**
+**Why raise the threshold:**
 
-- **Higher decode rate** than any individual engine — the
-  median-bbox is more decoder-friendly than any single engine's
-  tight crop.
+- **Higher precision** — `consensus=2` drops codes only one engine
+  saw, filtering single-engine misdetections out of the union.
+- The merged median-bbox is also more decoder-friendly than any
+  single engine's tight crop.
 - **Robust to single-engine failure** — if one engine raises, the
-  vote proceeds with the rest (logged at WARNING).
+  merge proceeds with the rest (logged at WARNING).
 
 **Cost:**
 
 - **Latency = `max(per-engine times)`** thanks to parallel dispatch.
-  On a 640px image with all 4 engines voting, the tail is dominated
+  On a 640px image with all 4 engines running, the tail is dominated
   by whichever ArbezEngine instance is slowest (~110 ms for the
   bundled YOLOX-s on CoreML+CPU; ~180 ms for RT-DETR-v2 on CoreML;
   rest is classical decoders at sub-30ms). Drop slow engines via
@@ -621,16 +632,17 @@ from arbez.parallelism import installed_consensus_engines
 installed_consensus_engines()
 # -> ('arbez', 'apple_vision', 'zxing', 'wechat')  # M1, all extras
 
-Scanner(consensus="vote", engines=None)                # default: all installed vote
-Scanner(consensus="vote", engines=("zxing", "wechat")) # restrict to a subset
-Scanner(consensus="vote", engines=("arbez",))          # single-engine consensus (degenerate; valid)
+Scanner()                                    # union over every installed engine
+Scanner(engines=("zxing", "wechat"))         # union over just this subset
+Scanner(consensus=2, engines=("arbez", "zxing", "apple_vision"))  # >= 2 of this subset agree
 ```
 
 Validation is eager — `Scanner(engines=("apple_vision",))` on Linux
-raises `EngineUnavailable` at construction, not at scan time. The
-parameter co-exists with `engine=`: `engine=` controls
-single-engine mode (`consensus="off"`); `engines=` controls which
-engines vote in `consensus="vote"` mode.
+raises `EngineUnavailable` at construction, not at scan time.
+`engine=` and `engines=` are mutually exclusive: `engine=` runs a
+single engine with no consensus, `engines=` chooses which engines
+participate in the multi-engine merge. Combining the two — or pairing
+`engine=` with `consensus > 1` — raises `ValueError`.
 
 ## Architectural decisions (the why)
 
@@ -663,7 +675,8 @@ relevant to users:
 | S-072 | Explicit `name=` constructor arg for same-arch consensus |
 | S-073 | Bench consolidation: bench3 absorbs bench2 + matplotlib charts |
 | S-074 | Lift v0.1.0+ gate on production PyPI publish |
-| S-075 | Bare `Scanner()` defaults to `arbez`+`zxing` 2-engine consensus |
+| S-075 | Bare `Scanner()` defaults to `arbez`+`zxing` 2-engine consensus (superseded by S-093) |
+| S-093 | `Scanner()` runs ALL installed engines (union); `consensus=<int>` threshold; `Result.per_engine`; `engine="auto"` removed (0.2.0) |
 
 When something in the SDK surprises you, the ADR is usually a
 2-minute read that explains why it's that way.

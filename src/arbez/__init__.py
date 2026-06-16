@@ -15,7 +15,7 @@ status of the public-API contract.
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from arbez.acceleration import (
     coreml_is_available,

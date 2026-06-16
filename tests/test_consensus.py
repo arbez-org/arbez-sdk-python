@@ -8,10 +8,13 @@ Covers:
    vote, score mean, polygon from highest-score, extras shape.
 3. **Vote threshold** — ``min_votes`` filters groups correctly;
    ``min_votes=1`` is union, ``min_votes=N_engines`` is unanimous.
-4. **Scanner integration** — ``Scanner(consensus="vote")`` end-to-end:
-   constructs correctly, dispatches all engines in parallel, returns
-   merged detections.
-5. **Error paths** — invalid consensus mode, no engines installed,
+   (``run_consensus`` itself still takes ``min_votes``; the Scanner-level
+   spelling is ``consensus=N`` per S-093.)
+4. **Scanner integration** — multi-engine Scanner end-to-end (bare
+   ``Scanner()`` = all-installed union, or ``Scanner(consensus=N,
+   engines=...)``): constructs correctly, dispatches all engines in
+   parallel, returns merged detections.
+5. **Error paths** — invalid consensus type, no engines installed,
    bad min_votes, bad iou_threshold.
 6. **Engine failure isolation** — one engine raising doesn't kill the
    vote; the others still contribute.
@@ -337,61 +340,62 @@ def test_run_consensus_iou_out_of_range_raises() -> None:
         )
 
 
-# ── Scanner(consensus="vote") integration tests ──────────────────────────
+# ── Multi-engine Scanner integration tests (S-093) ───────────────────────
 
 
-def test_scanner_consensus_vote_constructs() -> None:
-    """``Scanner(consensus="vote")`` constructs OK on a host with at least one engine installed."""
-    s = Scanner(consensus="vote")
+def test_scanner_consensus_constructs() -> None:
+    """A multi-engine ``Scanner(consensus=2)`` constructs OK on a host with at
+    least two engines installed (this env has all four)."""
+    s = Scanner(consensus=2)
     assert s.engine_name == "consensus"
-    assert "vote" in repr(s)
+    assert "consensus=2" in repr(s)
 
 
-def test_scanner_consensus_off_when_engine_explicit() -> None:
-    """S-075: passing ``engine="auto"`` (or any explicit engine name) suppresses the
-    bare-Scanner S-075 default consensus and gives single-engine ``consensus="off"``
-    behavior. Pre-S-075 the bare ``Scanner()`` also gave this; post-S-075 the user
-    has to be explicit to get single-engine."""
-    s = Scanner(engine="auto")
-    assert "vote" not in repr(s)
+def test_scanner_off_when_engine_explicit() -> None:
+    """S-093: passing an explicit ``engine=`` name suppresses the bare-Scanner
+    all-installed consensus default and gives single-engine behavior."""
+    s = Scanner(engine="arbez")
+    assert "consensus=" not in repr(s)
     assert s.engine_name != "consensus"
+    assert s.engines is None
 
 
-def test_scanner_bare_default_engages_s075_consensus() -> None:
-    """S-075 (2026-05-17): bare ``Scanner()`` defaults to consensus="vote" with
-    engines=("arbez", "zxing") and min_votes=1. Pre-S-075 the bare-Scanner default
-    was consensus="off" (single-engine arbez). Pin the new behavior so it can't
-    regress silently."""
+def test_scanner_bare_default_engages_consensus() -> None:
+    """S-093 (0.2.0): bare ``Scanner()`` runs ALL installed engines in union
+    mode (consensus threshold 1). ``engine_name == "consensus"`` and ``engines``
+    is the resolved all-installed set (>= 2 engines on this host). Pin the new
+    behavior so it can't regress silently."""
     s = Scanner()
-    assert "vote" in repr(s)
+    assert "consensus=1" in repr(s)
     assert s.engine_name == "consensus"
-    assert s.engines == ("arbez", "zxing")
+    assert s.engines is not None and len(s.engines) >= 2
 
 
-def test_scanner_consensus_invalid_value_raises() -> None:
-    """Consensus must be 'off' or 'vote'."""
-    with pytest.raises(NotImplementedError, match="not supported"):
-        Scanner(consensus="quorum")
+def test_scanner_consensus_invalid_type_raises() -> None:
+    """S-093: ``consensus`` is an int now; passing a str (the removed 0.1.x
+    'off'/'vote' API) raises TypeError."""
+    with pytest.raises(TypeError, match="consensus must be an int"):
+        Scanner(consensus="quorum")  # type: ignore[arg-type]
 
 
-def test_scanner_consensus_vote_bad_min_votes_raises() -> None:
-    with pytest.raises(ValueError, match="min_votes must be >= 1"):
-        Scanner(consensus="vote", min_votes=0)
+def test_scanner_consensus_below_one_raises() -> None:
+    with pytest.raises(ValueError, match="consensus must be >= 1"):
+        Scanner(consensus=0)
 
 
-def test_scanner_consensus_vote_bad_iou_raises() -> None:
+def test_scanner_consensus_bad_iou_raises() -> None:
     with pytest.raises(ValueError, match="iou_threshold must be in"):
-        Scanner(consensus="vote", iou_threshold=-0.1)
+        Scanner(consensus=2, iou_threshold=-0.1)
     with pytest.raises(ValueError, match="iou_threshold must be in"):
-        Scanner(consensus="vote", iou_threshold=1.5)
+        Scanner(consensus=2, iou_threshold=1.5)
 
 
-def test_scanner_consensus_vote_end_to_end(qr_image_640: Image.Image) -> None:
-    """Scanner(consensus='vote').scan(qr) returns merged detections.
+def test_scanner_consensus_end_to_end(qr_image_640: Image.Image) -> None:
+    """A multi-engine ``Scanner(consensus=2).scan(qr)`` returns merged detections.
 
     All installed engines (typically zxing/wechat/apple_vision/arbez) should agree on the QR.
     """
-    s = Scanner(consensus="vote", min_votes=2)
+    s = Scanner(consensus=2)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         result = s.scan(qr_image_640)
@@ -401,17 +405,18 @@ def test_scanner_consensus_vote_end_to_end(qr_image_640: Image.Image) -> None:
     assert d.symbology == Symbology.QR
     voted = d.extras.get("voted_by")
     assert isinstance(voted, tuple)
-    assert len(voted) >= 2, f"min_votes=2 requires >=2 engines; got {voted}"
+    assert len(voted) >= 2, f"consensus=2 requires >=2 engines; got {voted}"
 
 
 def test_scanner_consensus_subset_only_two_engines(qr_image_640: Image.Image) -> None:
-    """Consensus='vote' with engines=('zxing', 'apple_vision') only involves those two engines in
-    the vote."""
+    """``Scanner(consensus=2, engines=('zxing', 'apple_vision'))`` only involves
+    those two engines in the vote."""
     installed = set(installed_consensus_engines())
     needed = {"zxing", "apple_vision"} & installed
     if len(needed) < 2:
         pytest.skip("need both zxing + apple_vision for this test")
-    s = Scanner(consensus="vote", engines=("zxing", "apple_vision"), min_votes=2)
+    s = Scanner(consensus=2, engines=("zxing", "apple_vision"))
+    assert s.engines == ("zxing", "apple_vision")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         result = s.scan(qr_image_640)
@@ -421,12 +426,13 @@ def test_scanner_consensus_subset_only_two_engines(qr_image_640: Image.Image) ->
     assert set(voted) <= {"zxing", "apple_vision"}, f"got {voted}"
 
 
-def test_scanner_consensus_min_votes_one_is_union(qr_image_640: Image.Image) -> None:
-    """min_votes=1 accepts any single engine's detection (union mode).
+def test_scanner_consensus_threshold_one_is_union(qr_image_640: Image.Image) -> None:
+    """consensus=1 (the bare ``Scanner()`` default) accepts any single engine's
+    detection (union mode).
 
-    With ≥1 engine installed, this should never return empty on a QR.
+    With >= 2 engines installed, this should never return empty on a QR.
     """
-    s = Scanner(consensus="vote", min_votes=1)
+    s = Scanner()  # consensus defaults to 1 (union)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         result = s.scan(qr_image_640)
@@ -434,9 +440,9 @@ def test_scanner_consensus_min_votes_one_is_union(qr_image_640: Image.Image) -> 
 
 
 def test_scanner_consensus_timing_key_is_consensus(qr_image_640: Image.Image) -> None:
-    """Consensus='vote' reports timing under 'consensus' (not 'engine') so callers can distinguish
-    single-engine wall-clock from consensus wall-clock."""
-    s = Scanner(consensus="vote")
+    """The multi-engine path reports timing under 'consensus' (not 'engine') so
+    callers can distinguish single-engine wall-clock from consensus wall-clock."""
+    s = Scanner()  # all-installed multi-engine path
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         result = s.scan(qr_image_640)
@@ -445,8 +451,8 @@ def test_scanner_consensus_timing_key_is_consensus(qr_image_640: Image.Image) ->
 
 
 def test_scanner_consensus_warmup_doesnt_raise(qr_image_640: Image.Image) -> None:
-    """Warmup() works in consensus mode — pre-loads every voting engine."""
-    s = Scanner(consensus="vote")
+    """Warmup() works in the multi-engine path — pre-loads every voting engine."""
+    s = Scanner()
     s.warmup()
     # And a subsequent scan still works
     with warnings.catch_warnings():
@@ -455,9 +461,27 @@ def test_scanner_consensus_warmup_doesnt_raise(qr_image_640: Image.Image) -> Non
     assert isinstance(result.detections, tuple)
 
 
+def test_scanner_consensus_per_engine_keys_match_engine_set(
+    qr_image_640: Image.Image,
+) -> None:
+    """S-093: ``Result.per_engine`` keys == the resolved engine set for the
+    multi-engine path; each value is that engine's own raw detections."""
+    s = Scanner()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = s.scan(qr_image_640)
+    assert s.engines is not None
+    assert set(result.per_engine.keys()) == set(s.engines), (
+        f"per_engine keys must equal the engine set; got "
+        f"{set(result.per_engine.keys())!r} vs {set(s.engines)!r}"
+    )
+    for name, dets in result.per_engine.items():
+        assert isinstance(dets, tuple), f"per_engine[{name!r}] must be a tuple"
+
+
 def test_scanner_consensus_returns_empty_on_blank_image() -> None:
     """No engine detects anything on a blank image → empty consensus result."""
-    s = Scanner(consensus="vote", min_votes=2)
+    s = Scanner(consensus=2)
     img = Image.new("RGB", (640, 480), color="white")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -524,6 +548,80 @@ def test_run_consensus_disjoint_detections_kept_separately() -> None:
     assert len(out) == 2
     payloads = {d.payload for d in out}
     assert payloads == {"a", "b"}
+
+
+def test_run_consensus_per_code_threshold_filters_independently() -> None:
+    """S-093: ``consensus=N`` (here min_votes=2) is evaluated PER detected code,
+    not globally.
+
+    Construct two well-separated codes (IoU 0 between them):
+
+    * code A at the top-left — BOTH engines see it -> 2 votes -> survives.
+    * code B at the bottom-right — only ONE engine sees it -> 1 vote -> dropped.
+
+    The threshold must filter each code on its own vote count, keeping A and
+    dropping B in the same scan.
+    """
+    code_a = (10.0, 10.0, 60.0, 60.0)    # both engines agree here
+    code_b = (140.0, 140.0, 190.0, 190.0)  # only e1 sees this
+    e1 = _StubEngine((
+        _make_det(code_a, payload="A"),
+        _make_det(code_b, payload="B"),
+    ))
+    e2 = _StubEngine((
+        _make_det(code_a, payload="A"),
+    ))
+    img = Image.new("RGB", (200, 200), "white")
+    out = run_consensus(img, {"e1": e1, "e2": e2}, min_votes=2, iou_threshold=0.5)
+    # Only code A reaches 2 votes; code B (1 vote) is filtered out.
+    assert len(out) == 1, f"per-code threshold should keep only A; got {out}"
+    assert out[0].payload == "A"
+    assert out[0].extras["voted_by"] == ("e1", "e2")
+
+
+def test_scanner_per_code_consensus_filters_independently() -> None:
+    """End-to-end through ``Scanner(consensus=2, engines=...)``: per-code
+    filtering, plus ``Result.per_engine`` exposes each engine's RAW detections
+    (including the sub-threshold code B that ``detections`` drops).
+
+    Built from stub Engine instances passed via ``engines=`` so the test is
+    deterministic and model-free. We register the stubs under real engine names
+    and patch ``Scanner._resolve_consensus_engine_names`` / the engine pool so
+    the validated names map to our stubs.
+    """
+    from unittest.mock import patch
+
+    code_a = (10.0, 10.0, 60.0, 60.0)
+    code_b = (140.0, 140.0, 190.0, 190.0)
+    arbez_stub = _StubEngine((
+        _make_det(code_a, payload="A"),
+        _make_det(code_b, payload="B"),  # only arbez sees code B
+    ))
+    zxing_stub = _StubEngine((
+        _make_det(code_a, payload="A"),
+    ))
+    pool = {"arbez": arbez_stub, "zxing": zxing_stub}
+
+    s = Scanner(consensus=2, engines=("arbez", "zxing"))
+    img = Image.new("RGB", (200, 200), "white")
+    # Inject the stub pool so no real engines load.
+    with patch.object(s, "_get_consensus_engines", return_value=pool):
+        result = s.scan(img)
+
+    # Per-code: code A (2 votes) survives; code B (1 vote) is filtered.
+    assert len(result.detections) == 1
+    assert result.detections[0].payload == "A"
+    assert result.detections[0].extras["voted_by"] == ("arbez", "zxing")
+
+    # per_engine carries each engine's OWN raw detections, including the
+    # sub-threshold code B that the merged ``detections`` dropped.
+    assert set(result.per_engine.keys()) == {"arbez", "zxing"}
+    arbez_payloads = {d.payload for d in result.per_engine["arbez"]}
+    zxing_payloads = {d.payload for d in result.per_engine["zxing"]}
+    assert arbez_payloads == {"A", "B"}
+    assert zxing_payloads == {"A"}
+    # timings key for the multi-engine path.
+    assert "consensus" in result.timings_ms
 
 
 def test_run_consensus_engine_failure_isolated() -> None:

@@ -29,8 +29,8 @@ packages is missing or partially installed.
 pip install --force-reinstall arbez
 ```
 
-If you want a specific extra engine for `Scanner(consensus="vote")`
-to include more voters:
+Installing an extra engine adds it to the default `Scanner()` union
+(every installed engine participates):
 
 ```bash
 pip install 'arbez[apple-vision]'  # macOS only
@@ -47,7 +47,6 @@ You passed an unrecognized name to `Scanner(engine=...)`. The
 accepted values are exactly:
 
 ```python
-Scanner(engine="auto")           # single-engine auto-pick (arbez on stock install)
 Scanner(engine="arbez")          # first-party YOLOX-s + zxing-cpp decoder
 Scanner(engine="zxing")          # classical decoder
 Scanner(engine="wechat")         # OpenCV WeChat QR detector
@@ -56,33 +55,24 @@ Scanner(engine="apple_vision")   # macOS only (underscore, not hyphen)
 
 Note the underscore in `apple_vision` — `"apple-vision"` is the
 `pip` extra name, not the engine name. Bare `Scanner()` (no
-arguments) runs the 2-engine consensus default — see the next
-section.
+arguments) runs every installed engine (union) — see the next
+section. (`engine="auto"` was removed in 0.2.0.)
 
 ## `Scanner()` engine_name shows `"consensus"`, not the engine I expected
 
-Bare `Scanner()` runs a **2-engine consensus** of `arbez` + `zxing`
-(union mode, both always installed). The `engine_name` property is
-the literal
+Bare `Scanner()` runs **every installed engine** and unions their
+results (max yield). The `engine_name` property is the literal
 `"consensus"`; individual detections carry
 `extras["voted_by"]` listing the contributing engines. See
-[Concepts → What `Scanner()` does (and how `engine="auto"`
-differs)](concepts.md#what-scanner-does-and-how-engineauto-differs).
+[Concepts → What `Scanner()` does (and how `engine=`
+differs)](concepts.md#what-scanner-does-and-how-engine-differs).
 
-**To opt out** and get single-engine behavior:
-
-```python
-Scanner(engine="auto")           # SDK picks the single best engine (arbez on stock install)
-Scanner(engine="arbez")          # force the first-party engine specifically
-Scanner(engine="zxing")          # force classical zxing
-Scanner(engine="apple_vision")   # force apple vision (macOS only)
-```
-
-To preview what `engine="auto"` would pick without instantiating:
+**To opt out** and get single-engine behavior, name the engine:
 
 ```python
-from arbez.scanner import resolve_auto_engine
-print(resolve_auto_engine())     # "arbez" on a stock install
+Scanner(engine="arbez")          # first-party YOLOX-s + zxing-cpp decoder
+Scanner(engine="zxing")          # classical zxing
+Scanner(engine="apple_vision")   # apple vision (macOS only)
 ```
 
 ## `Scanner.scan` returned no detections

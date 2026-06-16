@@ -32,12 +32,12 @@ for d in result.detections:
     print(d.symbology.value, d.payload, d.bbox_xyxy)
 ```
 
-Bare `Scanner()` runs a **2-engine consensus** of the bundled
-`arbez` YOLOX-s detector + the classical `zxing` decoder, both
-always installed. Pass `Scanner(engine="auto")` for single-engine
-auto-pick instead (arbez first on a stock install). `scan()` returns a
-`Result` with all detections + the input image size + per-stage
-wall-clock timings.
+Bare `Scanner()` runs **every installed engine** and unions their
+results (max yield) — `arbez` + `zxing` on a stock install, plus
+`apple_vision` on macOS. Pass `Scanner(engine="arbez")` (or another
+name) for single-engine behavior. `scan()` returns a `Result` with the
+merged detections, each engine's raw detections in `per_engine`, the
+input image size, and per-stage wall-clock timings.
 
 ## What this SDK is, briefly
 

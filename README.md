@@ -20,7 +20,7 @@ require a major version bump.
 
 ## Benchmarks
 
-**Across 4,261 real-world natural-scene photographs, arbez's engines decoded 4,643 distinct barcodes and QR codes confirmed by at least two engines — present in 86.4% of the images.** Of that verified set, ZXing recovers 98%, Apple Vision (macOS-only) 96%, the bundled arbez detector 83%, and the QR-only WeChat engine 48%; the default cross-platform `Scanner()` pairs arbez + ZXing. *A snapshot on one private corpus with default settings — correctness here is cross-engine agreement, not human-labeled ground truth (see Limitations), and it is not a universal ranking.*
+**Across 4,261 real-world natural-scene photographs, arbez's engines decoded 4,643 distinct barcodes and QR codes confirmed by at least two engines — present in 86.4% of the images.** Of that verified set, ZXing recovers 98%, Apple Vision (macOS-only) 96%, the bundled arbez detector 83%, and the QR-only WeChat engine 48%; the default `Scanner()` runs every installed engine and unions their results. *A snapshot on one private corpus with default settings — correctness here is cross-engine agreement, not human-labeled ground truth (see Limitations), and it is not a universal ranking.*
 
 ### Results
 
@@ -35,7 +35,7 @@ Recall is measured against a **verified set of 4,643 codes** that **≥2 engines
 
 *Latency is the per-image median. WeChat's distribution is heavy-tailed (mean ~602 ms, p95 ~2,712 ms on this corpus), so its 42 ms median understates its typical worst-case cost.*
 
-The default `Scanner()` pairs arbez + ZXing by consensus and recovered **4,639 of the 4,643** verified codes on this corpus. Because ZXing is one of its two components, that figure is *not* an independent measurement — it reflects that the cross-platform default misses almost none of what the wider panel confirms (ZXing carrying broad symbology coverage, arbez adding QR / 2D robustness).
+The default `Scanner()` unions every installed engine and recovered **4,639 of the 4,643** verified codes on this corpus. Because ZXing and Apple Vision are among the engines it unions, that figure is *not* an independent measurement — it reflects that the all-engine default misses almost none of what the wider panel confirms (ZXing carrying broad symbology coverage, arbez adding QR / 2D robustness).
 
 <details>
 <summary><b>Per-symbology breakdown</b> — verified codes and per-engine recall</summary>
@@ -64,7 +64,7 @@ Each row is the verified codes of that symbology (≥2 engines agreed); the engi
 
 - **Corpus:** a corpus of 4,261 real-world natural-scene photographs containing barcodes and QR codes (full corpus; the sample ceiling of 5,000 exceeded the available images, so all 4,261 were used, fixed seed 42). Photos span 1D and 2D symbologies under varied lighting, angle, focus, and clutter.
 - **Engines:**
-  - **`Scanner()`** — the default arbez scanner: arbez's bundled ONNX detector plus ZXing, combined by consensus. Cross-platform.
+  - **`Scanner()`** — the default arbez scanner: runs every installed engine and unions their results. On the benchmark host that is arbez's bundled ONNX detector, ZXing, and Apple Vision.
   - **arbez** — the bundled ONNX detector alone.
   - **ZXing** — the built-in classical engine.
   - **Apple Vision** — Apple's Vision framework, macOS-only, auto-enabled on macOS.
@@ -154,14 +154,17 @@ with Scanner() as s:
 
 ## Engines
 
-`Scanner()` (no args) runs a **2-engine consensus by default**:
-the bundled `arbez` YOLOX-s detector + the classical `zxing`
-decoder, with detections from either engine kept (`min_votes=1`,
-union mode). Both are always installed, so the out-of-box
+`Scanner()` (no args) runs **every installed engine** and unions
+their results — whatever any engine can detect is returned (max
+yield). On a stock macOS install that is the bundled `arbez`
+YOLOX-s detector, the classical `zxing` decoder, and `apple_vision`;
+with the WeChat extra installed, `wechat` joins too. `arbez` and
+`zxing` are always installed, so even the leanest out-of-box
 experience gets `arbez`'s strong matrix-code recall (QR, Data
 Matrix) plus `zxing`'s coverage of further 2D codes (Aztec) and
 long-tail 1D codes (EAN-13, the 1D catch-all) at no extra setup
-cost.
+cost. `Scanner().engine_name` is `"consensus"`, and
+`Scanner().engines` returns the resolved all-installed set.
 
 | Engine          | Platform | Install                             |
 |-----------------|----------|-------------------------------------|
@@ -170,21 +173,29 @@ cost.
 | `apple_vision`  | macOS    | default on macOS (pyobjc auto-pulled) |
 | `wechat`        | all      | `pip install 'arbez[wechat]'`       |
 
-Switch off the default consensus when you want different behavior:
+Narrow the engine set, or require agreement, when you want
+different behavior:
 
 ```python
-Scanner(engine="arbez")           # single-engine arbez only
-Scanner(engine="auto")            # single-engine, SDK picks (arbez on stock install)
-Scanner(engine="apple_vision")    # force a specific engine
-Scanner(consensus="vote")         # N-engine majority vote across all installed engines
-                                  # (default min_votes=2 = majority; pass min_votes=1 for union)
+Scanner(engine="arbez")               # single engine only, no consensus
+Scanner(engine="apple_vision")        # force a specific single engine
+Scanner(engines=["arbez", "zxing"])   # union over just this subset
+Scanner(consensus=2)                  # keep only codes >= 2 installed engines agree on
+Scanner(consensus=2,                  # >= 2 of this subset must agree
+        engines=["arbez", "zxing", "apple_vision"])
 ```
+
+`consensus` is an integer; the default `1` means "union" (keep
+anything any engine saw). `consensus=N` keeps only codes that at
+least `N` engines agree on, clustered per detected code. (The
+0.1.x `engine="auto"`, `consensus="off"`/`"vote"` string modes, and
+`min_votes` parameter were removed in 0.2.0.)
 
 The `arbez` engine is **architecture-aware**: the bundled YOLOX-s
 detector is the default, and the same `ArbezEngine` class also
 loads user-supplied YOLOX-s, RT-DETR-v2, or YOLO11-s ONNXes via
 `ArbezEngine(model_path=..., arch=...)`. Multiple `ArbezEngine`
-instances can coexist in a single `Scanner` consensus — both
+instances can coexist in a single multi-engine `Scanner` — both
 across architectures (each gets a distinct `engine.name` derived
 from its arch) and within the same architecture (pass an explicit
 `name="..."` to distinguish e.g. the bundled YOLOX-s from your

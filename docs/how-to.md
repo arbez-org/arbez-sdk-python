@@ -57,16 +57,16 @@ all three forms through `coerce_to_pil` internally.
 
 ## Pick an engine
 
-`Scanner()` (no args) runs the **2-engine default consensus** of
-`arbez` + `zxing`. Override when you have a reason:
+`Scanner()` (no args) runs **every installed engine** and unions
+their results. Pass `engine=` when you want exactly one:
 
 ```python
 Scanner(engine="zxing")          # broadest symbology coverage
 Scanner(engine="wechat")         # QR-only, best on tiny / damaged
 Scanner(engine="apple_vision")   # macOS-only, real confidence scores
 Scanner(engine="arbez")          # single-engine arbez (first-party YOLOX-s + zxing decoder)
-Scanner(engine="auto")           # single-engine auto-pick (arbez on a stock install)
-Scanner(consensus="vote")        # N-engine majority vote across all installed engines
+Scanner(engines=["arbez", "zxing"])  # union over just this subset
+Scanner(consensus=2)             # keep only codes >= 2 installed engines agree on
 ```
 
 When to override:
@@ -77,20 +77,23 @@ When to override:
 | `wechat` | You're scanning small / blurry / partially-occluded QRs and recall matters more than throughput. QR-only. |
 | `apple_vision` | You're on macOS and want real per-detection confidence scores OR ANE-accelerated throughput. |
 | `arbez` | You want the first-party model. The bundled weights are a 14-class YOLOX-s detector (mAP@50 = 0.833 on QR, 0.370 overall, full 14-symbology coverage). Inspect `engine.model_version` to see which weights are loaded. To swap in your own RT-DETR-v2 or YOLO11-s, use `ArbezEngine(arch=..., model_path=...)` per [BYO weights](bring-your-own-weights.md). |
-| `consensus="vote"` | You want the highest decode rate at the cost of ~max(per-engine) latency. All installed engines vote; median bbox + majority payload. See ["Multi-engine consensus voting"](#multi-engine-consensus-voting). |
-| `auto` | You want single-engine behavior without committing to a name. `auto` picks `arbez` on a stock install (priority: arbez → apple_vision → zxing → wechat). Note: bare `Scanner()` is NOT equivalent to `Scanner(engine="auto")` — bare runs the 2-engine consensus default. |
+| `consensus=N` | You want to filter the multi-engine union down to codes engines agree on. `consensus=N` keeps only codes >= N installed engines saw; merged result has median bbox + majority payload. See ["Multi-engine consensus voting"](#multi-engine-consensus-voting). |
 
-To see what `auto` would pick on this host without instantiating:
+Bare `Scanner()` is **NOT** the same as any single-engine
+`Scanner(engine=...)`: bare unions every installed engine, while
+`engine=` runs exactly one. On a stock install `arbez` is the first
+engine the union resolves; to see what a stock install picks first on
+this host without instantiating:
 
 ```python
 from arbez.scanner import resolve_auto_engine
 print(resolve_auto_engine())  # "arbez" | "apple_vision" | "zxing" | "wechat" — "arbez" on a stock install
 ```
 
-### Locking which engines vote in consensus
+### Locking which engines participate
 
-`Scanner(engines=...)` restricts the consensus voter set. Default
-`None` = "all installed engines vote":
+`Scanner(engines=...)` restricts the engine set the union/merge runs
+over. Default `None` = "all installed engines participate":
 
 ```python
 from arbez import Scanner
@@ -99,20 +102,22 @@ from arbez.parallelism import installed_consensus_engines
 installed_consensus_engines()
 # -> ('arbez', 'apple_vision', 'zxing', 'wechat')   # M1 with all extras (locked order)
 
-Scanner(consensus="vote", engines=("zxing", "apple_vision"))
+Scanner(engines=("zxing", "apple_vision"))                  # union over just these two
+Scanner(consensus=2, engines=("zxing", "apple_vision"))     # both must agree
 ```
 
 ## Multi-engine consensus voting
 
-`Scanner(consensus="vote")` runs every installed engine in parallel
-and merges their detections via IoU clustering + majority vote.
+Bare `Scanner()` already runs every installed engine in parallel and
+unions their detections (via IoU clustering, threshold `1`). Raise
+`consensus=N` to keep only the codes that **>= N** engines agree on:
 
 ```python
 import warnings
 from arbez import Scanner
 
-scanner = Scanner(consensus="vote", min_votes=2)
-scanner.warmup()    # pre-loads every voting engine
+scanner = Scanner(consensus=2)    # >= 2 installed engines must agree
+scanner.warmup()                  # pre-loads every participating engine
 
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")    # not needed; engines are quiet now
@@ -123,25 +128,30 @@ for d in result.detections:
     print(d.extras["voted_by"])           # ('apple_vision', 'arbez', 'wechat', 'zxing')
     print(d.extras["vote_count"])         # 4
     print(d.payload)                      # majority-vote payload
+
+# Each engine's own raw detections, before the merge:
+print(result.per_engine.keys())          # dict_keys(['arbez', 'apple_vision', 'zxing', ...])
 ```
 
 Knobs:
 
 | Param | Default | Effect |
 |---|---|---|
-| `min_votes` | `2` | Min unique engines that must agree on a bbox cluster. `1` = union (max recall), `len(engines)` = unanimous. |
+| `consensus` | `1` | Min unique engines that must agree on a bbox cluster. `1` = union (max recall), `len(engines)` = unanimous. Greater than the number of participating engines raises `ValueError`. |
 | `iou_threshold` | `0.5` | Bbox IoU >= this groups detections from different engines as the same physical barcode. |
-| `engines` | `None` (all installed) | Subset of engines that vote. Validated eagerly. |
+| `engines` | `None` (all installed) | Subset of engines that participate. Validated eagerly. |
 
 When to use it:
 
-- **Highest decode rate** — the per-corner-median bbox is more
+- **Highest precision** — `consensus=2` drops codes only one engine
+  saw, filtering single-engine misdetections out of the default union.
+- **Decoder-friendly bbox** — the per-corner-median bbox is more
   decoder-friendly than any single engine's tight crop, especially
   when paired with `arbez` (which sometimes clips the quiet zone).
-- **Robust to single-engine failure** — if one engine raises mid-vote,
+- **Robust to single-engine failure** — if one engine raises mid-merge,
   the others still contribute; logged at WARNING.
 - **Tradeoff: latency** — `max(per-engine times)` thanks to parallel
-  dispatch. ~150 ms on a 640px image when all 4 engines vote. Drop
+  dispatch. ~150 ms on a 640px image when all 4 engines run. Drop
   the slow engine via `engines=` to shave the tail (e.g., drop
   `wechat` or `arbez`).
 
@@ -204,14 +214,14 @@ result = scanner.scan("photo.jpg")
 
 print(f"engine: {scanner.engine_name}")
 print(f"image:  {result.image_size[0]}x{result.image_size[1]}")
-print(f"vote ran in {result.timings_ms['consensus']:.1f} ms")
+print(f"consensus merge ran in {result.timings_ms['consensus']:.1f} ms")
 print(f"{len(result)} detections")
 ```
 
 `timings_ms` is a per-stage wall-clock dict. Keys you may see:
-`"engine"` (single-engine mode, e.g. `Scanner(engine="zxing")`),
-`"consensus"` (`consensus="vote"` mode AND the bare-`Scanner()`
-default consensus shown above), `"preprocess"` (when
+`"engine"` (the single-engine path, e.g. `Scanner(engine="zxing")`),
+`"consensus"` (the multi-engine path — the bare-`Scanner()` union
+shown above, or any `consensus=N`), `"preprocess"` (when
 `preprocess="auto"` kicks in).
 
 ## Benchmark with the built-in corpus
@@ -316,11 +326,12 @@ Implementation rules:
    - Empty tuple if you found nothing — that's not an error.
 
 Your custom engine satisfies the same Protocol the built-ins do, so
-you can also have it vote alongside them in consensus mode. Today
-`Scanner(consensus="vote")` votes across the names in
-`installed_consensus_engines()` (the built-in set); a future
-extension will let you register a user-supplied engine into the
-voter set.
+you can also have it vote alongside them in a consensus merge. The
+multi-engine `Scanner` path runs the names in
+`installed_consensus_engines()` (the built-in set); to vote a custom
+engine in today, call `run_consensus` directly with your own
+`dict[str, Engine]`. A future extension will let you register a
+user-supplied engine into the Scanner's set.
 
 ## Use across threads
 

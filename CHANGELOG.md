@@ -52,6 +52,49 @@ the explicit maintainer act of tagging is the gate.
 
 _Nothing yet._
 
+## 0.2.0 — 2026-06-16
+
+**Scanner consensus model redesign (S-093) — breaking.** Bare `Scanner()`
+now runs **every installed engine** and unions their results for maximum
+yield (whatever any engine can detect is returned), replacing the curated
+2-engine `arbez`+`zxing` default. On a stock macOS install that's
+`arbez`+`zxing`+`apple_vision`; add the WeChat extra and it joins too.
+
+### Breaking changes
+
+- **`Scanner()` default**: was the 2-engine `arbez`+`zxing` consensus
+  (S-075); now the union of **all installed** engines. `Scanner().engines`
+  reflects the full installed set; results on multi-engine hosts may include
+  more detections.
+- **`consensus` is now an `int`** (the per-code agreement threshold), not a
+  mode string. `consensus=1` (default) = union; `consensus=N` keeps only
+  codes **≥ N engines agree on** (per detected code). The `"off"` / `"vote"`
+  strings and the separate **`min_votes`** parameter were removed.
+- **`engine="auto"` removed.** Bare `Scanner()` (all-installed union) replaces
+  its purpose; name a single engine (e.g. `Scanner(engine="arbez")`) for
+  single-engine scanning.
+- `engine=` (single) is mutually exclusive with `engines=` / `consensus>1`
+  (raises `ValueError`); naming an uninstalled engine raises
+  `EngineUnavailable`; `consensus` greater than the engine count raises
+  `ValueError`.
+
+### Added
+
+- **`Result.per_engine`** — `{engine_name: that engine's own raw detections}`,
+  populated whenever an engine ran. Lets callers see each engine's
+  independent finds, including codes that didn't reach a `consensus=N`
+  threshold. `Result.detections` remains the merged, per-code consensus
+  result (with `extras["voted_by"]`).
+- **`arbez.consensus.run_consensus_detailed()`** → `ConsensusResult`
+  (merged `detections` + `per_engine`). `run_consensus()` is unchanged
+  (still returns the merged tuple).
+
+### Unchanged
+
+- Single-engine `Scanner(engine="zxing"|"arbez"|"wechat"|"apple_vision")`,
+  pre-constructed `Engine` instances, per-code IoU clustering + voting policy,
+  and the `Detection` / `Result` core fields.
+
 ## 0.1.0 — 2026-06-01
 
 **First public release.** `arbez` is now Apache-2.0 and published to

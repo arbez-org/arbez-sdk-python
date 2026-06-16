@@ -218,6 +218,25 @@ class Result:
     image_size: tuple[int, int]
     """Input image (width, height) in pixels."""
 
+    per_engine: Mapping[str, tuple[Detection, ...]] = field(default_factory=dict)
+    """Each engine's own raw detections, keyed by engine name (S-093).
+
+    Populated whenever an engine ran:
+
+    * Single-engine ``Scanner(engine="zxing")`` → ``{"zxing": (...)}`` —
+      identical to ``detections`` (one engine, no merge).
+    * Multi-engine (bare ``Scanner()`` = all-installed union, or
+      ``Scanner(consensus=N, engines=...)``) → ``{engine_name: its own
+      detections, ...}`` — what EACH engine independently saw, BEFORE the
+      per-code consensus merge. Useful to see a code that only one engine
+      found, including ones filtered out of ``detections`` by a
+      ``consensus=N`` (N>1) threshold.
+
+    ``detections`` is the merged, per-code consensus result (each carrying
+    ``extras["voted_by"]``); ``per_engine`` is the un-merged breakdown.
+    **Read-only** post-construction (wrapped in ``types.MappingProxyType``).
+    """
+
     timings_ms: Mapping[str, float] = field(default_factory=dict)
     """Per-stage wall-clock in milliseconds.
 
@@ -226,14 +245,11 @@ class Result:
     Current key set:
 
     * ``"engine"`` — engine ``detect_and_decode()`` call wall-clock.
-      Present when ``Scanner(consensus="off")`` (i.e. single-engine
-      mode, including ``Scanner(engine="auto")`` and explicit
-      ``engine="<name>"`` paths).
-    * ``"consensus"`` — multi-engine voting wall-clock (``max`` over
-      per-engine times since they run in parallel). Present when
-      ``Scanner(consensus="vote")`` runs, including bare
-      ``Scanner()`` since S-075 (2026-05-17). Live since S-032 /
-      v0.0.18.
+      Present on the single-engine path (``Scanner(engine="<name>")``).
+    * ``"consensus"`` — multi-engine wall-clock (``max`` over per-engine
+      times since they run in parallel). Present whenever more than one
+      engine runs: bare ``Scanner()`` (all-installed union) and
+      ``Scanner(consensus=N, engines=...)`` (S-093).
     * ``"preprocess"`` — added when ``Scanner.scan(image,
       preprocess="auto")`` triggers the downscale + autocontrast
       path. Reports the preprocess wall-clock, not the engine.
@@ -251,6 +267,13 @@ class Result:
         if not isinstance(self.timings_ms, MappingProxyType):
             frozen = MappingProxyType(dict(self.timings_ms))
             object.__setattr__(self, "timings_ms", frozen)
+        # S-093: freeze per_engine too — each value coerced to a tuple so
+        # the read-only contract holds even if a caller passed lists.
+        if not isinstance(self.per_engine, MappingProxyType):
+            frozen_pe = MappingProxyType(
+                {name: tuple(dets) for name, dets in self.per_engine.items()}
+            )
+            object.__setattr__(self, "per_engine", frozen_pe)
 
     def __len__(self) -> int:  # convenience: ``len(result)`` for # of detections
         return len(self.detections)

@@ -1,19 +1,19 @@
-# Consensus rules — what `Scanner(consensus="vote")` actually does
+# Consensus rules — what the multi-engine `Scanner()` actually does
 
 This page is the deterministic field-by-field spec for the consensus
-voting that happens inside `Scanner(consensus="vote")` and inside
-the S-075 default `Scanner()`. The implementation lives in
+merge on the multi-engine `Scanner()` path. The implementation lives in
 `src/arbez/consensus.py`; this is the user-facing companion that
 explains the rules without reading the code.
 
-The two consensus paths use the same machinery; only the defaults
-differ:
+Every multi-engine path uses the same machinery; only the engine set
+and the agreement threshold differ (`Scanner`'s integer `consensus=`
+maps onto the `min_votes` below):
 
-| Path | Engines | min_votes |
+| Path | Engines | threshold |
 |---|---|---|
-| Bare `Scanner()` (S-075) | `("arbez", "zxing")` | 1 (union) |
-| `Scanner(consensus="vote")` | all installed | 2 (majority) |
-| `Scanner(consensus="vote", engines=..., min_votes=...)` | as passed | as passed |
+| Bare `Scanner()` | all installed | 1 (union) |
+| `Scanner(consensus=N)` | all installed | N |
+| `Scanner(consensus=N, engines=...)` | as passed | N |
 
 ## The pipeline (5 stages)
 

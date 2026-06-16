@@ -30,25 +30,22 @@ default. No extras needed for a fully working scanner.
   `Scanner(engine="apple_vision")` works out of the box. Linux /
   Windows installs are unchanged.
 
-Bare `Scanner()` runs a **2-engine consensus** of `arbez` + `zxing`
-— both are core deps installed by every stock `pip install arbez`.
-To opt out and get single-engine behavior:
+Bare `Scanner()` runs **every installed engine** and unions their
+results — `arbez` + `zxing` (core deps) on every stock install, plus
+`apple_vision` on macOS. To get single-engine behavior:
 
-* `Scanner(engine="auto")` — resolves to the best installed single
-  engine (priority: **arbez → apple_vision → zxing → wechat**).
 * `Scanner(engine="arbez")` / `"zxing"` / `"apple_vision"` /
-  `"wechat"` — force a specific engine.
+  `"wechat"` — run just that engine.
 
-For richer recall via multi-engine consensus voting, install the
-classical engines as extras and use `Scanner(consensus="vote")` —
+To require agreement instead of a union, pass an integer threshold:
+`Scanner(consensus=2)` keeps only codes that >= 2 engines agree on —
 see [Concepts → Consensus](concepts.md#consensus--multi-engine-voting).
 
 ## Extras
 
-Extras are for **additional** engines that join arbez in
-`Scanner(consensus="vote")` and remain available via explicit
-`Scanner(engine="...")`. Order below mirrors the canonical engine
-order.
+Extras are for **additional** engines that join the default `Scanner()`
+union and remain available via explicit `Scanner(engine="...")`. Order
+below mirrors the canonical engine order.
 
 | Extra | Adds | Use for |
 |---|---|---|
@@ -178,9 +175,9 @@ Default engine:       consensus
 > **YOLOX-s, RT-DETR-v2, and YOLO11-s** ONNXes via `model_path=` +
 > `arch=`; see [Bring your own weights](bring-your-own-weights.md).
 > For single-engine behavior pass `Scanner(engine="arbez")` /
-> `"auto"` / `"zxing"` / `"wechat"` / `"apple_vision"`. To run
-> every installed engine and merge their detections, use
-> `Scanner(consensus="vote")`.
+> `"zxing"` / `"wechat"` / `"apple_vision"`. Bare `Scanner()` already
+> runs every installed engine and merges their detections; add
+> `consensus=N` to require N-engine agreement.
 
 ## CUDA + Core ML acceleration
 
