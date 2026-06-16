@@ -20,104 +20,87 @@ require a major version bump.
 
 ## Benchmarks
 
-**Across 4,261 real-world natural-scene photographs, arbez's engines decoded 4,643 distinct barcodes and QR codes confirmed by at least two engines — present in 86.4% of the images.** Of that verified set, ZXing recovers 98%, Apple Vision (macOS-only) 96%, the bundled arbez detector 83%, and the QR-only WeChat engine 48%; the default `Scanner()` runs every installed engine and unions their results. *A snapshot on one private corpus with default settings — correctness here is cross-engine agreement, not human-labeled ground truth (see Limitations), and it is not a universal ranking.*
+**Across 4,276 real-world natural-scene photographs, the default `Scanner()` — which runs every installed engine and unions their results — decoded 5,014 distinct codes and found at least one in 98% of images: more than any single engine.** *A snapshot on one private corpus (macOS, all four engines) with default settings; these are decode-yield counts, not a human-labeled ground truth (see Limitations), and not a universal ranking.*
 
-### Results
+### Yield by configuration
 
-Recall is measured against a **verified set of 4,643 codes** that **≥2 engines decoded identically** (same image, same payload). Cross-engine agreement filters the misdetections and symbology-mislabels that single-engine raw decode counts include.
+Distinct codes decoded over 4,290 images (4,276 corpus + 14 synthesized exotic-format). `Scanner()` is the 0.2.0 default — the union of all installed engines; `consensus=N` keeps only codes that **≥ N engines agree on** (per detected code).
 
-| Engine | Recall vs verified set | Median latency | Notes |
-|---|--:|--:|---|
-| ZXing | **98.1%** | 51 ms | built-in; broad symbology coverage |
-| Apple Vision *(macOS-only)* | 95.9% | 20 ms | strongest 1D linear; weaker on Data Matrix |
-| arbez (bundled ONNX detector) | 82.6% | 83 ms | strong on QR / Data Matrix / Aztec; lighter on 1D linear |
-| WeChat *(QR-only)* | 48.2% | 42 ms | QR only |
+| Configuration | Images with ≥1 code | Distinct codes decoded |
+|---|--:|--:|
+| **`Scanner()`** — all engines, union | **4,224  (98%)** | **5,014** |
+| `engine="apple_vision"` *(macOS-only)* | 4,188 | 4,932 |
+| `engine="zxing"` | 3,661 | 3,956 |
+| `engine="arbez"` *(bundled detector)* | 3,284 | 3,481 |
+| `engine="wechat"` *(QR-only)* | 2,226 | 2,084 |
+| `consensus=2` *(≥2 engines agree)* | 3,746 | 4,199 |
+| `consensus=3` *(≥3 engines agree)* | 3,044 | 3,094 |
 
-*Latency is the per-image median. WeChat's distribution is heavy-tailed (mean ~602 ms, p95 ~2,712 ms on this corpus), so its 42 ms median understates its typical worst-case cost.*
+`Scanner()` beats every single engine on both axes — **+82 distinct codes** over the strongest single engine (Apple Vision) on this macOS host, and a larger margin on Linux/Windows where Apple Vision isn't available. `consensus=2`/`=3` trade yield for cross-engine agreement (precision).
 
-The default `Scanner()` unions every installed engine and recovered **4,639 of the 4,643** verified codes on this corpus. Because ZXing and Apple Vision are among the engines it unions, that figure is *not* an independent measurement — it reflects that the all-engine default misses almost none of what the wider panel confirms (ZXing carrying broad symbology coverage, arbez adding QR / 2D robustness).
+### By symbology
 
-<details>
-<summary><b>Per-symbology breakdown</b> — verified codes and per-engine recall</summary>
+Distinct codes decoded **per engine** — each engine leads on different symbologies, which is exactly why `Scanner()` unions them:
 
-Each row is the verified codes of that symbology (≥2 engines agreed); the engine columns show what fraction of them each engine recovered.
+| Symbology | arbez | Apple Vision | ZXing | WeChat |
+|---|--:|--:|--:|--:|
+| QR | **2,615** | 2,357 | 2,357 | 2,084 |
+| Code 128 | 670 | **1,564** | 996 | – |
+| Data Matrix | 234 | **505** | 254 | – |
+| Code 39 | 111 | **156** | 121 | – |
+| ITF | – | **154** | 100 | – |
+| PDF417 | 51 | **85** | 54 | – |
+| EAN-13 | – | **81** | 50 | – |
+| Aztec | – | **14** | 10 | – |
 
-| Symbology | Verified codes | ZXing | Apple Vision | arbez | WeChat |
-|---|--:|--:|--:|--:|--:|
-| QR | 2,556 | 99% | 99% | 99% | 88% |
-| Code 128 | 1,274 | 96% | 100% | 61% | – |
-| Data Matrix | 375 | 99% | 58% | 97% | – |
-| ITF | 164 | 100% | 100% | 13% | – |
-| Code 39 | 144 | 97% | 99% | 46% | – |
-| EAN-13 | 60 | 100% | 100% | 55% | – |
-| PDF417 | 49 | 92% | 78% | 67% | – |
-| Code 93 | 12 | 100% | 100% | 17% | – |
-| Aztec | 8 | 100% | 100% | 100% | – |
-| EAN-8 | 1 | 100% | 100% | – | – |
-| **All** | **4,643** | **98%** | **96%** | **83%** | **48%** |
-
-*Percentages are recall — the share of that symbology's verified codes the engine decoded. "–" = the engine does not target that symbology (WeChat is QR-only), or recovered none of a tiny sample (arbez on the single EAN-8). The bundled arbez detector is strong on QR, Data Matrix, and Aztec but lighter on 1D linear types (ITF, Code 39/93); ZXing and Apple Vision lead on linear barcodes.*
-
-</details>
+*Bold = best single engine for that symbology. arbez (bundled detector + libdmtx) leads QR; Apple Vision leads the 1D/linear family and Data Matrix on this macOS host; ZXing is the broad cross-platform decoder; WeChat is QR-only ("–" = not targeted). These are raw per-engine distinct payloads — `Scanner()` unions all of them (see the yield table above), deduplicating and cross-voting per physical code, so its per-symbology totals are not a simple column sum.*
 
 ### Methodology
 
-- **Corpus:** a corpus of 4,261 real-world natural-scene photographs containing barcodes and QR codes (full corpus; the sample ceiling of 5,000 exceeded the available images, so all 4,261 were used, fixed seed 42). Photos span 1D and 2D symbologies under varied lighting, angle, focus, and clutter.
-- **Engines:**
-  - **`Scanner()`** — the default arbez scanner: runs every installed engine and unions their results. On the benchmark host that is arbez's bundled ONNX detector, ZXing, and Apple Vision.
-  - **arbez** — the bundled ONNX detector alone.
-  - **ZXing** — the built-in classical engine.
-  - **Apple Vision** — Apple's Vision framework, macOS-only, auto-enabled on macOS.
-  - **WeChat** — the OpenCV WeChat QR detector (QR-only).
-- **Verified set:** a code is counted only when **≥2 of the four engines** (arbez, ZXing, WeChat, Apple Vision) return the **identical payload for the same image** — 4,643 codes, deduplicated per image. This cross-check discards single-engine misdetections, overlapping-box duplicates, and symbology-mislabels, which raw decode counts otherwise inflate.
-- **Metrics:** per-engine **recall** = the share of the verified set the engine decoded; image coverage = the 86.4% of images holding ≥1 verified code; and median wall-clock latency per image.
-- **Hardware:** Apple Silicon (arm64), macOS, 8 CPU cores. Python 3.13.
-- **Build:** pre-release build of v0.1.0 (engine code identical to the v0.1.0 release). **Date:** 2026-06-01.
+- **Corpus:** 4,276 real-world natural-scene photographs (the full corpus) spanning 1D and 2D symbologies under varied lighting, angle, focus, and clutter — plus 14 synthesized images that exercise the exotic input formats (HEIC, AVIF, WebP, BMP, TIFF, GIF) end to end.
+- **Configurations:** each engine alone (arbez, Apple Vision, ZXing, WeChat), `Scanner()` (all installed engines, union), and `consensus=2` / `consensus=3`. All seven are derived from a **single scan per image** — `Scanner()` runs every engine once, `Result.per_engine` exposes each engine's own detections, and the consensus thresholds re-vote those cached detections — so the configurations are exactly comparable.
+- **Metric:** **distinct codes decoded** = distinct decoded payloads (deduplicated by hash). "Images with ≥1 code" = images where the configuration decoded at least one payload. These are decode-**yield** counts.
+- **Environment:** a fresh `pip install arbez[all]` (all four engines + HEIC/AVIF), Python 3.12, Apple Silicon (macOS arm64). arbez 0.2.0.
+- **Date:** 2026-06-16.
 
 ### Reproduce
 
-The full multi-engine table (including the WeChat QR engine) requires the optional extra:
-
 ```bash
-pip install 'arbez[wechat]'
+pip install 'arbez[all]'   # all four engines + HEIC/AVIF input formats
 ```
 
-ZXing is built in, and Apple Vision is auto-enabled on macOS. The default install gives you arbez + ZXing (plus Apple Vision on macOS):
+Every configuration above comes from one `Scanner()` pass per image — `Result.per_engine` gives each engine's own detections, and `consensus=N` applies an agreement threshold:
 
-```bash
-pip install arbez
+```python
+from pathlib import Path
+from arbez import Scanner
+
+scanner = Scanner()                       # union of all installed engines
+strict  = Scanner(consensus=2)            # keep only codes >=2 engines agree on
+for img in Path("your-images").iterdir():
+    res = scanner.scan(img)
+    res.detections            # merged, per-code union (each with extras["voted_by"])
+    res.per_engine["zxing"]   # that engine's own raw detections
 ```
 
-Run the benchmark against your own directory of images with
-[`arbez_benchmark3.py`](https://github.com/arbez-org/arbez-sdk-python/blob/main/examples/arbez_benchmark3.py)
-— the script lives in the GitHub repository (under `examples/`), not in the pip package, so run it from a repo checkout:
-
-```bash
-python examples/arbez_benchmark3.py --corpus <your-dir> --sample 5000 --seed 42 --with-scanner --no-charts --out-dir <out-dir>
-```
-
-The corpus walk yields up to 5,000 images (4,261 in the private run, where the corpus held fewer images than the 5,000 sample ceiling). Results land in `<out-dir>/summary.json`, `REPORT.md`, and a `per_engine_<name>.csv` per engine; the verified-set recall above is computed by intersecting decoded payloads across the per-engine CSVs (≥2 engines agreeing on the same image + payload). Note that `summary.json` also reports a built-in `consensus_validated_recall`; that is a different metric (IoU-clustered boxes, with the composite `Scanner()` included as a voter) and will not match the ≥2-engine payload-verified recall above. The private corpus used here is not shipped. For a runnable, self-contained subset, generate a synthetic corpus with `arbez.testing.clean_corpus()` (its generators need the `[dev]` extra, or `pip install qrcode python-barcode`), save the in-memory specimens to a directory, and point `--corpus` at it:
+The private corpus used above is not shipped. For a runnable, self-contained corpus, generate synthetic specimens with `arbez.testing.clean_corpus()` (needs the `[dev]` extra, or `pip install qrcode python-barcode`):
 
 ```python
 from pathlib import Path
 from arbez.testing import clean_corpus
 
-out = Path("synthetic-corpus")
-out.mkdir(exist_ok=True)
+out = Path("synthetic-corpus"); out.mkdir(exist_ok=True)
 for s in clean_corpus():
     s.image.save(out / f"{s.spec_id}.png")
 ```
 
-*The numbers above were measured on the pre-release build that became v0.1.0; the v0.1.0 release contains the same engine code paths.*
-
 ### Limitations
 
 - This is a **capability snapshot, not a competitor ranking.** Results are specific to this corpus, this hardware, and default configuration; your mileage will vary with image mix, resolution, and tuning.
-- **Apple Vision is macOS-only** and unavailable on Linux/Windows, where the cross-platform `Scanner()` (arbez + ZXing) is the recommended default.
-- **WeChat is QR-only** and is included for QR comparison, not general barcode coverage.
-- **Engine independence is partial.** arbez and ZXing share the zxing-cpp decoder library, so an agreement only between those two corroborates detection but not decoder independence (Apple Vision and WeChat are independent decode implementations).
-- **No human-labeled ground truth.** "Verified" means ≥2 engines agree, not a hand-annotated key. This is conservative: a code only one engine reads correctly is *excluded* from the verified set (so true single-engine reads aren't credited), and a code every engine misreads identically would not be caught.
-- **Raw per-engine decode counts are not reported** because they overstate: the arbez detector emits overlapping boxes for one code and occasionally mislabels a 1D barcode's symbology or returns a misdecode. Cross-engine corroboration discards these, which is why the recall figures here are lower (and more honest) than raw decode tallies.
+- **Decode yield, not ground truth.** "Distinct codes decoded" counts what each configuration *read*; it is not checked against a human-labeled key, so a misread inflates a count. The `consensus=2`/`=3` rows are the precision view — codes that multiple engines independently agree on (per code).
+- **Apple Vision is macOS-only** and unavailable on Linux/Windows, where `Scanner()` unions arbez + ZXing (+ WeChat if installed); the relative gain from unioning is larger there.
+- **Engine independence is partial.** arbez and ZXing share the zxing-cpp decoder library, so agreement between only those two corroborates detection but not decoder independence (Apple Vision and WeChat are independent implementations).
+- **WeChat is QR-only** and heavy-tailed in latency (its median understates its worst case), so it is included for QR comparison, not general coverage.
 
 ## Install
 
