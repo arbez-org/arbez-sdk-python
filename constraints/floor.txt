@@ -46,6 +46,13 @@ pillow==10.3.0
 onnxruntime==1.18.0
 zxing-cpp==3.0.0
 
+# S-092 (2026-06-14): arbez-dmtx — companion wheel (native libdmtx) used as
+# the ArbezEngine Data Matrix fallback. CORE on the four shipped platforms;
+# marker matches pyproject.toml. Floor pinned to the first published release
+# (0.0.1, live on PyPI) per the lockstep convention with pyproject.toml so
+# install-smoke-min catches drift.
+arbez-dmtx==0.0.1  ; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine in 'x86_64 aarch64') or (sys_platform == 'win32' and platform_machine == 'AMD64')
+
 # S-084 (2026-05-18): pyobjc-framework-Vision + pyobjc-framework-Quartz
 # moved into core dependencies, auto-pulled on Darwin so a bare
 # `pip install arbez` on macOS gets a working AppleVisionEngine.

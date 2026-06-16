@@ -72,8 +72,10 @@ from _corpus_source import (  # type: ignore[import-not-found]
 from arbez.engines.arbez import ArbezEngine
 
 # Stage labels as defined in ``ArbezEngine._STAGE_LABELS`` +
-# ``_FALLBACK_STAGE_LABEL`` — keep in sync with the engine.
-STAGES = ("tight", "medium", "large", "fallback")
+# ``_FALLBACK_STAGE_LABEL``, plus the S-092 ``"libdmtx"`` stage set when the
+# arbez-dmtx fallback recovers a Data Matrix that zxing-cpp missed — keep in
+# sync with the engine (engines/arbez.py sets decode_stage="libdmtx").
+STAGES = ("tight", "medium", "large", "fallback", "libdmtx")
 
 
 def main() -> int:

@@ -54,6 +54,7 @@ updates:
       - dependency-name: "pillow"
       - dependency-name: "onnxruntime"
       - dependency-name: "zxing-cpp"
+      - dependency-name: "arbez-dmtx"  # S-092 floor pin (constraints/floor.txt)
       - dependency-name: "pyobjc-framework-Vision"
       - dependency-name: "pyobjc-framework-Quartz"
       - dependency-name: "opencv-contrib-python"

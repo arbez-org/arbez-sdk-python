@@ -430,6 +430,15 @@ class ArbezEngine:
         self._zxing_module: Any | None = None
         self._zxing_probed: bool = False
 
+        # S-092: lazy-loaded arbez-dmtx (libdmtx) Data Matrix decoder. Used ONLY
+        # as a fallback when zxing-cpp fails to decode a DATA_MATRIX-class
+        # detection (libdmtx is markedly stronger on deformed / low-contrast
+        # Data Matrix). Graceful: if arbez-dmtx isn't installed (a platform with
+        # no wheel, or a stripped install), the probe caches None and the engine
+        # behaves exactly as before — DataMatrix is decoded via zxing-cpp only.
+        self._dmtx_decode: Any | None = None
+        self._dmtx_probed: bool = False
+
         # S-039 (v0.0.24): use raw metadata dict, NOT
         # ``self.model_version`` — the property triggers session-load
         # post-S-039, and we want ``__init__`` to stay cheap. Pre-
@@ -666,6 +675,10 @@ class ArbezEngine:
             self._session = None
             self._zxing_module = None
             self._zxing_probed = False
+            # S-092: reset the libdmtx probe too, for symmetry with zxing —
+            # a reopened engine re-probes the arbez-dmtx companion consistently.
+            self._dmtx_decode = None
+            self._dmtx_probed = False
             # Metadata stays — it's a small dict, was loaded from
             # disk-pinned bytes, and ``model_version`` property reads
             # it without triggering a session reload. Resetting it
@@ -970,6 +983,77 @@ class ArbezEngine:
             self._zxing_probed = True
             return self._zxing_module
 
+    def _get_dmtx(self) -> Any | None:
+        """Probe + cache the arbez-dmtx (libdmtx) Data Matrix decoder (S-092).
+
+        Returns the ``decode`` callable, or ``None`` if arbez-dmtx isn't
+        installed / usable — in which case the engine decodes Data Matrix via
+        zxing-cpp only (no behaviour change). Cached after the first probe.
+
+        Mirrors ``_get_zxing``'s S-039 double-checked-lock so a concurrent
+        scan can never observe ``_dmtx_probed`` true while ``_dmtx_decode`` is
+        still unset (which would silently skip libdmtx for that batch).
+        """
+        # Fast path: already probed.
+        if self._dmtx_probed:
+            return self._dmtx_decode
+        with self._session_lock:
+            if self._dmtx_probed:
+                return self._dmtx_decode
+            try:
+                # arbez-dmtx is a core dep on the four shipped platforms but has
+                # no wheel elsewhere; the three codes keep the ignore correct in
+                # every env (absent -> import-not-found; installed untyped ->
+                # import-untyped; installed + py.typed -> unused-ignore).
+                from arbez_dmtx import (  # type: ignore[import-not-found, import-untyped, unused-ignore]
+                    decode as _dmtx_decode,
+                )
+                self._dmtx_decode = _dmtx_decode
+            except Exception as e:  # not installed / no wheel on this platform
+                _log.debug(
+                    "ArbezEngine: arbez-dmtx unavailable (%r); Data Matrix "
+                    "decoded via zxing-cpp only", e,
+                )
+                self._dmtx_decode = None
+            # Set probed LAST, inside the lock, after _dmtx_decode is assigned.
+            self._dmtx_probed = True
+            return self._dmtx_decode
+
+    @staticmethod
+    def _dmtx_decode_one(
+        dmtx_decode: Any, pil_image: PILImage, det: RawDetection,
+    ) -> str | None:
+        """Fallback Data Matrix decode via libdmtx on the detected crop (S-092).
+
+        Only invoked when zxing-cpp failed on a DATA_MATRIX-class detection.
+        Crops the bbox (with pad), upscales small crops (libdmtx benefits), and
+        runs libdmtx with a short timeout. Returns the payload or ``None``.
+        """
+        try:
+            bmin = min(det.x2 - det.x1, det.y2 - det.y1)
+            if bmin <= 0:
+                return None
+            pad = max(8.0, 0.25 * bmin)
+            iw, ih = pil_image.width, pil_image.height
+            crop = pil_image.crop((
+                max(0, int(det.x1 - pad)), max(0, int(det.y1 - pad)),
+                min(iw, int(det.x2 + pad)), min(ih, int(det.y2 + pad)),
+            )).convert("RGB")
+            cw, ch = crop.size
+            if cw < 4 or ch < 4:
+                return None
+            if min(cw, ch) < 300:  # libdmtx decodes upscaled crops far better
+                s = 300.0 / min(cw, ch)
+                crop = crop.resize((max(1, int(cw * s)), max(1, int(ch * s))))
+            res = dmtx_decode(crop, max_count=1, timeout=300)
+            if res:
+                # str(...) because dmtx_decode is Any-typed (optional dep), so
+                # mypy can't see that .data is bytes / .decode() returns str.
+                return str(res[0].data.decode("utf-8", "replace"))
+        except Exception as e:
+            _log.debug("ArbezEngine: libdmtx fallback failed: %r", e)
+        return None
+
     def _decode_detections(
         self, raw_dets: list[RawDetection], pil_image: PILImage,
     ) -> tuple[Detection, ...]:
@@ -981,6 +1065,9 @@ class ArbezEngine:
         """
         zxing = self._get_zxing() if self._decode_enabled else None
         decoder_active = zxing is not None
+        # S-092: libdmtx Data Matrix fallback decoder (probed once; None if the
+        # arbez-dmtx companion isn't installed -> behaviour unchanged).
+        dmtx_decode = self._get_dmtx() if self._decode_enabled else None
 
         # S-035 perf: materialize the image once as a numpy view so the
         # staged decoder (up to 4 zxing passes per detection) can slice
@@ -1018,6 +1105,16 @@ class ArbezEngine:
                 symbology = self._class_id_to_symbology[d.class_id]
             else:
                 symbology = Symbology.OTHER_1D
+            # S-092: when zxing-cpp failed on a Data Matrix detection, try the
+            # stronger libdmtx decoder on the same crop. Data-Matrix-only by
+            # design (libdmtx decodes nothing else); skipped entirely when the
+            # arbez-dmtx companion isn't installed (dmtx_decode is None).
+            if (payload is None and dmtx_decode is not None
+                    and symbology == Symbology.DATA_MATRIX):
+                dmtx_payload = self._dmtx_decode_one(dmtx_decode, pil_image, d)
+                if dmtx_payload is not None:
+                    payload = dmtx_payload
+                    decode_stage = "libdmtx"
             polygon: tuple[tuple[float, float], ...] = (
                 (d.x1, d.y1), (d.x2, d.y1), (d.x2, d.y2), (d.x1, d.y2),
             )
@@ -1030,7 +1127,8 @@ class ArbezEngine:
                 if 0 <= d.class_id < len(self._class_names) else "unknown"
             )
             extras: dict[str, object] = {
-                "decoder": "zxing" if payload is not None else "none",
+                "decoder": ("libdmtx" if decode_stage == "libdmtx"
+                            else "zxing" if payload is not None else "none"),
                 "model_class_id": d.class_id,
                 "model_class_name": model_class_name,
             }
