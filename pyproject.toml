@@ -69,6 +69,35 @@ dependencies = [
     # for why 2.2 was bumped. Pinned identically in
     # constraints/floor.txt so install-smoke-min catches drift.
     "zxing-cpp>=3.0",
+    # S-092 (2026-06-14): arbez-dmtx — self-contained libdmtx Data Matrix decoder,
+    # used as a fallback when zxing-cpp fails on a Data Matrix crop (libdmtx
+    # recovers a large share of deformed / low-contrast Data Matrix on our eval
+    # corpus). CORE (default-on) because it strictly *adds* correct, ECC-validated
+    # decodes with zero regression to other symbologies and zero runtime cost
+    # unless zxing-cpp fails on a Data-Matrix-class detection. The native libdmtx
+    # is bundled in the per-platform wheel (no apt/brew/system setup). The marker
+    # scopes the dep to the CPU/OS we ship wheels for; the runtime _get_dmtx
+    # probe (engines/arbez.py) degrades ArbezEngine to zxing-cpp-only Data
+    # Matrix whenever the import fails.
+    # arbez-dmtx 0.0.1 is live on PyPI with per-platform wheels (macOS arm64,
+    # manylinux_2_28 x86_64/aarch64, win_amd64), each bundling native libdmtx
+    # 0.7.8. Verified by installing from PyPI across CPython 3.10-3.14 incl.
+    # free-threaded 3.13t/3.14t on all four platforms, so ci.yml's
+    # `pip install -e ".[dev]"` and the wheel-audit (tools/audit_wheels.py,
+    # which lists arbez-dmtx) both resolve green.
+    # musllinux NOTE (not a blocker): PEP 508 markers have no glibc-vs-musl
+    # key, so this marker also matches Alpine (musllinux) x86_64/aarch64, where
+    # arbez-dmtx is required but has no wheel. This does NOT regress anything:
+    # Alpine is already outside arbez's supported matrix because onnxruntime
+    # (a core dep, always installed for ArbezEngine) ships no musllinux wheel
+    # AND no sdist (verified on PyPI 2026-06-14: onnxruntime + opencv-contrib
+    # both 0 musllinux / 0 sdist; zxing-cpp 0 musllinux but has an sdist).
+    # So `pip install arbez` already hard-fails on onnxruntime before reaching
+    # arbez-dmtx; tools/audit_wheels.py's PLATFORM_TAGS intentionally lists
+    # only manylinux (glibc) for this reason. Full Alpine support (musllinux
+    # wheels across the native deps) is a long-term "nice to have", gated on
+    # onnxruntime first — not on arbez-dmtx.
+    "arbez-dmtx>=0.0.1; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine in 'x86_64 aarch64') or (sys_platform == 'win32' and platform_machine == 'AMD64')",
     # S-084 (2026-05-18): pyobjc-framework-Vision + pyobjc-framework-Quartz
     # auto-pulled on Darwin so `pip install arbez` on macOS gives a fully
     # working AppleVisionEngine out of the box. Pre-S-084 these lived

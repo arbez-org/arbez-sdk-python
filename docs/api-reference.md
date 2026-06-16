@@ -515,7 +515,12 @@ bundled YOLOX-s + a user-trained YOLOX-s fine-tune) in one
 
 **Detection.extras** populated by this engine:
 
-- `decoder`: `"zxing"` (decoded successfully) or `"none"`
+- `decoder`: `"zxing"` (decoded by zxing-cpp), `"libdmtx"` (Data Matrix
+  recovered by the arbez-dmtx fallback after zxing-cpp failed the crop,
+  S-092), or `"none"` (not decoded)
+- `decode_stage`: present only when a payload was decoded — which strategy
+  produced it: `"tight"` / `"medium"` / `"large"` / `"fallback"` (the staged
+  zxing-cpp crops) or `"libdmtx"` (the S-092 Data Matrix fallback)
 - `model_class_id`: int 0..(num_classes - 1)
 - `model_class_name`: native class name from the loaded model's
   vocabulary. The bundled weights yield 14-class names (qr, micro_qr,

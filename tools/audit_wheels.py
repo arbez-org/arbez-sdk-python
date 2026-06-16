@@ -78,6 +78,12 @@ NATIVE_DEPS: dict[str, str] = {
     "pillow": ">=10",
     "onnxruntime": ">=1.18",
     "zxing-cpp": ">=3.0",
+    # S-092 (2026-06-14): arbez-dmtx — companion wheel bundling native
+    # libdmtx for the ArbezEngine Data Matrix fallback, a CORE dep on the
+    # four shipped platforms (see DEP_PLATFORMS below; same set as its
+    # pyproject marker). Published to PyPI (0.0.1) with manylinux/macosx-tagged
+    # per-platform wheels, so this audit cell resolves green.
+    "arbez-dmtx": ">=0.0.1",
     # consensus extras (every user with `arbez[consensus]` gets these
     # on top of the defaults — apple-vision is Darwin-only by marker)
     "opencv-contrib-python": ">=4.9",
@@ -99,6 +105,12 @@ NATIVE_DEPS: dict[str, str] = {
 # scope, see S-009).
 DEP_PLATFORMS: dict[str, frozenset[str]] = {
     "onnxruntime-gpu": frozenset({"linux_x86_64", "windows_x86_64"}),
+    # arbez-dmtx ships wheels for exactly the four platforms in its
+    # pyproject marker (all current PLATFORM_TAGS keys). Pinned here so a
+    # future macos_x86_64 row wouldn't accidentally audit it there.
+    "arbez-dmtx": frozenset(
+        {"macos_arm64", "linux_x86_64", "linux_aarch64", "windows_x86_64"}
+    ),
 }
 
 PYTHONS = ["3.10", "3.11", "3.12", "3.13", "3.14"]
