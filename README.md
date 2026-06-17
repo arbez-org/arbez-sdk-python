@@ -64,6 +64,7 @@ with Scanner() as scanner:                       # union of all installed engine
     result = scanner.scan("photo.jpg")           # path, bytes, PIL.Image, ndarray, or stream
     for d in result.detections:
         print(d.symbology, d.payload, d.bbox_xyxy)
+        # ->  Symbology.QR  https://arbez.org  (40.0, 40.0, 290.0, 290.0)
 ```
 
 Narrow the engine set, or require agreement:
