@@ -89,6 +89,18 @@ yield (whatever any engine can detect is returned), replacing the curated
   (merged `detections` + `per_engine`). `run_consensus()` is unchanged
   (still returns the merged tuple).
 
+### Changed
+
+- **ArbezEngine symbology is now decoder-authoritative (S-094).** When the
+  classical decoder reads a crop, the decoded (ECC-validated) format names the
+  symbology, overriding the YOLOX detector's classification — so a Data Matrix
+  the detector had filed as "QR" is now correctly labeled `DATA_MATRIX`. The
+  detector's original guess is preserved in `extras["detector_symbology"]` when
+  it was overridden. When nothing decodes, the detector's class stands. This
+  also makes consensus symbology votes more accurate. A caller reading
+  `Detection.symbology` from ArbezEngine on a decoded code may now see a
+  different (more correct) value than in 0.1.x.
+
 ### Unchanged
 
 - Single-engine `Scanner(engine="zxing"|"arbez"|"wechat"|"apple_vision")`,

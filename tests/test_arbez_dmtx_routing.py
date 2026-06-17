@@ -193,7 +193,7 @@ def _engine_with_failing_zxing_and_fake_dmtx(
     engine._zxing_module = object()
     engine._zxing_probed = True
     monkeypatch.setattr(
-        engine, "_decode_one", lambda *_a, **_k: (None, None), raising=True,
+        engine, "_decode_one", lambda *_a, **_k: (None, None, None), raising=True,
     )
     # Inject a fake libdmtx decoder, pre-probed so _get_dmtx returns it.
     def fake_dmtx(crop: object, max_count: int = 0, timeout: int = 0) -> list[_FakeDmtxResult]:
@@ -251,10 +251,10 @@ def test_no_libdmtx_call_when_zxing_succeeds(
     engine = ArbezEngine(decode=True)
     engine._zxing_module = object()
     engine._zxing_probed = True
-    # zxing succeeds on the crop.
+    # zxing succeeds on the crop (S-094: 3-tuple — payload, stage, decoded symbology).
     monkeypatch.setattr(
         engine, "_decode_one",
-        lambda *_a, **_k: ("ZXING-DECODED", "tight"), raising=True,
+        lambda *_a, **_k: ("ZXING-DECODED", "tight", Symbology.DATA_MATRIX), raising=True,
     )
 
     def fake_dmtx(*_a: object, **_k: object) -> list[_FakeDmtxResult]:

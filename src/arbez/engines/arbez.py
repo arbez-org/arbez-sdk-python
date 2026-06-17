@@ -66,8 +66,9 @@ from arbez.engines._yolox import (
 )
 from arbez.engines.base import ThreadSafety
 from arbez.engines.helpers import coerce_to_pil
+from arbez.engines.zxing import symbology_for_zxing_format
 from arbez.exceptions import EngineUnavailable
-from arbez.types import Detection
+from arbez.types import Detection, Symbology
 
 # S-066: architecture dispatch — values come from the bundled (or
 # user-supplied) ONNX's ``arbez_arch`` metadata key. Unknown values
@@ -1092,29 +1093,49 @@ class ArbezEngine:
         for d in raw_dets:
             payload: str | None = None
             decode_stage: str | None = None
+            decoded_sym: Symbology | None = None
             if decoder_active:
-                payload, decode_stage = self._decode_one(zxing, pil_image, np_image, d)
+                payload, decode_stage, decoded_sym = self._decode_one(
+                    zxing, pil_image, np_image, d,
+                )
 
             # S-036: per-instance tables — different models can ship
             # different class vocabularies (legacy 9 / native 14 /
             # user-supplied custom). ``_class_id_to_symbology`` is
             # set in ``__init__`` from metadata and reconfirmed
             # against the actual output shape in ``_get_session``.
-            from arbez.types import Symbology
+            # This is the DETECTOR's classification — reconciled with the
+            # decoder's verdict below (S-094).
             if 0 <= d.class_id < len(self._class_id_to_symbology):
-                symbology = self._class_id_to_symbology[d.class_id]
+                detector_symbology = self._class_id_to_symbology[d.class_id]
             else:
-                symbology = Symbology.OTHER_1D
+                detector_symbology = Symbology.OTHER_1D
             # S-092: when zxing-cpp failed on a Data Matrix detection, try the
-            # stronger libdmtx decoder on the same crop. Data-Matrix-only by
-            # design (libdmtx decodes nothing else); skipped entirely when the
+            # stronger libdmtx decoder on the same crop. Gated on the DETECTOR's
+            # class (libdmtx decodes Data Matrix only); skipped when the
             # arbez-dmtx companion isn't installed (dmtx_decode is None).
             if (payload is None and dmtx_decode is not None
-                    and symbology == Symbology.DATA_MATRIX):
+                    and detector_symbology == Symbology.DATA_MATRIX):
                 dmtx_payload = self._dmtx_decode_one(dmtx_decode, pil_image, d)
                 if dmtx_payload is not None:
                     payload = dmtx_payload
                     decode_stage = "libdmtx"
+
+            # S-094: decoder-authoritative symbology. A successful decode names
+            # the symbology — the decoder ECC-validated a code of that exact
+            # format — and overrides the detector's classification. The detector
+            # both localizes AND guesses a class, and that guess is often wrong
+            # on square 2D codes (e.g. Data Matrix filed as "QR"). libdmtx
+            # decodes Data Matrix only; zxing reports the parsed format. When
+            # nothing decoded (or the format is one the SDK doesn't model), keep
+            # the detector's class as the best available label.
+            if decode_stage == "libdmtx":
+                symbology = Symbology.DATA_MATRIX
+            elif decoded_sym is not None:
+                symbology = decoded_sym
+            else:
+                symbology = detector_symbology
+
             polygon: tuple[tuple[float, float], ...] = (
                 (d.x1, d.y1), (d.x2, d.y1), (d.x2, d.y2), (d.x1, d.y2),
             )
@@ -1132,6 +1153,10 @@ class ArbezEngine:
                 "model_class_id": d.class_id,
                 "model_class_name": model_class_name,
             }
+            # S-094: when the decoder overrode the detector's class, record the
+            # detector's original guess for transparency / telemetry.
+            if symbology != detector_symbology:
+                extras["detector_symbology"] = detector_symbology.name
             # S-080: surface which staged-decode strategy produced this
             # payload ("tight"/"medium"/"large"/"fallback") for the
             # `tools/analyze_decode_rescue.py` analysis. Only included
@@ -1179,13 +1204,16 @@ class ArbezEngine:
         pil_image: PILImage,
         np_image: Any | None,
         det: RawDetection,
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, Symbology | None]:
         """Run zxing-cpp on the detected region, with progressive
-        recall strategies (S-033). Returns ``(payload, stage)`` where
-        ``payload`` is the decoded text or ``None`` on failure, and
-        ``stage`` is one of ``"tight"`` / ``"medium"`` / ``"large"`` /
-        ``"fallback"`` identifying which strategy produced the
-        payload (or ``None`` if everything failed).
+        recall strategies (S-033). Returns ``(payload, stage,
+        decoded_symbology)`` where ``payload`` is the decoded text or
+        ``None`` on failure, ``stage`` is one of ``"tight"`` /
+        ``"medium"`` / ``"large"`` / ``"fallback"`` identifying which
+        strategy produced the payload (or ``None`` if everything
+        failed), and ``decoded_symbology`` (S-094) is the symbology
+        zxing-cpp parsed for the winning read (or ``None`` if nothing
+        decoded / the format is unmodeled).
 
         ``np_image`` is the source image as an HxWx3 uint8 RGB numpy
         array (S-035 perf path). When non-None, crops are taken as
@@ -1220,14 +1248,15 @@ class ArbezEngine:
 
         S-080: return type became ``tuple[str | None, str | None]``
         (was ``str | None``). The stage label is surfaced as
-        ``extras["decode_stage"]`` by ``_decode_detections``. Pure
-        instrumentation — no behaviour change.
+        ``extras["decode_stage"]`` by ``_decode_detections``. S-094 added
+        the third element (the decoder-parsed symbology) for the
+        symbology-reconciliation step. Pure instrumentation otherwise.
 
         Replaces the v0.0.18 single-strategy 8-pixel-pad crop.
         """
         bbox_min = min(det.x2 - det.x1, det.y2 - det.y1)
         if bbox_min <= 0:
-            return None, None  # degenerate bbox
+            return None, None, None  # degenerate bbox
 
         img_w, img_h = pil_image.width, pil_image.height
 
@@ -1247,9 +1276,9 @@ class ArbezEngine:
                 crop = np_image[y1:y2, x1:x2]
             else:
                 crop = pil_image.crop((x1, y1, x2, y2))
-            payload = ArbezEngine._zxing_read_first_valid(zxing, crop)
+            payload, decoded_sym = ArbezEngine._zxing_read_first_valid(zxing, crop)
             if payload is not None:
-                return payload, ArbezEngine._STAGE_LABELS[stage_idx]
+                return payload, ArbezEngine._STAGE_LABELS[stage_idx], decoded_sym
 
         # Stage 4: full-image fallback. zxing-cpp has its own detector
         # and may find the code where every padded crop failed (e.g.
@@ -1258,31 +1287,36 @@ class ArbezEngine:
         # only accept results whose decoded position center is INSIDE
         # the detection bbox - guards against multi-code images where
         # zxing finds a different code than the one we detected.
-        fb_payload = ArbezEngine._zxing_read_within_bbox(
+        fb_payload, fb_sym = ArbezEngine._zxing_read_within_bbox(
             zxing, pil_image if np_image is None else np_image, det,
             img_w=img_w, img_h=img_h,
         )
         if fb_payload is not None:
-            return fb_payload, ArbezEngine._FALLBACK_STAGE_LABEL
-        return None, None
+            return fb_payload, ArbezEngine._FALLBACK_STAGE_LABEL, fb_sym
+        return None, None, None
 
     @staticmethod
-    def _zxing_read_first_valid(zxing: Any, image: Any) -> str | None:
-        """Run zxing on the image, return the first valid payload.
+    def _zxing_read_first_valid(
+        zxing: Any, image: Any,
+    ) -> tuple[str, Symbology | None] | tuple[None, None]:
+        """Run zxing on the image; return ``(payload, decoded_symbology)``.
 
         ``image`` may be a PIL.Image or a numpy ndarray (HxWx3 uint8 RGB) — zxing-cpp's Python
         bindings accept both (S-035 perf path).
 
-        Returns ``None`` on any decode failure (zxing exception, no codes found, or all results were
-        invalid).
+        ``decoded_symbology`` (S-094) is the symbology zxing-cpp actually parsed —
+        ECC-validated, hence authoritative — mapped to :class:`Symbology`, or ``None``
+        when the format isn't one the SDK models (the caller keeps its detector label).
+        Returns ``(None, None)`` on any decode failure (zxing exception, no codes found,
+        or all results were invalid).
         """
         try:
             for r in zxing.read_barcodes(image):
                 if r.valid:
-                    return str(r.text)
+                    return str(r.text), symbology_for_zxing_format(r.format)
         except Exception as e:
             _log.debug("ArbezEngine: zxing read failed: %r", e)
-        return None
+        return None, None
 
     @staticmethod
     def _zxing_read_within_bbox(
@@ -1292,7 +1326,7 @@ class ArbezEngine:
         *,
         img_w: int | None = None,
         img_h: int | None = None,
-    ) -> str | None:
+    ) -> tuple[str, Symbology | None] | tuple[None, None]:
         """Full-image zxing read with position-match filter (S-033).
 
         ``image`` may be a PIL.Image or a numpy ndarray (HxWx3 uint8
@@ -1300,16 +1334,17 @@ class ArbezEngine:
         ``img_h`` (S-035 perf path — saves a PIL attribute lookup
         per call).
 
-        Returns the first valid payload whose decoded center is
-        inside the detection bbox. ``None`` if no decoded position
-        matches - this avoids attaching the wrong barcode's payload
-        to the current detection on multi-code images.
+        Returns ``(payload, decoded_symbology)`` for the first valid result
+        whose decoded center is inside the detection bbox (``decoded_symbology``
+        per S-094 — the zxing-parsed format, or ``None`` if unmodeled).
+        ``(None, None)`` if no decoded position matches - this avoids attaching
+        the wrong barcode's payload to the current detection on multi-code images.
         """
         try:
             results = zxing.read_barcodes(image)
         except Exception as e:
             _log.debug("ArbezEngine: full-image fallback failed: %r", e)
-            return None
+            return None, None
         for r in results:
             if not r.valid:
                 continue
@@ -1320,5 +1355,5 @@ class ArbezEngine:
             except AttributeError:
                 continue  # zxing result without Position info — skip
             if det.x1 <= cx <= det.x2 and det.y1 <= cy <= det.y2:
-                return str(r.text)
-        return None
+                return str(r.text), symbology_for_zxing_format(r.format)
+        return None, None
