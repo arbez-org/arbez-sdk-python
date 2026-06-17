@@ -7,17 +7,7 @@
 
 **High-yield barcode & QR detection in Python that stays simple — one `pip install`, one `Scanner()`, every platform.**
 
-`arbez` reads barcodes and QR codes from real-world images and, in our benchmark, returns more of them than any single engine it runs — with no tuning. `pip install arbez` needs no system libraries: the engines, the bundled AI model, and the common image formats come in the wheels (HEIC / AVIF and the WeChat engine are optional extras), and a single `Scanner()` does the rest. It reaches that yield by pairing its bundled AI detector with **zxing-cpp** and, on macOS, Apple's on-device **Vision** framework, then merging the results.
-
-```python
-from arbez import Scanner
-
-with Scanner() as s:                       # every installed engine — maximum yield
-    for d in s.scan("photo.jpg").detections:
-        print(d.symbology, d.payload)
-```
-
-> **`0.2.x`** · production-usable, pre-1.0 — the API may still change between minor releases ([CHANGELOG](CHANGELOG.md)); `1.0.0` will lock it.
+`arbez` reads barcodes and QR codes from real-world images and, in our benchmark, returns more of them than any single engine it runs. It pairs a bundled AI detector with **zxing-cpp** and, on macOS, Apple's on-device **Vision** framework, then merges the results — no tuning, no system libraries, one `Scanner()` call. Jump to the [quick start](#quick-start).
 
 ## What it does
 
@@ -168,6 +158,10 @@ for img in out.iterdir():
 Today arbez reaches its yield by combining engines. The direction is to grow the **bundled AI detector** until it clears that bar on its own — so that a single `pip install arbez`, with no platform-specific helpers, is all anyone needs for reliable detection on every platform. Each release trains it further; the multi-engine union is both today's product and the target the detector is closing in on. Apple Vision and the classical engines stay welcome boosts where available — the goal is simply that you never have to *depend* on them.
 
 The aim is plain: make arbez the easiest, most reliable way to read QR codes and barcodes in Python — no expertise, no setup, just results.
+
+## Versioning
+
+arbez follows [semantic versioning's 0.x convention](https://semver.org/#spec-item-4): while it is pre-1.0, the public API may change between minor releases, and breaking changes are documented in the [CHANGELOG](CHANGELOG.md). `1.0.0` will mark the point at which the API surface is stable.
 
 ## License
 
