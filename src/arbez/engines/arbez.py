@@ -327,9 +327,8 @@ class ArbezEngine:
         # ``["CPUExecutionProvider"]``) to force a specific EP — useful
         # for benchmarking or reproducibility. The CPU EP is always
         # appended as a fallback so unknown / unavailable EPs fall
-        # through cleanly. See ``docs/profiling.md`` and
-        # ``examples/arbez_benchmark.py`` for CPU-vs-CoreML throughput
-        # numbers on the current bundled weights.
+        # through cleanly. See ``docs/profiling.md`` for CPU-vs-CoreML
+        # throughput notes on the current bundled weights.
         # S-083 (generalises S-081): probe ``onnxruntime`` at
         # construction so callers using a fallback engine chain catch
         # ``EngineUnavailable`` cleanly here, rather than a generic
