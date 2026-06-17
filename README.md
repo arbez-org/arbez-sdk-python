@@ -40,20 +40,20 @@ Distinct codes decoded over 4,290 images (4,276 corpus + 14 synthesized exotic-f
 
 ### By symbology
 
-Distinct codes decoded by symbology. Each code is attributed to the symbology `Scanner()` votes for it (the **cross-engine consensus label**, not each engine's self-report), so the columns are consistent and `Scanner()` ≥ every engine on each row. Different engines lead different symbologies — which is exactly why `Scanner()` unions them:
+Distinct codes decoded by symbology — each engine's own decoded codes, by their (decoder-accurate) symbology. `Scanner()` ≥ every engine on each row. Different engines lead different symbologies — which is exactly why `Scanner()` unions them:
 
 | Symbology | arbez | Apple Vision | ZXing | WeChat | **`Scanner()`** |
 |---|--:|--:|--:|--:|--:|
-| QR | **2,364** | 2,360 | 2,360 | 2,075 | **2,398** |
-| Code 128 | 645 | **1,564** | 1,000 | 4 | **1,603** |
-| Data Matrix | 322 | **507** | 256 | 2 | **518** |
-| Code 39 | 63 | **164** | 123 | – | **171** |
-| ITF | 13 | **151** | 98 | – | **156** |
-| PDF417 | 41 | **84** | 53 | 1 | **95** |
-| EAN-13 | 24 | **72** | 43 | – | **81** |
-| Aztec | 8 | **14** | 8 | – | **14** |
+| QR | **2,355** | 2,357 | 2,357 | 2,084 | **2,385** |
+| Code 128 | 635 | **1,564** | 996 | – | **1,583** |
+| Data Matrix | 323 | **505** | 254 | – | **517** |
+| Code 39 | 61 | **156** | 121 | – | **163** |
+| ITF | 17 | **154** | 100 | – | **156** |
+| PDF417 | 44 | **85** | 54 | – | **91** |
+| EAN-13 | 33 | **81** | 50 | – | **81** |
+| Aztec | 10 | **14** | 10 | – | **14** |
 
-*Bold (engine columns) = best single engine for that symbology. The label is the consensus symbology — arbez is a detector **and** decoder, so its raw class is corrected here by what was actually decoded (e.g. Data Matrix its detector had filed as "QR"). arbez leads QR; Apple Vision leads the linear family and Data Matrix on this macOS host; ZXing is the broad cross-platform decoder; WeChat is QR-only (its handful of non-QR entries are QR-detector misreads). `Scanner()` unions all engines, so it meets or beats every single engine on every symbology.*
+*Bold (engine columns) = best single engine for that symbology. Symbology is decoder-accurate: arbez is both a detector and a decoder, and since v0.2.0 (S-094) it adopts the decoder's ECC-validated format as the label — so codes its detector had filed as "QR" but are really Data Matrix / ITF / Aztec are now labeled correctly. arbez leads QR; Apple Vision leads the linear family and Data Matrix on this macOS host; ZXing is the broad cross-platform decoder; WeChat is QR-only. `Scanner()` unions all engines, so it meets or beats every single engine on every symbology.*
 
 ### Methodology
 
