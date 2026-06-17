@@ -31,7 +31,7 @@ How the engines combine: [docs/concepts.md](docs/concepts.md) · full API: [docs
 
 ### Built on proven engines
 
-arbez builds on **zxing-cpp** for classical decode; on macOS it adds Apple's on-device **Vision** framework — a real lift to accuracy and speed — and the optional **WeChat** detector contributes an independent QR read. Its own bundled AI detector ties them together; the [Roadmap](#roadmap) is for that detector to carry more of the load over time. Prefer a single engine? `Scanner(engine="zxing")`.
+arbez builds on **zxing-cpp** for classical 1D/2D decode, with **libdmtx** (via the [arbez-dmtx](https://github.com/arbez-org/arbez-dmtx) package) as a Data Matrix fallback; on macOS it adds Apple's on-device **Vision** framework — a real lift to accuracy and speed — and the optional **WeChat** detector contributes an independent QR read. Its own bundled AI detector ties them together; the [Roadmap](#roadmap) is for that detector to carry more of the load over time. Prefer a single engine? `Scanner(engine="zxing")`.
 
 ## Install
 
@@ -166,3 +166,5 @@ arbez follows [semantic versioning's 0.x convention](https://semver.org/#spec-it
 ## License
 
 Apache License, Version 2.0 — see [`LICENSE`](LICENSE). The bundled object-detection model (`src/arbez/_assets/arbez_yolox_s.onnx`) is also Apache-2.0; see `src/arbez/_assets/NOTICE` for full attribution.
+
+Data Matrix fallback decoding uses [arbez-dmtx](https://pypi.org/project/arbez-dmtx/) (Apache-2.0), a core dependency that bundles the native **libdmtx** library (BSD-2-Clause, © 2005–2016 Mike Laughton, Vadim A. Misbakh-Soloviov and others) and a vendored **pylibdmtx** ctypes wrapper (MIT, © 2016–2020 Lawrence Hudson); their full license texts ship inside the arbez-dmtx wheel.
