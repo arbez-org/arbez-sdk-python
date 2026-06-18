@@ -11,11 +11,12 @@ What's being locked here:
    not deferred to scan-time. Users get immediate feedback on a
    typo'd or uninstalled engine.
 
-3. **The contract is locked even though consensus voting isn't shipping
-   yet.** ``engines=`` stores the validated subset on the Scanner
-   instance and surfaces it via the ``engines`` property + repr. When
-   consensus voting lands at v0.2.0 the same value drives the vote;
-   user code written today against this API doesn't need to change.
+3. **The contract is locked.** ``engines=`` stores the validated
+   subset on the Scanner instance and surfaces it via the ``engines``
+   property + repr; the same value drives the multi-engine vote
+   (S-093). A single-name subset degrades to the single-engine path
+   (nothing to vote on), so ``engines`` reads back as ``None`` in
+   that case.
 
 4. **Error shape is actionable.** Unknown-name vs known-but-not-installed
    are distinct error messages — the user knows whether to fix a typo
@@ -32,56 +33,70 @@ from arbez.parallelism import installed_consensus_engines
 # ─── Default (None) ───────────────────────────────────────────────────────
 
 
-def test_default_engines_resolves_to_s075_consensus_set() -> None:
-    """S-075 (2026-05-17): bare ``Scanner()`` no longer leaves ``engines=None``.
-    The S-075 default routes through consensus with ``engines=("arbez", "zxing")``
-    so the property surfaces the resolved set.
+def test_default_engines_resolves_to_all_installed_set() -> None:
+    """S-093 (0.2.0): bare ``Scanner()`` runs every installed engine, so
+    ``engines`` surfaces the resolved all-installed set (>= 2 engines on this
+    host) rather than being opaque.
 
-    Pre-S-075: this asserted ``s.engines is None``. Update the contract: bare
-    construction now exposes its 2-engine consensus set, so ``engines`` is
-    observable instead of opaque.
+    Pre-0.2.0 this asserted the curated S-075 ``("arbez", "zxing")`` pair; the
+    new contract is the FULL installed set.
     """
     s = Scanner()
-    assert s.engines == ("arbez", "zxing")
+    assert s.engines is not None and len(s.engines) >= 2
+    assert set(s.engines) == set(installed_consensus_engines())
 
 
 def test_default_engines_none_when_engine_explicit() -> None:
-    """When the user opts out of the S-075 default by passing an explicit ``engine=``,
-    the consensus path doesn't engage and ``engines`` stays at its default of None.
-    This preserves the pre-S-075 invariant for explicit single-engine paths."""
-    s = Scanner(engine="auto")
+    """When the user opts out of the all-installed default by passing an
+    explicit ``engine=``, the consensus path doesn't engage and ``engines``
+    is ``None`` (single-engine path)."""
+    s = Scanner(engine="arbez")
     assert s.engines is None
 
 
 def test_explicit_engine_keeps_repr_quiet_on_engines() -> None:
-    """When the user goes single-engine via explicit ``engine="auto"`` / ``engine="arbez"``,
-    the repr stays compact — no consensus-mode params surface.
+    """When the user goes single-engine via explicit ``engine="arbez"``, the
+    repr stays compact — no consensus-mode params surface.
 
-    Bare ``Scanner()`` repr DOES include ``engines=`` and ``min_votes=`` because the
-    S-075 default consensus is active; that's the intentional new shape and is
-    locked separately by the test_scanner_auto.py S-075 tests.
+    Bare ``Scanner()`` repr DOES include ``consensus=`` and ``engines=`` because
+    the all-installed consensus default is active (S-093); that's the intentional
+    new shape and is locked separately by the test_scanner_auto.py tests.
     """
-    s = Scanner(engine="auto")
+    s = Scanner(engine="arbez")
     r = repr(s)
     assert "engines=" not in r
-    assert "min_votes=" not in r
+    assert "consensus=" not in r
 
 
 # ─── Subset selection ─────────────────────────────────────────────────────
 
 
 def test_engines_subset_validated_and_stored() -> None:
-    """A subset of currently-installed engines validates and is stored in input order.
+    """A multi-name subset of currently-installed engines validates and is
+    stored in input order. The ``engines`` property returns the tuple.
 
-    The ``engines`` property returns the tuple.
+    S-093: a 2+ engine subset engages the multi-engine path, so ``engines``
+    reflects the chosen set. (A single-name subset degrades to single-engine —
+    see ``test_engines_single_name_subset_degrades_to_single_engine``.)
     """
     installed = installed_consensus_engines()
-    if not installed:
-        pytest.skip("no engines installed — can't test subset selection")
-    # Pick the first installed engine — guaranteed valid.
-    subset = (installed[0],)
+    if len(installed) < 2:
+        pytest.skip("need >=2 engines installed for subset selection")
+    subset = tuple(installed[:2])
     s = Scanner(engines=subset)
     assert s.engines == subset
+
+
+def test_engines_single_name_subset_degrades_to_single_engine() -> None:
+    """S-093: a one-element ``engines=`` subset has nothing to vote on, so the
+    Scanner degrades to the single-engine path — ``engine_name`` is that engine
+    and ``engines`` reads back as ``None``."""
+    installed = installed_consensus_engines()
+    if not installed:
+        pytest.skip("no engines installed")
+    s = Scanner(engines=(installed[0],))
+    assert s.engine_name == installed[0]
+    assert s.engines is None
 
 
 def test_engines_subset_preserves_input_order() -> None:
@@ -100,22 +115,28 @@ def test_engines_subset_preserves_input_order() -> None:
 
 
 def test_engines_accepts_list() -> None:
-    """A plain list is accepted (convenience); stored as a tuple for immutability."""
+    """A plain list is accepted (convenience); stored as a tuple for immutability.
+
+    Use a 2-engine list so the multi-engine path engages and ``engines`` is
+    surfaced (a single-name list would degrade to single-engine, ``None``).
+    """
     installed = installed_consensus_engines()
-    if not installed:
-        pytest.skip("no engines installed")
-    s = Scanner(engines=[installed[0]])
-    assert s.engines == (installed[0],)
+    if len(installed) < 2:
+        pytest.skip("need >=2 engines installed")
+    s = Scanner(engines=list(installed[:2]))
+    assert s.engines == tuple(installed[:2])
     assert isinstance(s.engines, tuple)
 
 
 def test_engines_subset_surfaced_in_repr() -> None:
-    """Non-default ``engines=`` shows up in repr — important for debugging multi-Scanner setups."""
+    """Non-default ``engines=`` shows up in repr — important for debugging
+    multi-Scanner setups. Uses a 2-engine subset (multi-engine path)."""
     installed = installed_consensus_engines()
-    if not installed:
-        pytest.skip("no engines installed")
-    s = Scanner(engines=(installed[0],))
-    assert f"engines=({installed[0]!r},)" in repr(s)
+    if len(installed) < 2:
+        pytest.skip("need >=2 engines installed")
+    subset = tuple(installed[:2])
+    s = Scanner(engines=subset)
+    assert f"engines={subset!r}" in repr(s)
 
 
 # ─── Validation: errors ───────────────────────────────────────────────────
@@ -187,25 +208,20 @@ def test_engines_duplicate_name_raises_value_error() -> None:
 # ─── Interplay with other Scanner args ────────────────────────────────────
 
 
-def test_engines_works_alongside_engine_arg() -> None:
-    """``engine=`` and ``engines=`` are independent.
-
-    Today ``engine=`` drives single-engine scan; ``engines=`` describes future consensus subset. Co-
-    existence is the locked contract.
-    """
+def test_engine_and_engines_together_raise() -> None:
+    """S-093: ``engine=`` (single) and ``engines=`` (a set) are mutually
+    exclusive selectors; passing both raises ValueError, where pre-0.2.0 they
+    co-existed and the new model makes the choice explicit."""
     installed = installed_consensus_engines()
     if not installed:
         pytest.skip("no engines installed")
-    s = Scanner(engine=installed[0], engines=(installed[0],))
-    assert s.engine_name == installed[0]
-    assert s.engines == (installed[0],)
+    with pytest.raises(ValueError, match="not both"):
+        Scanner(engine=installed[0], engines=(installed[0],))
 
 
-def test_engines_validation_runs_before_consensus_check() -> None:
-    """Even with consensus="off" (current default), invalid engines= raises.
-
-    The user gets the engines= error rather than missing it until v0.2.0 when consensus voting
-    actually runs.
+def test_engines_validation_runs_at_construction() -> None:
+    """Invalid ``engines=`` raises at construction (eager validation), so the
+    user gets the error immediately rather than at first scan.
     """
     with pytest.raises(EngineUnavailable):
-        Scanner(consensus="off", engines=("not_a_real_engine",))
+        Scanner(engines=("not_a_real_engine",))

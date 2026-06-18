@@ -167,21 +167,22 @@ def test_scanner_construct_lazy() -> None:
     # Constructor must NOT touch any model file or load a backend.
     # Cheap-construct is required so benchmarking and latency-monitoring
     # harnesses can build Scanner pools up front.
-    # S-075 (2026-05-17): bare ``Scanner()`` defaults to a 2-engine
-    # consensus of arbez + zxing, so ``engine_name`` is the literal
-    # ``"consensus"`` sentinel and the consensus engine list is
-    # captured in ``engines``. Pre-S-075 this asserted "arbez".
+    # S-093 (0.2.0): bare ``Scanner()`` runs ALL installed engines and
+    # unions their results, so ``engine_name`` is the literal
+    # ``"consensus"`` sentinel and the resolved all-installed engine set
+    # is captured in ``engines`` (>= 2 engines on this host). Pre-0.2.0
+    # this asserted the curated ("arbez", "zxing") pair.
     s = Scanner()
     assert s.engine_name == "consensus"
     assert s.engine_name in repr(s)
-    assert s.engines == ("arbez", "zxing"), (
-        f"S-075 default consensus engine set; got {s.engines!r}"
+    assert s.engines is not None and len(s.engines) >= 2, (
+        f"S-093 all-installed consensus engine set; got {s.engines!r}"
     )
 
 
 def test_scanner_decodes_end_to_end(qr_image, qr_payload) -> None:  # type: ignore[no-untyped-def]
-    """Scanner() with no args defaults to the S-075 2-engine consensus (arbez + zxing,
-    union mode). End-to-end decode against the session QR fixture must still succeed —
+    """Scanner() with no args runs the S-093 all-installed consensus (union
+    mode). End-to-end decode against the session QR fixture must still succeed —
     consensus didn't break the basic happy path.
 
     YOLOX-s can emit multiple overlapping detections for one physical code, and consensus
@@ -206,17 +207,14 @@ def test_scanner_decodes_end_to_end(qr_image, qr_payload) -> None:  # type: igno
 
 
 def test_scanner_rejects_unknown_consensus_value() -> None:
-    """S-039 (v0.0.24): the test name was a v0.0.13-era leftover — consensus voting has shipped
-    since v0.0.18 (S-032). The accepted values are ``"off"`` (default) and ``"vote"``; anything else
-    raises ``NotImplementedError`` with an upgrade-path message.
-
-    Pre-S-032 the rejection covered "consensus is not implemented at all"; today it covers "this
-    consensus mode name is unrecognized — pick 'off' or 'vote'."
+    """S-093 (0.2.0): ``consensus`` is an int now (the per-code agreement
+    threshold; 1 = union). The 0.1.x ``"off"``/``"vote"`` string API was
+    removed, so passing a str raises ``TypeError`` with a migration message.
     """
     from arbez import Scanner
 
-    with pytest.raises(NotImplementedError, match="consensus"):
-        Scanner(consensus="all")
+    with pytest.raises(TypeError, match="consensus must be an int"):
+        Scanner(consensus="all")  # type: ignore[arg-type]
 
 
 def test_scanner_unknown_engine_raises_engine_unavailable() -> None:
@@ -241,6 +239,55 @@ def test_engine_protocol_satisfied_by_zxing() -> None:
     from arbez.engines.zxing import ZXingEngine
 
     assert isinstance(ZXingEngine(), Engine)
+
+
+# ── S-093 (0.2.0) — Result.per_engine on the single-engine path ──────────
+
+
+def test_single_engine_result_per_engine_populated() -> None:
+    """S-093: on the single-engine path ``Result.per_engine`` is
+    ``{engine_name: detections}`` — that one engine's own detections, identical
+    to ``result.detections`` (no merge). The timings key is ``"engine"``.
+
+    Uses a stub Engine instance so the test is deterministic + model-free.
+    """
+    from PIL import Image
+
+    from arbez import Scanner
+    from arbez.engines.base import Engine
+    from arbez.types import Detection, Symbology
+
+    canned = (
+        Detection(
+            bbox_xyxy=(0.0, 0.0, 50.0, 50.0),
+            symbology=Symbology.QR,
+            score=0.9,
+            payload="solo",
+            engine="my_stub",
+        ),
+    )
+
+    class _StubEngine:
+        name = "my_stub"
+        native_format = "pil_rgb"
+
+        def detect_and_decode(self, _img: object) -> tuple[Detection, ...]:
+            return canned
+
+    engine: Engine = _StubEngine()
+    s = Scanner(engine=engine)
+    assert s.engine_name == "my_stub"
+    assert s.engines is None  # single-engine path
+
+    result = s.scan(Image.new("RGB", (100, 100), "white"))
+    # per_engine keyed by the single engine's name, holding its own detections.
+    assert set(result.per_engine.keys()) == {"my_stub"}
+    assert result.per_engine["my_stub"] == canned
+    # …and identical to the merged detections (one engine, no merge).
+    assert result.detections == canned
+    # Single-engine timing key.
+    assert "engine" in result.timings_ms
+    assert "consensus" not in result.timings_ms
 
 
 # ── S-042 (v0.0.29) — Scanner.close() + context manager support ──────────

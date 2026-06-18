@@ -163,49 +163,7 @@ def installed_consensus_engines() -> tuple[str, ...]:
         names.append("wechat")
     return tuple(names)
 
-
-@functools.cache
-def default_consensus_engine_names() -> tuple[str, ...]:
-    """Engines that participate in the S-075 default ``Scanner()`` consensus.
-
-    Returns the engine names that bare ``Scanner()`` runs in consensus
-    mode by default (S-075, 2026-05-17). The set is intentionally
-    restricted to engines that are **always installed** on a stock
-    ``pip install arbez``:
-
-    1. ``"arbez"`` — first-party YOLOX-s + zxing-cpp decoder pipeline,
-       always present.
-    2. ``"zxing"`` — classical decoder, always present (zxing-cpp is
-       a core dep since S-034 / v0.0.20).
-
-    Why only these two and not also ``apple_vision`` / ``wechat``: the
-    default has to be predictable across all installations. Including
-    optional extras in the default would mean a Mac with
-    ``arbez[apple-vision]`` runs a 3-engine consensus while a Linux
-    box runs a 2-engine one — same code, different behavior, hard to
-    debug. Users on platforms with extras can opt in to the full N-
-    engine consensus via ``Scanner(consensus="vote")``.
-
-    Falls back to ``("arbez",)`` if zxing is somehow absent (broken
-    install / stripped frozen-app build / explicit uninstall). The
-    default ``Scanner()`` then degrades to single-engine arbez
-    silently rather than failing — the bare construction must
-    never raise on a working arbez install.
-
-    Cached via ``functools.cache`` (the underlying state doesn't
-    change at runtime).
-
-    Examples
-    --------
-    >>> default_consensus_engine_names()
-    ('arbez', 'zxing')                  # stock install
-    >>> default_consensus_engine_names()
-    ('arbez',)                          # zxing somehow missing
-    """
-    arbez, _apple_vision, zxing, _wechat = _probe_engines()
-    names: list[str] = []
-    if arbez:
-        names.append("arbez")
-    if zxing:
-        names.append("zxing")
-    return tuple(names)
+# S-093 (0.2.0): the former ``default_consensus_engine_names()`` (the
+# curated S-075 arbez+zxing pair) was removed — bare ``Scanner()`` now runs
+# ALL installed engines for max yield, so the default IS
+# ``installed_consensus_engines()``. There is no separate "default subset".

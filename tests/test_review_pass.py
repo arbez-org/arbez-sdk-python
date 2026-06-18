@@ -84,8 +84,12 @@ def test_scanner_repr_omits_model() -> None:
     keeping it in repr was just noise."""
     s = Scanner(engine="zxing")
     r = repr(s)
-    assert "engine='zxing'" in r
-    assert "consensus='off'" in r
+    # S-093 (0.2.0): single-engine repr is just ``Scanner(engine='zxing')`` —
+    # no ``consensus=`` / ``engines=`` keys (those only appear on the
+    # multi-engine path). The removed 0.1.x ``consensus='off'`` no longer
+    # surfaces.
+    assert r == "Scanner(engine='zxing')"
+    assert "consensus=" not in r
     assert "model=" not in r
 
 

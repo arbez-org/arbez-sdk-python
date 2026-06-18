@@ -145,10 +145,10 @@ from arbez import Scanner
 s = Scanner()
 result = s.scan("photo.jpg")
 print(result.timings_ms)
-# {'consensus': 42.7}                   # bare Scanner() (S-075 default 2-engine consensus)
+# {'consensus': 42.7}                   # bare Scanner() (all installed engines, union)
 # {'engine': 38.4}                      # for Scanner(engine="arbez")
 # {'engine': 4.2}                       # for Scanner(engine="apple_vision")
-# {'consensus': 152.1}                  # for consensus="vote", all engines
+# {'consensus': 152.1}                  # for Scanner(consensus=2) etc. (multi-engine)
 # {'engine': 38.4, 'preprocess': 6.1}   # 'preprocess' appears only with scan(..., preprocess="auto")
 ```
 

@@ -1,15 +1,22 @@
-"""Tests for ``Scanner(engine='auto')`` smart engine selection (S-008 + S-034 + S-075).
+"""Tests for engine selection + auto-resolution (S-008 + S-034 + S-093).
 
 Four things to lock down:
 
-1. **Bare ``Scanner()`` defaults to the S-075 2-engine consensus**
-   (arbez + zxing) on every test runner. End-to-end decode against
-   the session ``qr_image`` fixture must succeed.
+1. **Bare ``Scanner()`` runs ALL installed engines and unions their
+   results (S-093, 0.2.0).** ``engine_name == "consensus"`` and
+   ``engines`` is the resolved all-installed tuple when >= 2 engines
+   are present; it degrades to single-engine when exactly 1 is
+   installed. To keep these assertions deterministic regardless of
+   what's installed in the test env, we mock
+   ``arbez._engine_discovery._probe_engines`` to a chosen boolean
+   tuple.
 
-2. **Explicit ``Scanner(engine="auto")`` preserves the pre-S-075
-   single-engine behavior**: resolves to ``"arbez"`` on a normal
-   install (S-034 priority order: arbez, apple_vision, zxing,
-   wechat).
+2. **``engine="auto"`` was REMOVED in 0.2.0 (S-093).**
+   ``Scanner(engine="auto")`` now raises
+   :class:`~arbez.exceptions.EngineUnavailable`. The *function*
+   :func:`resolve_auto_engine` is still kept (it backs
+   ``parallelism.recommended_workers("auto")``) and its behavior is
+   tested unchanged below.
 
 3. **Priority order in ``resolve_auto_engine()`` is correct
    (S-034):** arbez first, then apple_vision on Darwin, then zxing,
@@ -26,6 +33,7 @@ Four things to lock down:
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import platform
 import sys
@@ -42,22 +50,22 @@ from arbez.scanner import resolve_auto_engine
 # ─── End-to-end on the actual runner ───────────────────────────────────────
 
 
-def test_scanner_bare_default_is_s075_consensus(qr_image: PILImage, qr_payload: str) -> None:
-    """S-075 (2026-05-17): bare ``Scanner()`` defaults to a 2-engine consensus of
-    arbez + zxing in union mode (``min_votes=1``).
+def test_scanner_bare_default_is_consensus(qr_image: PILImage, qr_payload: str) -> None:
+    """S-093 (0.2.0): bare ``Scanner()`` runs ALL installed engines and unions
+    their results (consensus threshold 1 = max yield).
 
-    Locks the new default:
+    Locks the new default on the *real* runner (which has >= 2 engines):
     - ``engine_name`` is the literal ``"consensus"`` sentinel
-    - ``engines`` exposes the resolved 2-engine set (``("arbez", "zxing")``)
+    - ``engines`` exposes the resolved all-installed set
     - End-to-end decode of the canonical QR fixture still succeeds
     """
     s = Scanner()
     assert s.engine_name == "consensus", (
-        f"S-075 contract: Scanner() runs default consensus; got engine_name="
-        f"{s.engine_name!r}"
+        f"S-093 contract: Scanner() runs all-installed consensus; got "
+        f"engine_name={s.engine_name!r}"
     )
-    assert s.engines == ("arbez", "zxing"), (
-        f"S-075 contract: default consensus engine set is arbez + zxing; got "
+    assert s.engines is not None and len(s.engines) >= 2, (
+        f"S-093 contract: default consensus runs the all-installed set; got "
         f"{s.engines!r}"
     )
     result = s.scan(qr_image)
@@ -68,74 +76,146 @@ def test_scanner_bare_default_is_s075_consensus(qr_image: PILImage, qr_payload: 
     )
 
 
-def test_scanner_engine_auto_explicit_preserves_single_engine() -> None:
-    """S-075: passing ``engine="auto"`` explicitly preserves the pre-S-075 single-engine
-    behavior. The explicit ``"auto"`` is the escape hatch from the new bare-Scanner
-    consensus default for users who want single-engine without committing to a name.
-    """
-    s = Scanner(engine="auto")
-    assert s.engine_name == "arbez", (
-        f"Scanner(engine='auto') must resolve to single-engine 'arbez' on a "
-        f"normal install (S-034 priority); got {s.engine_name!r}"
-    )
+def test_scanner_engine_auto_raises_engine_unavailable() -> None:
+    """S-093: ``engine="auto"`` was removed in 0.2.0. Passing it now raises
+    :class:`EngineUnavailable` (bare ``Scanner()`` is the all-installed default;
+    name a single engine for single-engine scanning)."""
+    with pytest.raises(EngineUnavailable, match="auto"):
+        Scanner(engine="auto")
 
 
 def test_scanner_engine_arbez_explicit_is_single_engine() -> None:
-    """S-075: passing ``engine="arbez"`` explicitly is also single-engine arbez (no
-    consensus). Same shape as before S-075 — the explicit name overrides the
-    bare-Scanner default."""
+    """Passing ``engine="arbez"`` explicitly is single-engine arbez (no
+    consensus). The explicit name overrides the bare-Scanner all-installed
+    default."""
     s = Scanner(engine="arbez")
     assert s.engine_name == "arbez"
-    # repr surfaces ``consensus='off'`` for single-engine paths; that's expected.
     # The real check is that engine_name is the single-engine 'arbez', NOT the
-    # consensus sentinel.
+    # consensus sentinel, and engines is None (single-engine path).
     assert s.engine_name != "consensus"
-    assert "vote" not in repr(s)
+    assert s.engines is None
+    assert "consensus=" not in repr(s)
 
 
-def test_scanner_bare_min_votes_default_is_union() -> None:
-    """S-075: in the bare-Scanner consensus default path, ``min_votes`` defaults to 1
-    (union mode) so detections from EITHER engine are kept. This is the whole point
-    of the default consensus — surface zxing's long-tail 1D coverage that arbez
-    misses, not require both engines to agree before keeping a detection."""
+def test_scanner_bare_consensus_threshold_default_is_union() -> None:
+    """S-093: bare ``Scanner()`` uses consensus threshold 1 (union mode) so
+    detections from ANY installed engine are kept. This is the whole point of
+    the all-installed default — maximum yield, surfacing every engine's
+    long-tail coverage rather than requiring agreement."""
     s = Scanner()
-    assert "min_votes=1" in repr(s), (
-        f"S-075 default consensus should use min_votes=1 (union); repr={repr(s)!r}"
+    assert "consensus=1" in repr(s), (
+        f"S-093 default should use consensus=1 (union); repr={repr(s)!r}"
     )
 
 
-def test_scanner_bare_min_votes_explicit_is_honored() -> None:
-    """S-075: if the user passes ``min_votes`` explicitly while leaving everything
-    else default, the explicit value wins over the S-075 default of 1. This is the
-    ``min_votes=None`` sentinel doing its job — distinguish "user didn't pass" from
-    "user passed 1 explicitly", same as for ``engine`` itself."""
-    s = Scanner(min_votes=2)
-    # Still S-075 default consensus shape (engine+engines+consensus all unset)…
+def test_scanner_consensus_threshold_explicit_is_honored() -> None:
+    """S-093: if the user passes ``consensus=N`` explicitly while leaving the
+    engine set at the all-installed default, the explicit threshold wins over
+    the default of 1."""
+    s = Scanner(consensus=2)
+    # Still the all-installed default-set consensus shape (engine+engines unset)…
     assert s.engine_name == "consensus"
-    assert s.engines == ("arbez", "zxing")
-    # …but min_votes is the user's 2, not the S-075 default of 1.
-    assert "min_votes=2" in repr(s), (
-        f"Explicit min_votes=2 should win over S-075 default of 1; repr={repr(s)!r}"
+    assert s.engines is not None and len(s.engines) >= 2
+    # …but the threshold is the user's 2, not the default of 1.
+    assert "consensus=2" in repr(s), (
+        f"Explicit consensus=2 should win over the default of 1; repr={repr(s)!r}"
     )
 
 
 def test_scanner_repr_shows_resolved_engine() -> None:
-    """``repr(Scanner())`` must surface the RESOLVED engine name, not the input
-    placeholder. Under S-075 the resolved name for bare Scanner() is ``"consensus"``;
-    under explicit ``Scanner(engine="auto")`` it's still the concrete single-engine
-    name. Never the input placeholder ``"auto"`` regardless of path."""
-    # S-075 path: engine_name in repr is "consensus", not "auto"
+    """``repr(Scanner())`` must surface the RESOLVED engine name, not any input
+    placeholder. Under S-093 the resolved name for bare Scanner() (>= 2 engines)
+    is ``"consensus"``; for an explicit single engine it's the concrete name.
+    Never the removed placeholder ``"auto"`` regardless of path."""
+    # S-093 multi-engine path: repr is the consensus shape, never "auto".
     s_default = Scanner()
     assert "auto" not in repr(s_default), (
         f"repr should not contain 'auto': {repr(s_default)!r}"
     )
     assert s_default.engine_name in repr(s_default)
-    # Pre-S-075 path: engine_name in repr is the resolved single engine
-    s_auto = Scanner(engine="auto")
-    assert "auto" not in repr(s_auto), (
-        f"repr should reflect the resolved engine, not 'auto': {repr(s_auto)!r}"
+    # Single-engine path: engine_name in repr is the resolved single engine.
+    s_single = Scanner(engine="arbez")
+    assert "auto" not in repr(s_single), (
+        f"repr should reflect the resolved engine, not 'auto': {repr(s_single)!r}"
     )
-    assert s_auto.engine_name in repr(s_auto)
+    assert s_single.engine_name in repr(s_single)
+
+
+# ─── Deterministic bare-Scanner() set tests (mocked engine discovery) ──────
+#
+# S-093: bare ``Scanner()`` runs every installed engine. This test env happens
+# to have ALL FOUR engines installed, so to pin the resolved *set* + the
+# single-engine-degrade behavior deterministically we mock
+# ``_probe_engines`` (the single source of truth the discovery helpers cache)
+# rather than rely on what's installed. ``_with_probed`` patches it and clears
+# the two functools.cache'd readers so the chosen tuple takes effect.
+
+
+@contextlib.contextmanager
+def _with_probed(
+    arbez: bool, apple_vision: bool, zxing: bool, wechat: bool
+) -> Iterator[None]:
+    """Context manager: force ``_probe_engines`` to a chosen boolean tuple and
+    clear the dependent caches so the value takes effect this call.
+
+    The autouse ``_clear_engine_discovery_cache`` fixture clears the caches on
+    exit too, so no cross-test leakage.
+    """
+    from arbez import _engine_discovery as ed
+
+    with patch.object(
+        ed, "_probe_engines",
+        return_value=(arbez, apple_vision, zxing, wechat),
+    ):
+        ed._probe_engines.cache_clear()
+        ed.installed_consensus_engines.cache_clear()
+        yield
+
+
+def test_scanner_bare_three_engines_resolves_full_set() -> None:
+    """S-093: bare ``Scanner()`` with arbez + apple_vision + zxing installed
+    (wechat absent) resolves to the full 3-engine consensus set, threshold 1."""
+    with _with_probed(True, True, True, False):
+        s = Scanner()
+        assert s.engine_name == "consensus"
+        assert s.engines == ("arbez", "apple_vision", "zxing"), (
+            f"bare Scanner() should run every installed engine; got {s.engines!r}"
+        )
+        assert "consensus=1" in repr(s)
+
+
+def test_scanner_bare_single_engine_degrades() -> None:
+    """S-093: bare ``Scanner()`` with exactly ONE installed engine degrades to
+    single-engine — ``engine_name`` is that engine and ``engines is None``
+    (nothing to vote on). Mock a host with only arbez present."""
+    with _with_probed(True, False, False, False):
+        s = Scanner()
+        assert s.engine_name == "arbez", (
+            f"single-engine install should degrade to that engine; got "
+            f"{s.engine_name!r}"
+        )
+        assert s.engines is None
+        assert "consensus=" not in repr(s)
+
+
+def test_scanner_bare_single_engine_degrades_to_zxing() -> None:
+    """S-093: same degrade contract with a different sole engine — only zxing
+    installed (e.g. arbez model unimportable) degrades to single-engine zxing."""
+    with _with_probed(False, False, True, False):
+        s = Scanner()
+        assert s.engine_name == "zxing"
+        assert s.engines is None
+
+
+def test_scanner_bare_no_engines_raises() -> None:
+    """S-093: bare ``Scanner()`` on a host with NO installed engines (broken
+    install) raises :class:`EngineUnavailable` at construction, not at first
+    scan."""
+    with (
+        _with_probed(False, False, False, False),
+        pytest.raises(EngineUnavailable, match="no installed engines"),
+    ):
+        Scanner()
 
 
 # ─── Decision-logic tests (independent of the actual host) ─────────────────
@@ -147,6 +227,10 @@ def test_scanner_repr_shows_resolved_engine() -> None:
 # include ``"arbez.engines.arbez"`` in the set to model a normal
 # install, omit it to model the (production-impossible) "arbez
 # missing" case so the fallback branches can be tested.
+#
+# These exercise the FUNCTION ``resolve_auto_engine()`` — still shipped in
+# 0.2.0 (it backs ``parallelism.recommended_workers("auto")``). Only the
+# removed ``Scanner(engine="auto")`` *behavior* changed, not this function.
 
 
 def _find_spec_for(present: set[str]) -> object:
@@ -161,37 +245,30 @@ def _find_spec_for(present: set[str]) -> object:
 
 @pytest.fixture(autouse=True)
 def _clear_engine_discovery_cache() -> Iterator[None]:
-    """Clear all three engine-discovery caches between tests.
+    """Clear the engine-discovery caches between tests.
 
     S-039 (v0.0.24) added the ``_probe_engines`` cache clear so the
     decision-logic tests below could monkey-patch ``find_spec`` to
     simulate different host configurations.
 
-    **Code-review fix (2026-05-17):** ``_probe_engines`` is not the
-    only ``@functools.cache``'d function — :func:`installed_consensus_engines`
-    and :func:`default_consensus_engine_names` both cache their own
-    return values (they call ``_probe_engines`` internally but their
-    cached outputs are independent of its cache state). Clearing only
-    ``_probe_engines`` left stale tuples in the dependent caches, so
-    any test monkey-patching ``find_spec`` and then constructing a
-    bare ``Scanner()`` (which routes through
-    ``default_consensus_engine_names()`` per S-075) would silently see
-    the pre-patch cached state. All three caches are now cleared on
-    entry AND exit.
+    S-093 (0.2.0): ``default_consensus_engine_names`` was REMOVED (bare
+    ``Scanner()`` now runs the all-installed set, so there is no separate
+    "default subset" cache). Only the two still-existing ``@functools.cache``'d
+    functions remain to clear: ``_probe_engines`` and
+    ``installed_consensus_engines``. Cleared on entry AND exit so a test that
+    monkey-patches ``find_spec`` / ``_probe_engines`` can't leak cached
+    host-state into the next test.
     """
     from arbez._engine_discovery import (
         _probe_engines,
-        default_consensus_engine_names,
         installed_consensus_engines,
     )
 
     _probe_engines.cache_clear()
     installed_consensus_engines.cache_clear()
-    default_consensus_engine_names.cache_clear()
     yield
     _probe_engines.cache_clear()
     installed_consensus_engines.cache_clear()
-    default_consensus_engine_names.cache_clear()
 
 
 def test_resolve_auto_picks_arbez_when_available() -> None:
@@ -335,152 +412,52 @@ def test_unknown_engine_name_raises_at_construction() -> None:
         Scanner(engine="bogus")
 
 
-# ─── Code-review fixes (2026-05-17) — regression tests for P0 + P1 ────────
+# ─── Error-path contract (S-093, 0.2.0) ───────────────────────────────────
 
 
-def test_scanner_consensus_off_explicit_opts_out_of_s075_default() -> None:
-    """Code-review P0 #3: pre-fix, ``Scanner(consensus="off")`` engaged the
-    S-075 default consensus because the predicate couldn't distinguish "user
-    passed off" from "user passed nothing." Post-fix (consensus sentinel
-    ``str | None = None``), explicit ``"off"`` is the documented single-engine
-    path and is honored."""
-    s = Scanner(consensus="off")
-    assert s.engine_name != "consensus", (
-        f"Explicit consensus='off' must NOT engage S-075 default consensus; "
-        f"got engine_name={s.engine_name!r}"
-    )
-    assert s.engines is None
-    assert "vote" not in repr(s)
+def test_scanner_engine_with_consensus_above_one_raises() -> None:
+    """``Scanner(engine="zxing", consensus=2)`` is contradictory — a single
+    engine can't reach a 2-engine threshold. Raises ValueError."""
+    with pytest.raises(ValueError, match="single"):
+        Scanner(engine="zxing", consensus=2)
 
 
-def test_scanner_consensus_off_alone_resolves_to_single_engine_auto() -> None:
-    """When the user passes only ``consensus="off"`` (no engine=), the partial-
-    override branch resolves ``engine`` to ``"auto"`` → single-engine arbez on a
-    stock install."""
-    s = Scanner(consensus="off")
-    # On a working install, "auto" resolves to "arbez" (S-034).
-    assert s.engine_name == "arbez"
+def test_scanner_engine_with_engines_raises() -> None:
+    """``Scanner(engine="arbez", engines=["zxing"])`` mixes the single-engine
+    and multi-engine selectors — raises ValueError."""
+    with pytest.raises(ValueError, match="not both"):
+        Scanner(engine="arbez", engines=["zxing"])
 
 
-def test_scanner_engine_instance_with_consensus_vote_raises() -> None:
-    """Code-review P0 #2: pre-fix, ``Scanner(engine=<Engine instance>,``
-    ``consensus="vote")`` silently dropped the user's pre-configured engine
-    because the consensus path never inspected ``engine=``. Now raises
-    ValueError so the user gets immediate feedback."""
-    from arbez import Symbology
-    from arbez.engines.zxing import ZXingEngine
-
-    with pytest.raises(ValueError, match="not supported"):
-        Scanner(engine=ZXingEngine(formats={Symbology.QR}), consensus="vote")
+def test_scanner_engines_with_unknown_name_raises() -> None:
+    """``Scanner(engines=[...])`` containing an unknown engine name raises
+    :class:`EngineUnavailable` at construction."""
+    with pytest.raises(EngineUnavailable):
+        Scanner(engines=["arbez", "not_a_real_engine"])
 
 
-def test_scanner_min_votes_in_off_mode_raises() -> None:
-    """Code-review P1 #7+#8: pre-fix, ``Scanner(engine="arbez", min_votes=5)``
-    silently absorbed min_votes and ignored it. Now raises ValueError so the
-    user knows their min_votes is being ignored."""
-    with pytest.raises(ValueError, match=r"min_votes.*only meaningful"):
-        Scanner(engine="arbez", min_votes=5)
+def test_scanner_consensus_above_engine_count_raises() -> None:
+    """``Scanner(consensus=99)`` on a host with < 99 engines raises ValueError —
+    no code could ever reach that many votes."""
+    with pytest.raises(ValueError, match="exceeds the number of engines"):
+        Scanner(consensus=99)
 
 
-def test_scanner_consensus_vote_min_votes_above_engine_count_raises() -> None:
-    """Code-review P1 #7: pre-fix, ``Scanner(consensus="vote", min_votes=99)``
-    on a 2-engine install constructed cleanly + silently returned empty
-    results forever (no cluster could ever reach 99 unique voters). Now
-    raises ValueError at construction."""
-    with pytest.raises(ValueError, match="exceeds the number of voting engines"):
-        Scanner(consensus="vote", min_votes=99)
+def test_scanner_consensus_zero_raises() -> None:
+    """``consensus=0`` is below the union floor of 1 — raises ValueError."""
+    with pytest.raises(ValueError, match="consensus must be >= 1"):
+        Scanner(consensus=0)
 
 
-def test_scanner_bare_degrades_to_single_arbez_when_zxing_absent() -> None:
-    """Code-review P1 #9: when ``default_consensus_engine_names()`` returns
-    only ``("arbez",)`` (zxing somehow absent from the install), bare
-    ``Scanner()`` should silently degrade to single-engine arbez rather
-    than raise or engage consensus on a 1-engine voter set.
-
-    Uses monkey-patching since real-life "zxing missing from stock install"
-    requires a broken / stripped environment.
-    """
-    with (
-        patch.object(platform, "system", return_value="Linux"),
-        patch.object(
-            importlib.util,
-            "find_spec",
-            # Only arbez available — zxing/cv2/vision all absent.
-            side_effect=_find_spec_for({"arbez.engines.arbez"}),
-        ),
-    ):
-        s = Scanner()
-        # Degrades to single-engine arbez. Does NOT engage consensus.
-        assert s.engine_name == "arbez", (
-            f"Bare Scanner() with zxing missing should degrade to "
-            f"single-engine arbez; got {s.engine_name!r}"
-        )
-        assert s.engines is None
-        assert "vote" not in repr(s)
+def test_scanner_consensus_string_raises_type_error() -> None:
+    """The 0.1.x ``consensus="vote"`` string API was removed; ``consensus`` is
+    an int now, so a str raises TypeError."""
+    with pytest.raises(TypeError, match="consensus must be an int"):
+        Scanner(consensus="vote")  # type: ignore[arg-type]
 
 
-def test_scanner_bare_with_both_arbez_and_zxing_absent_raises() -> None:
-    """Code-review fix on top of P1 #9: pre-fix, the S-075 fallback fell
-    through to ``engine="arbez"`` even if arbez itself wasn't importable,
-    deferring the failure to the first scan call. Now raises
-    EngineUnavailable at construction time so the broken-install case
-    fails fast and loudly."""
-    with (
-        patch.object(platform, "system", return_value="Linux"),
-        patch.object(
-            importlib.util,
-            "find_spec",
-            # Neither arbez nor zxing nor anything else.
-            side_effect=_find_spec_for(set()),
-        ),
-        pytest.raises(EngineUnavailable, match="neither arbez nor zxing"),
-    ):
-        Scanner()
-
-
-def test_default_consensus_engine_names_returns_arbez_zxing_on_stock_install() -> None:
-    """Code-review P1 #13: pin the documented behavior of
-    :func:`default_consensus_engine_names`. On a stock install with both
-    arbez + zxing available, it returns ``("arbez", "zxing")``."""
-    from arbez._engine_discovery import default_consensus_engine_names
-
-    # Run on whatever this host is — the test environment always has
-    # both core deps. The autouse cache-clear fixture ensures we get a
-    # fresh probe.
-    assert default_consensus_engine_names() == ("arbez", "zxing")
-
-
-def test_default_consensus_engine_names_falls_back_to_arbez_only_when_zxing_absent() -> None:
-    """Code-review P1 #13: the documented degraded path. When zxing isn't
-    available, the helper returns ``("arbez",)`` — Scanner's S-075 routing
-    uses this to detect "fewer than 2 engines → fall back to single-engine
-    arbez."""
-    from arbez._engine_discovery import default_consensus_engine_names
-
-    with (
-        patch.object(platform, "system", return_value="Linux"),
-        patch.object(
-            importlib.util,
-            "find_spec",
-            side_effect=_find_spec_for({"arbez.engines.arbez"}),
-        ),
-    ):
-        assert default_consensus_engine_names() == ("arbez",)
-
-
-def test_default_consensus_engine_names_empty_when_arbez_and_zxing_absent() -> None:
-    """Code-review P1 #13: when BOTH are absent, the helper returns the
-    empty tuple. Scanner uses this to fail-fast in the all-engines-broken
-    case (otherwise the fallback to ``engine="arbez"`` would defer the
-    failure to first scan)."""
-    from arbez._engine_discovery import default_consensus_engine_names
-
-    with (
-        patch.object(platform, "system", return_value="Linux"),
-        patch.object(
-            importlib.util,
-            "find_spec",
-            side_effect=_find_spec_for(set()),
-        ),
-    ):
-        assert default_consensus_engine_names() == ()
+def test_scanner_consensus_bool_raises_type_error() -> None:
+    """``bool`` is an int subclass; ``Scanner(consensus=True)`` must NOT be
+    silently read as 1 — it raises TypeError."""
+    with pytest.raises(TypeError, match="consensus must be an int"):
+        Scanner(consensus=True)

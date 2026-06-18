@@ -4,50 +4,42 @@ The Scanner orchestrates one or more consensus engines and wraps the
 result in a :class:`~arbez.Result` that carries the input image size,
 the merged detection list, and per-stage timings.
 
-Default behavior (S-075, 2026-05-17)
-------------------------------------
-Bare ``Scanner()`` (no arguments) runs a **2-engine consensus** of
-the bundled ``arbez`` YOLOX-s detector + the classical ``zxing``
-decoder, in union mode (``min_votes=1``). Both engines are always
-installed (``zxing-cpp`` has been a core dep since S-034 / v0.0.20),
-so the default delivers ``arbez``'s strong matrix-code recall PLUS
-``zxing``'s long-tail coverage (Aztec, EAN-13, the 1D catch-all)
-with no extra setup.
+Default behavior (S-093, 0.2.0)
+-------------------------------
+Bare ``Scanner()`` (no arguments) runs **every installed engine** and
+unions their results — whatever any engine can detect is returned, for
+maximum yield. On a stock ``pip install arbez`` that's ``arbez`` +
+``zxing`` (+ ``apple_vision`` on macOS, where pyobjc auto-installs); add
+the WeChat extra and it joins too.
 
-Detections from either engine survive the vote; each output
-``Detection`` has ``engine="consensus"`` and
-``extras["voted_by"]`` listing the engines that contributed. Bbox
-is the per-coord median across cluster members, score is the mean,
-and symbology/payload tiebreaks go to the highest-scored member.
-See ``docs/consensus-rules.md`` for the full deterministic spec.
+Detections are merged **per physical code** (IoU clustering); each output
+``Detection`` has ``engine="consensus"`` and ``extras["voted_by"]`` listing
+the engines that found it. The un-merged per-engine breakdown is on
+``Result.per_engine``. Bbox is the per-coord median across cluster members,
+score the mean, symbology/payload tiebreaks go to the highest-scored
+member. See ``docs/consensus-rules.md`` for the deterministic spec.
 
-If ``zxing`` is somehow absent on a particular install (broken
-environment / stripped frozen-app build), bare ``Scanner()``
-degrades silently to single-engine ``arbez`` — the bare
-construction never raises on a working arbez install.
+Consensus (require agreement)
+-----------------------------
+``consensus`` is the per-code agreement threshold (an int, default ``1``):
+
+* ``Scanner()`` / ``consensus=1`` — union: keep a code if ANY engine saw it.
+* ``Scanner(consensus=N)`` — keep only codes **>= N engines agree on**
+  (evaluated per detected code), across all installed engines.
+* ``Scanner(consensus=N, engines=[...])`` — same, restricted to a chosen
+  engine set. Naming an engine that isn't installed raises at construction.
 
 Other constructor shapes
 ------------------------
-* ``Scanner(engine="auto")`` — single-engine auto-pick (the
-  pre-S-075 default). Priority order: arbez first (always
-  installed since S-034), then apple_vision on Darwin with the
-  full pyobjc stack, then zxing, then wechat.
-* ``Scanner(engine="arbez")`` — single-engine arbez (first-party
-  YOLOX-s + zxing-cpp decoder pipeline).
-* ``Scanner(engine="zxing")`` — single-engine classical decoder.
-  Broad symbology coverage; no model inference.
-* ``Scanner(engine="wechat")`` — QR-only; opencv-contrib's WeChat
-  detector. Best for tiny / damaged QR codes.
-* ``Scanner(engine="apple_vision")`` — macOS only. Apple
-  Neural-Engine backed; real per-detection confidence scores.
-* ``Scanner(consensus="vote")`` — N-engine majority vote across
-  ALL installed engines (``min_votes=2`` default, configurable).
-  Different default than bare ``Scanner()`` because the use cases
-  differ: bare = "give me best recall out of the box";
-  ``consensus="vote"`` = "have multiple engines agree before I
-  trust a detection."
-* ``Scanner(engine=<Engine instance>)`` — pass a pre-configured
-  engine (S-015), e.g. ``ZXingEngine(formats={Symbology.QR})``.
+* ``Scanner(engine="arbez")`` — single engine, no consensus. Also
+  ``"zxing"`` (broad classical decoder), ``"wechat"`` (QR-only, needs the
+  extra), ``"apple_vision"`` (macOS only, ANE-backed).
+* ``Scanner(engines=["arbez", "zxing"])`` — union over just that subset.
+* ``Scanner(engine=<Engine instance>)`` — a pre-configured engine (S-015),
+  e.g. ``ZXingEngine(formats={Symbology.QR})``.
+
+``engine="auto"`` and the ``consensus="off"/"vote"`` + ``min_votes`` API
+were removed in 0.2.0 (S-093).
 """
 
 from __future__ import annotations
@@ -103,12 +95,11 @@ _log = logging.getLogger(__name__)
 # ── Engine resolution ──────────────────────────────────────────────────────
 
 
-# Public set of engine name strings the resolver accepts. ``"auto"`` is
-# the smart-pick branch; the others map 1:1 to a built-in engine class.
-# S-028 added ``"arbez"`` in v0.0.14. S-034 (v0.0.20) made arbez the
-# default auto-pick.
+# Public set of single-engine name strings ``Scanner(engine=...)`` accepts;
+# each maps 1:1 to a built-in engine class. ``"auto"`` was removed in 0.2.0
+# (S-093) — bare ``Scanner()`` now runs all installed engines for max yield.
 _KNOWN_ENGINE_NAMES: frozenset[str] = frozenset(
-    {"auto", "arbez", "apple_vision", "zxing", "wechat"}
+    {"arbez", "apple_vision", "zxing", "wechat"}
 )
 
 
@@ -377,432 +368,221 @@ class Scanner:
     Parameters
     ----------
     engine:
-        Which consensus engine to use. Three accepted forms:
+        Select a SINGLE engine (no consensus). Accepted forms:
 
-        * ``None`` (the default since S-075) — bare ``Scanner()`` runs
-          the **2-engine default consensus**: ``arbez`` (bundled
-          YOLOX-s) + ``zxing`` (classical decoder), both always
-          installed. Detections from either engine are merged via IoU
-          clustering with ``min_votes=1`` (union mode), so the user
-          gets ``arbez``'s strong matrix-code recall PLUS ``zxing``'s
-          long-tail coverage (Aztec, EAN-13, the 1D catch-all)
-          right from ``Scanner()``. The result's
-          ``engine_name`` is ``"consensus"`` and each detection carries
-          ``extras["voted_by"]`` listing the engines that contributed.
-          If ``zxing`` is somehow absent on this install (broken
-          environment / stripped frozen-app build), this path
-          degrades silently to single-engine ``arbez``.
-        * ``"auto"`` — explicit single-engine auto-pick (the
-          pre-S-075 default). Resolves to the best installed single
-          engine: ``arbez`` first (always installed), then
-          ``apple_vision`` on Darwin with the full pyobjc stack, then
-          ``zxing``, then ``wechat``. Use this when you want
-          single-engine behavior without committing to a specific
-          engine name.
-        * Explicit string — ``"arbez"`` / ``"zxing"`` / ``"wechat"`` /
-          ``"apple_vision"``. ``arbez`` is the first-party YOLOX-s
-          pipeline; ``zxing`` handles every Arbez symbology (broadest
-          classical), ``wechat`` is QR-only but better at tiny /
-          damaged codes, ``apple_vision`` is macOS-only and exposes
-          real per-detection confidence.
-        * A pre-constructed :class:`~arbez.Engine` instance (S-015). Use
-          this when you need engine-specific configuration the string
-          form doesn't expose, e.g.
+        * Explicit string — ``"arbez"`` (first-party YOLOX-s + zxing-cpp
+          pipeline), ``"zxing"`` (broadest classical decoder), ``"wechat"``
+          (QR-only, better on tiny / damaged codes; needs the extra), or
+          ``"apple_vision"`` (macOS-only, ANE-backed, real confidence).
+        * A pre-constructed :class:`~arbez.Engine` instance (S-015), when you
+          need engine-specific config the string form doesn't expose, e.g.
           ``Scanner(engine=ZXingEngine(formats={Symbology.QR}))``.
-          The Scanner still wraps results, times engine calls, and
-          drives consensus — you just supply your own engine instance.
-    model:
-        **Reserved; always raises ``NotImplementedError`` when
-        non-``None``.** ``ArbezEngine`` shipped at v0.0.17 and is
-        the default since v0.0.20 — to load custom YOLOX-s /
-        RT-DETR-v2 / YOLO11-s weights, construct an
-        ``ArbezEngine(model_path=...)`` explicitly and pass it via
-        ``engine=`` (or via the ``engines=`` list for consensus
-        voting). The ``model=`` parameter remains reserved at the
-        Scanner level for future Scanner-level model wiring; the
-        explicit-engine path covers every current BYO use case.
-    consensus:
-        Multi-engine consensus mode (S-032, locked from v0.0.18;
-        S-077 sentinel default).
+        * ``None`` (the default) — do NOT select a single engine; the
+          multi-engine path runs instead (bare ``Scanner()`` = all installed).
 
-        * ``None`` (default since S-077) — sentinel meaning "user
-          didn't pass". When ``engine=None`` and ``engines=None``
-          too, bare ``Scanner()`` engages the S-075 default consensus
-          (``arbez`` + ``zxing``, union mode); otherwise the
-          sentinel resolves to ``"off"``.
-        * ``"off"`` (explicit opt-out) — single-engine path.
-          ``engine=`` picks which engine runs; ``engines=`` is
-          stored for reference but doesn't drive scanning.
-        * ``"vote"`` — run ALL engines in ``engines=`` (or all
-          installed engines if ``engines=None``) in parallel and vote
-          on the merged result. Each output Detection has
-          ``engine="consensus"`` and ``extras["voted_by"]`` listing
-          the engines that contributed. See :func:`arbez.consensus.run_consensus`
-          for the voting policy.
-
-        Any other value raises :class:`NotImplementedError`.
-    min_votes:
-        Consensus vote threshold (S-032; S-077 sentinel default).
-        When ``consensus="vote"``, a detection cluster is kept only
-        if at least this many UNIQUE engines agree on the bbox.
-
-        * ``None`` (default since S-077) — sentinel resolved per path:
-          ``1`` (union mode) for the bare-Scanner S-075 default,
-          ``2`` (majority) for explicit ``consensus="vote"``.
-        * Explicit ``int >= 1`` — overrides the per-path default.
-
-        ``Scanner(consensus="off", min_votes=N)`` raises
-        ``ValueError`` since S-077 — min_votes is only meaningful
-        with ``consensus="vote"``.
-    iou_threshold:
-        Consensus bbox-grouping threshold (S-032). Two detections
-        whose bboxes overlap with IoU >= this value are treated as
-        the same physical barcode and merged. Default ``0.5``.
-        Validated in every mode; only consulted when consensus
-        voting is active.
+        Mutually exclusive with ``engines=`` and with ``consensus > 1``.
+        ``engine="auto"`` was removed in 0.2.0 (S-093).
     engines:
-        Which engines participate in consensus voting (S-027, locked
-        from v0.0.13). Two accepted forms:
+        The engine set for the multi-engine path. ``None`` (default) means
+        **every installed engine** — the max-yield bare-``Scanner()`` set
+        (:func:`arbez.parallelism.installed_consensus_engines`). A
+        tuple/list of names restricts the set; each name must be currently
+        installed or :class:`EngineUnavailable` is raised at construction.
+        Empty sequence raises :class:`ValueError`. Mutually exclusive with
+        ``engine=``.
+    consensus:
+        Per-code agreement threshold for the multi-engine path (S-093). An
+        ``int >= 1``:
 
-        * ``None`` (default) — when consensus voting kicks in, ALL
-          engines reported by
-          :func:`arbez.parallelism.installed_consensus_engines` vote.
-          The standard recommendation.
-        * Tuple/sequence of engine names — restrict consensus to this
-          subset. Each name must be a currently-installed engine
-          (members of ``installed_consensus_engines()``); unknown or
-          uninstalled names raise :class:`EngineUnavailable` at
-          construction time so the user gets immediate feedback
-          rather than a surprise at scan time.
+        * ``1`` (default) — union: keep a code if ANY engine in the set saw
+          it. This is what bare ``Scanner()`` does (max yield).
+        * ``N >= 2`` — keep only codes that **>= N engines agree on**,
+          evaluated PER detected code (IoU clustering). ``N`` greater than
+          the number of engines raises :class:`ValueError`.
 
-        Validation happens at ``__init__`` time so users get immediate
-        feedback on unknown / uninstalled engine names, not a surprise
-        at first scan. Empty sequence raises :class:`ValueError` (no
-        engines to vote with).
-
-        Consensus voting shipped in S-032 (v0.0.18) and is the bare
-        ``Scanner()`` default since S-075 (2026-05-17). ``engines=``
-        directly drives the consensus voter set when ``consensus="vote"``
-        is active.
+        Each surviving Detection has ``engine="consensus"`` and
+        ``extras["voted_by"]``; the un-merged per-engine detections are on
+        ``Result.per_engine``. See :func:`arbez.consensus.run_consensus` for
+        the voting policy. The 0.1.x ``"off"/"vote"`` strings + ``min_votes``
+        were removed in 0.2.0.
+    model:
+        **Reserved; always raises ``NotImplementedError`` when non-``None``.**
+        To load custom YOLOX-s / RT-DETR-v2 / YOLO11-s weights, construct an
+        ``ArbezEngine(model_path=...)`` and pass it via ``engine=`` (or in
+        ``engines=``).
+    iou_threshold:
+        Consensus bbox-grouping threshold (S-032). Two detections whose
+        bboxes overlap with IoU >= this value are treated as the same
+        physical barcode and merged. Default ``0.5``; validated in ``[0, 1]``.
 
     Raises
     ------
     EngineUnavailable
-        Unknown engine name passed to ``engine=``; OR
-        ``consensus="vote"`` with an empty voter set after applying
-        the ``engines=`` filter; OR bare ``Scanner()`` on a broken
-        install where neither ``arbez`` nor ``zxing`` is importable
-        (since S-077).
+        Unknown name passed to ``engine=`` or ``engines=`` (including
+        ``engine="auto"``, removed in 0.2.0); a name in ``engines=`` that
+        isn't installed; or no installed engines at all (broken install).
     TypeError
-        ``engine=`` is neither a string nor an Engine Protocol
-        instance; OR ``engines=`` is neither None nor a tuple/list.
+        ``engine=`` is neither a string nor an Engine instance; ``engines=``
+        is neither None nor a tuple/list; or ``consensus=`` is not an int.
     ValueError
-        Several validation paths since S-077:
-
-        * ``min_votes < 1``
-        * ``iou_threshold`` outside ``[0, 1]``
-        * ``Scanner(consensus="off", min_votes=N)`` for any explicit
-          ``N`` — only meaningful with ``consensus="vote"``
-        * ``min_votes > len(resolved voting engines)`` — degenerate
-          (no cluster can ever reach the threshold)
-        * ``Scanner(engine=<Engine instance>, consensus="vote")`` —
-          the consensus path uses ``_resolve_engine`` to build
-          voters by name; a pre-constructed Engine has nowhere to
-          land. Use ``engines=`` by name instead.
-        * Empty ``engines=`` sequence; OR unknown engine name in
-          ``engines=``.
+        ``consensus < 1``; ``consensus`` greater than the number of engines;
+        ``iou_threshold`` outside ``[0, 1]``; ``engine=`` combined with
+        ``engines=`` or with ``consensus > 1``; or an empty / invalid
+        ``engines=`` sequence.
     NotImplementedError
-        ``model=`` is anything other than ``None`` (see ``model:``
-        parameter docs); OR ``consensus=`` is neither None nor
-        ``"off"`` / ``"vote"``.
+        ``model=`` is anything other than ``None``.
     """
 
     def __init__(
         self,
         engine: str | Engine | None = None,
-        consensus: str | None = None,
-        engines: tuple[str, ...] | list[str] | None = None,
         *,
+        engines: tuple[str, ...] | list[str] | None = None,
+        consensus: int = 1,
         model: Path | None = None,
-        min_votes: int | None = None,
         iou_threshold: float = 0.5,
     ) -> None:
-        # S-075 (2026-05-17): bare ``Scanner()`` now defaults to a
-        # 2-engine consensus of ``arbez`` + ``zxing`` (both always
-        # installed since S-034). Detected by the "user passed
-        # nothing related to engine selection" predicate:
-        # ``engine is None and consensus is None and engines is None``.
-        # Any explicit value to those three opts out of the new
-        # default.
+        # S-093 (0.2.0): engine-selection model.
         #
-        # Code-review fix (2026-05-17): ``consensus`` uses a sentinel
-        # (``None``) so we can tell ``Scanner(consensus="off")``
-        # (explicit opt-out from S-075 default → single-engine) from
-        # bare ``Scanner()`` (engages S-075). Pre-fix, both produced
-        # the S-075 consensus output, which was a silent surprise for
-        # any caller who wrote ``consensus="off"`` thinking it was a
-        # no-op.
+        #   Scanner()                       -> union of ALL installed engines
+        #   Scanner(engine="zxing")         -> single engine, no consensus
+        #   Scanner(engines=[...])          -> union over that subset
+        #   Scanner(consensus=N)            -> >=N of all installed must agree
+        #   Scanner(consensus=N, engines=)  -> >=N of that subset must agree
         #
-        # ``min_votes`` uses the same sentinel pattern. In the S-075
-        # default path we want UNION semantics (min_votes=1: detection
-        # counts if EITHER engine saw it) so the whole point of the
-        # bundled+zxing default — long-tail 1D coverage from zxing
-        # added on top of arbez's matrix-code strength — actually
-        # surfaces. If the user passes ``min_votes`` explicitly,
-        # honor it.
-        #
-        # Fallback: if ``zxing`` isn't available (broken install /
-        # stripped frozen-app build), degrade silently to
-        # single-engine ``arbez``. The bare construction must never
-        # raise on a working arbez install.
-        if engine is None and consensus is None and engines is None:
-            from arbez._engine_discovery import default_consensus_engine_names
-            default_set = default_consensus_engine_names()
-            if len(default_set) >= 2:
-                _log.debug(
-                    "Scanner: bare construction -> S-075 default consensus(%s)",
-                    "+".join(default_set),
-                )
-                consensus = "vote"
-                engines = default_set
-                if min_votes is None:
-                    min_votes = 1
-            elif "arbez" in default_set:
-                # zxing not available -> degrade to single-engine arbez.
-                # Code-review fix: only fall through to ``engine="arbez"``
-                # if arbez IS in the default set — if arbez itself is
-                # broken (extremely rare; only seen in stripped frozen-
-                # app builds), let the explicit failure path below raise
-                # EngineUnavailable at construction time instead of
-                # silently constructing an engine that will crash at
-                # first scan.
-                _log.debug(
-                    "Scanner: bare construction -> single-engine arbez "
-                    "(S-075 default consensus degraded; zxing not available)"
-                )
-                consensus = "off"
-                engine = "arbez"
-            else:
-                # Both arbez AND zxing absent. Fail loudly at
-                # construction time rather than at first scan.
-                raise EngineUnavailable(
-                    "Scanner() called with no arguments on an install "
-                    "where neither arbez nor zxing is available. Both "
-                    "are core deps; reinstall with "
-                    "``pip install --force-reinstall arbez``, or pass "
-                    "an explicit engine name "
-                    "(e.g. ``Scanner(engine='apple_vision')``)."
-                )
-        elif engine is None:
-            # Partial override: user passed consensus=/engines= but not
-            # engine=. Honor their intent — treat engine=None as "auto"
-            # for the single-engine slot (it's ignored anyway when
-            # consensus="vote", but resolves cleanly when "off").
-            engine = "auto"
+        # ``consensus`` is the per-code agreement threshold: 1 = union (keep a
+        # code if ANY engine saw it — the max-yield default); N>=2 = keep only
+        # codes >=N engines agree on (per detected code, via IoU clustering).
+        # The 0.1.x ``consensus="off"/"vote"`` strings, ``min_votes``, and
+        # ``engine="auto"`` were removed.
 
-        # ``consensus`` sentinel resolution. Anything still ``None`` at
-        # this point means the user passed at least one of
-        # ``engine=`` / ``engines=`` but didn't explicitly set
-        # ``consensus=``. Default to single-engine ``"off"``.
-        if consensus is None:
-            consensus = "off"
-
-        # Code-review fix (2026-05-17): ``min_votes`` is only meaningful
-        # when ``consensus="vote"``. Pre-fix, ``Scanner(engine="arbez",``
-        # ``min_votes=5)`` silently absorbed the value and ignored it
-        # — confusing for users trying to debug "why is my min_votes
-        # not taking effect?". Raise instead. Validation happens AFTER
-        # the S-075 routing (which may set ``consensus="vote"``
-        # internally) but BEFORE the ``min_votes`` sentinel is
-        # resolved to its default, so we can still distinguish
-        # "user passed" from "default."
-        if consensus == "off" and min_votes is not None:
-            raise ValueError(
-                f"min_votes={min_votes} only meaningful with "
-                f"consensus='vote'. Got consensus='off' (single-engine "
-                f"path) where min_votes is ignored. Either pass "
-                f"``consensus='vote'`` to enable multi-engine voting, "
-                f"or drop the ``min_votes=`` argument."
-            )
-
-        # ``min_votes`` sentinel resolution. The historical default
-        # (pre-S-075) was 2 for ``consensus="vote"`` with N engines.
-        # If unspecified at this point, fall back to 2 for backwards
-        # compatibility with existing ``Scanner(consensus="vote")``
-        # callers that relied on the default.
-        if min_votes is None:
-            min_votes = 2
-
-        # S-027: validate ``engines=`` before the consensus / model
-        # NotImplementedError raises, so users get a single coherent
-        # error per call. ``None`` is the default ("all installed");
-        # an explicit sequence is validated against
-        # ``installed_consensus_engines()`` immediately.
-        self._engines = _validate_consensus_subset(engines)
-
-        # S-032: validate consensus mode. "off" (single-engine) and
-        # "vote" (multi-engine voting) are the only accepted values.
-        if consensus not in ("off", "vote"):
-            raise NotImplementedError(
-                f"consensus={consensus!r} not supported. Accepted values: "
-                "'off' (single-engine), 'vote' (S-032 multi-engine voting)."
-            )
-        if consensus == "vote" and min_votes < 1:
-            raise ValueError(
-                f"min_votes must be >= 1; got {min_votes}"
-            )
-        # Code-review fix (2026-06): validate ``iou_threshold``
-        # UNCONDITIONALLY — the docstring's Raises section promises the
-        # range check without qualification, and ``min_votes`` already
-        # raises on the single-engine path (S-077). Pre-fix, an
-        # out-of-range value was silently stored when
-        # ``consensus="off"``.
-        if not (0.0 <= iou_threshold <= 1.0):
-            raise ValueError(
-                f"iou_threshold must be in [0, 1]; got {iou_threshold}"
-            )
-
+        # ── Reserved / range validation ──────────────────────────────────
         if model is not None:
-            # No longer silently ignored. A user passing a real .onnx /
-            # .mlpackage path would be confused if we accepted it and
-            # then ran some other engine instead. The Scanner-level
-            # ``model=`` slot is reserved for a future Scanner-level
-            # model-wiring shortcut; today, to load custom detector
-            # weights, construct an ``ArbezEngine(model_path=...)`` and
-            # pass it via ``engine=`` (or in the ``engines=`` list for
-            # consensus voting).
+            # Reserved Scanner-level slot. To load custom detector weights
+            # today, construct ``ArbezEngine(model_path=...)`` and pass it
+            # via ``engine=`` (or in ``engines=`` for consensus).
             raise NotImplementedError(
                 f"Scanner(model={str(model)!r}) is reserved. To load custom "
                 f"detector weights today, construct "
                 f"``ArbezEngine(model_path=...)`` and pass it via "
                 f"``engine=`` (or in ``engines=`` for consensus voting)."
             )
+        if not (0.0 <= iou_threshold <= 1.0):
+            raise ValueError(
+                f"iou_threshold must be in [0, 1]; got {iou_threshold}"
+            )
+        # ``bool`` is an int subclass — reject it so ``Scanner(consensus=True)``
+        # isn't silently read as 1.
+        if not isinstance(consensus, int) or isinstance(consensus, bool):
+            raise TypeError(
+                f"consensus must be an int >= 1 (the number of engines that "
+                f"must agree per code; 1 = union). The 0.1.x 'off'/'vote' "
+                f"strings + min_votes were removed in 0.2.0. Got {consensus!r}."
+            )
+        if consensus < 1:
+            raise ValueError(f"consensus must be >= 1; got {consensus}")
 
-        self._consensus_mode = consensus
-        self._consensus_min_votes = int(min_votes)
+        # Shared attributes (set concretely in the branches below). S-012
+        # thread-safety: ``_get_engine`` / ``_get_consensus_engines`` are
+        # double-checked under these locks.
         self._consensus_iou_threshold = float(iou_threshold)
-        # S-012 thread-safety: lazy ``_get_engine`` is double-checked
-        # under this lock so two threads landing on a fresh Scanner can't
-        # both construct an engine and race on the assignment. After the
-        # first scan ``self._engine`` is non-None and the check-then-use
-        # is a pure read (no lock contention on the hot path).
         self._engine_lock = threading.Lock()
-
-        # S-032 consensus: lazy-loaded dict of {engine_name: Engine}
-        # for the consensus="vote" path. Built on first scan via
-        # ``_get_consensus_engines``.
         self._consensus_engines: dict[str, Engine] | None = None
         self._consensus_engines_lock = threading.Lock()
+        self._engine: Engine | None = None
+        self._engines: tuple[str, ...] | None = None
+        self._is_consensus = False
+        self._consensus_min_votes = 1
 
-        # S-032: in consensus="vote" mode, ``engine=`` doesn't drive
-        # scanning. A string ``engine=`` is ignored entirely on this
-        # path — ``engine_name`` becomes the literal "consensus"
-        # sentinel below and the single-engine wiring is skipped.
-        if consensus == "vote":
-            # Code-review fix (2026-05-17): pre-fix, passing
-            # ``engine=<Engine instance>`` alongside ``consensus="vote"``
-            # silently DROPPED the user's pre-configured engine. The
-            # consensus path uses ``_resolve_consensus_engine_names()``
-            # to build a fresh default engine pool — the instance was
-            # never inspected. A user writing
-            # ``Scanner(engine=ZXingEngine(formats={Symbology.QR}),``
-            # ``consensus="vote")`` would silently lose their
-            # ``formats=`` filter. Raise explicitly so the contract is
-            # honest.
-            if engine is not None and not isinstance(engine, str):
+        # ── Single-engine path: ``engine=`` was given ────────────────────
+        if engine is not None:
+            if engines is not None:
                 raise ValueError(
-                    "Scanner(engine=<Engine instance>, consensus='vote') is not "
-                    "supported — the consensus path uses ``_resolve_engine`` "
-                    "to build each voter from its name, so a pre-constructed "
-                    "Engine instance has nowhere to land. To run a configured "
-                    "engine in consensus, either use ``consensus='off'`` (single "
-                    "engine), or pre-register the engine + use ``engines=`` to "
-                    "select it by name (future work)."
+                    "Pass engine= (one engine) OR engines= (a set to run "
+                    "together), not both. For multi-engine use engines=[...] "
+                    "(optionally with consensus=N)."
                 )
-
-            # Resolve which engines vote. Same logic as
-            # _get_consensus_engines's name-list resolution; doing it
-            # here lets us fail-fast on "no engines available" at
-            # construction time, not first scan.
-            vote_names = self._resolve_consensus_engine_names()
-            if not vote_names:
+            if consensus != 1:
+                raise ValueError(
+                    f"consensus={consensus} requires multiple engines, but "
+                    f"engine= selects a single one. Use engines=[...] with "
+                    f"consensus={consensus}, or drop consensus= for a single "
+                    f"engine."
+                )
+            # M1 (S-015): accept a pre-constructed Engine instance (e.g.
+            # ``ZXingEngine(formats={Symbology.QR})``) alongside string names.
+            if not isinstance(engine, str):
+                if not isinstance(engine, Engine):
+                    raise TypeError(
+                        f"engine must be None (all-installed default), a string "
+                        f"name ('arbez'/'zxing'/'wechat'/'apple_vision'), or an "
+                        f"Engine Protocol instance; got {type(engine).__name__} "
+                        f"which does not satisfy isinstance(_, Engine)."
+                    )
+                self._engine_name = getattr(engine, "name", type(engine).__name__)
+                self._engine = engine
+                _log.debug(
+                    "Scanner: accepted user-supplied engine instance %r (name=%r)",
+                    engine, self._engine_name,
+                )
+                return
+            if engine == "auto":
                 raise EngineUnavailable(
-                    "consensus='vote' requires at least one installed "
-                    "engine. Got an empty set after applying ``engines=`` "
-                    "filter. The stock install always provides arbez + "
-                    "zxing, so reaching this state means the install is "
-                    "broken; reinstall with "
-                    "`pip install --force-reinstall arbez`."
+                    "engine='auto' was removed in 0.2.0. Bare Scanner() now "
+                    "runs ALL installed engines (max yield); name a single "
+                    "engine (e.g. Scanner(engine='arbez')) for single-engine "
+                    "scanning."
                 )
-
-            # Code-review fix (2026-05-17): min_votes > number-of-engines
-            # is a silent black hole — no cluster can ever reach the
-            # threshold, so ``scan()`` returns empty forever. Validate
-            # upfront. (``run_consensus`` mirrors this same check
-            # defensively for direct callers, but that one alone would
-            # be too late here: a user constructing a Scanner that
-            # returns nothing wants the error at construction time,
-            # not at the first scan call.)
-            if min_votes > len(vote_names):
-                raise ValueError(
-                    f"min_votes={min_votes} exceeds the number of voting "
-                    f"engines ({len(vote_names)}: {vote_names}). No cluster "
-                    f"can ever reach this threshold, so ``scan()`` would "
-                    f"silently return empty. Either lower ``min_votes`` to "
-                    f"<= {len(vote_names)} or install more consensus engines."
+            if engine not in _KNOWN_ENGINE_NAMES:
+                raise EngineUnavailable(
+                    f"Unknown engine name {engine!r}. Expected one of: "
+                    f"{sorted(_KNOWN_ENGINE_NAMES)}, or pass a pre-constructed "
+                    f"Engine instance."
                 )
-
-            # ``engine_name`` becomes the literal "consensus" sentinel
-            # so introspection is unambiguous. ``engines`` property
-            # already exposes the per-engine list when non-default.
-            self._engine_name = "consensus"
-            self._engine: Engine | None = None
+            self._engine_name = engine
+            # Lazy instantiation — defer the (possibly heavy) import to scan.
             return
 
-        # M1 (S-015): accept pre-constructed Engine instances alongside
-        # string names. The Protocol's ``runtime_checkable`` lets us
-        # validate the shape; the engine_name is taken from a ``name``
-        # attribute if present, else falls back to ``type(engine).__name__``.
-        # This is the path for users who need ``ZXingEngine(formats=...)``
-        # configuration that the string form doesn't surface.
-        if not isinstance(engine, str):
-            if not isinstance(engine, Engine):
-                raise TypeError(
-                    f"engine must be None (S-075 default consensus), a string "
-                    f"name ('auto'/'arbez'/'zxing'/'wechat'/'apple_vision'), "
-                    f"or an Engine Protocol instance; got "
-                    f"{type(engine).__name__} which does not satisfy "
-                    f"isinstance(_, Engine)."
-                )
-            # User-supplied engine — already constructed, fully eager.
-            # Skip the lazy-resolution path; the engine IS the engine.
-            self._engine_name = getattr(engine, "name", type(engine).__name__)
-            self._engine = engine
-            _log.debug(
-                "Scanner: accepted user-supplied engine instance %r (name=%r)",
-                engine, self._engine_name,
-            )
-            return
-
-        if engine not in _KNOWN_ENGINE_NAMES:
+        # ── Multi-engine path: ``engine=`` is None ───────────────────────
+        # The engine set is ``engines=`` (validated subset) or, by default,
+        # every installed engine (max-yield bare ``Scanner()``).
+        self._engines = _validate_consensus_subset(engines)
+        vote_names: tuple[str, ...] = (
+            self._engines if self._engines is not None
+            else _ed_installed_consensus_engines()
+        )
+        if not vote_names:
+            # arbez + zxing are core deps, so this only happens on a broken
+            # install. Fail loudly at construction, not first scan.
             raise EngineUnavailable(
-                f"Unknown engine name {engine!r}. Expected one of: "
-                f"{sorted(_KNOWN_ENGINE_NAMES)}, or pass a pre-constructed "
-                f"Engine instance."
+                "Scanner() found no installed engines. arbez + zxing are core "
+                "deps; reinstall with `pip install --force-reinstall arbez`, "
+                "or pass an explicit engine (e.g. "
+                "Scanner(engine='apple_vision'))."
             )
-
-        if engine == "auto":
-            # Resolve eagerly so repr() and self.engine_name reflect the
-            # actual chosen engine, not the literal "auto" placeholder.
-            # The pick itself is cheap (importlib.util.find_spec only).
-            engine = resolve_auto_engine()
-            _log.debug("Scanner: auto-resolved engine to %r", engine)
-
-        self._engine_name = engine
-        # Lazy engine instantiation — the consensus extras can be heavy
-        # (opencv-contrib is ~80 MB), so we defer the import until the
-        # first scan call.
-        self._engine = None
+        if consensus > len(vote_names):
+            raise ValueError(
+                f"consensus={consensus} exceeds the number of engines "
+                f"({len(vote_names)}: {list(vote_names)}). No code could ever "
+                f"reach that many votes. Lower consensus to "
+                f"<= {len(vote_names)}, or install more engines."
+            )
+        if len(vote_names) == 1:
+            # Only one engine in the set — nothing to vote on, so behave as
+            # single-engine (cleaner introspection; bare ``Scanner()`` never
+            # raises on a working 1-engine install). ``consensus`` is 1 here
+            # (the > len check above ruled out N>1).
+            self._engines = None
+            self._engine_name = vote_names[0]
+            return
+        # Genuine multi-engine consensus (>= 2 engines).
+        self._is_consensus = True
+        self._consensus_min_votes = int(consensus)
+        # Expose the resolved set on the ``engines`` property even when the
+        # user didn't pass ``engines=`` — bare ``Scanner()`` then shows the
+        # all-installed set it actually ran.
+        self._engines = tuple(vote_names)
+        self._engine_name = "consensus"
 
     # ── Public read-only properties ────────────────────────────────────────
 
@@ -810,17 +590,16 @@ class Scanner:
     def engine_name(self) -> str:
         """The resolved engine name.
 
-        After construction this is a concrete name — never the input
-        placeholder ``"auto"``. Built-in values:
+        Built-in values:
 
         * ``"arbez"`` / ``"arbez-rtdetr"`` / ``"arbez-yolo11"`` /
           ``"arbez-<arch>"`` — bundled ArbezEngine variants (S-067);
           or any string passed to ``ArbezEngine(name="...")`` (S-072)
         * ``"apple_vision"`` / ``"zxing"`` / ``"wechat"`` — classical
           single-engine paths
-        * ``"consensus"`` — multi-engine voting mode (live since
-          S-032 / v0.0.18; the bare-``Scanner()`` default since
-          S-075 / 2026-05-17)
+        * ``"consensus"`` — multi-engine path: bare ``Scanner()``
+          (all-installed union) or ``Scanner(consensus=N, engines=...)``
+          (S-093).
         * A third-party engine's ``name`` class attribute — when
           a pre-constructed Engine instance was passed via
           ``engine=``.
@@ -829,19 +608,15 @@ class Scanner:
 
     @property
     def engines(self) -> tuple[str, ...] | None:
-        """The consensus engine subset selected by ``engines=`` (S-027).
+        """The engine set this Scanner runs in the multi-engine path (S-093).
 
-        * ``None`` — default for single-engine paths; consensus voting
-          (when active) would use ALL engines from
-          :func:`arbez.parallelism.installed_consensus_engines`.
-        * Tuple of engine names — either the user-specified subset
-          validated at ``__init__`` time, OR the S-075 default
-          ``("arbez", "zxing")`` for bare ``Scanner()`` construction
-          (resolved from ``default_consensus_engine_names()``).
+        * ``None`` — single-engine path (``Scanner(engine=...)``).
+        * Tuple of engine names — the multi-engine set: the validated
+          ``engines=`` subset, or the resolved all-installed set for bare
+          ``Scanner()`` (so it always reflects what actually ran).
 
-        Locked from v0.0.13 (S-027). Consensus voting shipped in
-        S-032 (v0.0.18); the S-075 default makes this property
-        observable on bare ``Scanner()`` since 2026-05-17.
+        Locked from v0.0.13 (S-027); since S-093 (0.2.0) bare ``Scanner()``
+        exposes the full all-installed set here.
         """
         return self._engines
 
@@ -931,19 +706,25 @@ class Scanner:
         # engine; the vote-path dispatches all engines in parallel and
         # votes on the merged result.
         t0 = time.perf_counter()
-        if self._consensus_mode == "vote":
-            from arbez.consensus import run_consensus
+        per_engine: dict[str, tuple[Detection, ...]]
+        if self._is_consensus:
+            from arbez.consensus import run_consensus_detailed
 
-            detections = run_consensus(
+            cr = run_consensus_detailed(
                 pil_image,
                 self._get_consensus_engines(),
                 min_votes=self._consensus_min_votes,
                 iou_threshold=self._consensus_iou_threshold,
             )
+            detections = cr.detections
+            per_engine = dict(cr.per_engine)
             timing_label = "consensus"
         else:
             engine = self._get_engine()
             detections = engine.detect_and_decode(pil_image)
+            # Single engine: the per_engine breakdown is just that engine's
+            # own detections under its name (S-093).
+            per_engine = {self._engine_name: detections}
             timing_label = "engine"
         engine_ms = (time.perf_counter() - t0) * 1_000.0
 
@@ -956,6 +737,13 @@ class Scanner:
                 _rescale_detection(d, scale_inv_x, scale_inv_y)
                 for d in detections
             )
+            # Rescale the per-engine breakdown to the same original coords.
+            per_engine = {
+                name: tuple(
+                    _rescale_detection(d, scale_inv_x, scale_inv_y) for d in dets
+                )
+                for name, dets in per_engine.items()
+            }
 
         timings: dict[str, float] = {timing_label: engine_ms}
         if preprocess != "off":
@@ -964,6 +752,7 @@ class Scanner:
         return Result(
             detections=detections,
             image_size=original_size,
+            per_engine=per_engine,
             timings_ms=timings,
         )
 
@@ -1002,7 +791,7 @@ class Scanner:
 
         from PIL import Image as _Image
 
-        if self._consensus_mode == "vote":
+        if self._is_consensus:
             # S-032: warm up every engine that will vote.
             engines = self._get_consensus_engines()
             for eng in engines.values():
@@ -1202,22 +991,13 @@ class Scanner:
     # ── Repr ───────────────────────────────────────────────────────────────
 
     def __repr__(self) -> str:
-        # model= is intentionally omitted: passing anything but None
-        # raises NotImplementedError (H1 / S-015), so showing it in
-        # repr just adds noise. consensus is the same case but the
-        # field is part of the constructor's contract and worth
-        # surfacing — defaults to "off" today. engines= (S-027) is
-        # omitted in the default case to keep repr quiet; surfaced
-        # when the user has restricted the consensus subset.
-        base = (
-            f"Scanner(engine={self._engine_name!r}, "
-            f"consensus={self._consensus_mode!r}"
+        # model= is intentionally omitted (only None is accepted). Single-
+        # engine shows just the engine; the multi-engine consensus path
+        # surfaces the threshold, the resolved engine set, and iou_threshold.
+        if not self._is_consensus:
+            return f"Scanner(engine={self._engine_name!r})"
+        return (
+            f"Scanner(consensus={self._consensus_min_votes}, "
+            f"engines={self._engines!r}, "
+            f"iou_threshold={self._consensus_iou_threshold})"
         )
-        if self._engines is not None:
-            base += f", engines={self._engines!r}"
-        if self._consensus_mode == "vote":
-            base += (
-                f", min_votes={self._consensus_min_votes}, "
-                f"iou_threshold={self._consensus_iou_threshold}"
-            )
-        return base + ")"

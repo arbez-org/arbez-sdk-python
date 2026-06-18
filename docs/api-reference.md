@@ -40,11 +40,10 @@ class Scanner:
     def __init__(
         self,
         engine: str | Engine | None = None,
-        consensus: str | None = None,
         engines: tuple[str, ...] | list[str] | None = None,
+        consensus: int = 1,
         *,
         model: Path | None = None,
-        min_votes: int | None = None,
         iou_threshold: float = 0.5,
     ) -> None: ...
 
@@ -68,8 +67,9 @@ class Scanner:
     def __exit__(self, *args) -> None: ...
 ```
 
-The primary entry point. Picks an engine (or runs a consensus vote),
-scans the image, wraps the result.
+The primary entry point. Runs one engine or unions/merges several,
+scans the image, wraps the result. With no arguments it runs **every
+installed engine** and unions their results.
 
 `Scanner` also works as a **context manager**:
 
@@ -91,22 +91,21 @@ schedule + macOS's malloc-reclamation timing.
 
 | Param | Default | Description |
 |---|---|---|
-| `engine` | `None` | **`None` (the default since S-075)** runs the 2-engine default consensus (`arbez` + `zxing`, both always installed, union mode). Pass `"auto"` for single-engine auto-pick (pre-S-075 default). Pass an explicit name (`"arbez"` / `"zxing"` / `"wechat"` / `"apple_vision"`) to force a single engine. OR pass a pre-constructed `Engine` instance (e.g. `ZXingEngine(formats={Symbology.QR})`). Ignored when `consensus="vote"` (the consensus path drives scanning instead). |
-| `consensus` | `"off"` | Mode of operation. `"off"` = single-engine path driven by `engine=`. `"vote"` = multi-engine voting: every engine in `engines=` (or all installed) runs in parallel and detections are merged via IoU clustering + majority vote. Any other value raises `NotImplementedError`. Note: bare `Scanner()` internally promotes itself to `consensus="vote"` with `engines=("arbez","zxing")` + `min_votes=1` per S-075. |
-| `engines` | `None` | Subset of engine names that participate in `consensus="vote"`. `None` = all installed engines vote. Each name must be in `installed_consensus_engines()`; unknown / uninstalled names raise `EngineUnavailable` at construction. Empty sequence raises `ValueError`. Bare `Scanner()` resolves this to `("arbez", "zxing")` per S-075. |
+| `engine` | `None` | Selects a **single** engine, no consensus. Pass a name (`"arbez"` / `"zxing"` / `"wechat"` / `"apple_vision"`) or a pre-constructed `Engine` instance (e.g. `ZXingEngine(formats={Symbology.QR})`). `None` (the default) instead unions **every installed engine** (or the subset in `engines=`). Combining `engine=` with `engines=` or with `consensus > 1` raises `ValueError`. |
+| `engines` | `None` | Subset of engine names to union / merge. `None` = all installed engines participate. Each name must be in `installed_consensus_engines()`; unknown / uninstalled names raise `EngineUnavailable` at construction. Empty sequence raises `ValueError`. |
+| `consensus` | `1` | Integer agreement threshold. `1` (the default) = **union** — keep any code that any participating engine detected. `N > 1` = keep only codes that **>= N engines agree on**, clustered per detected code via IoU. Greater than the number of participating engines raises `ValueError`. |
 | `model` | `None` | Reserved for `Scanner`-level model paths. Today passing anything other than `None` raises `NotImplementedError`. For an actual user-supplied model use `ArbezEngine(model_path=...)` directly. Keyword-only. |
-| `min_votes` | `None` | Sentinel. When `consensus="vote"`, resolves to `2` (majority, the pre-S-075 default). When bare `Scanner()` engages the S-075 default consensus, resolves to `1` (union mode — surface detections from EITHER engine, which is the whole point of the default). Pass explicitly to override: e.g. `Scanner(min_votes=2)` on the S-075 default path requires both engines to agree. Keyword-only. |
-| `iou_threshold` | `0.5` | When `consensus="vote"`, bbox IoU >= this value groups detections from different engines as the same physical barcode. Out-of-range values (outside `[0, 1]`) raise `ValueError` at construction regardless of consensus mode. Keyword-only. |
+| `iou_threshold` | `0.5` | On the multi-engine path, bbox IoU >= this value groups detections from different engines as the same physical barcode. Out-of-range values (outside `[0, 1]`) raise `ValueError` at construction. Keyword-only. |
 
 **Properties:**
 
-- **`engine_name: str`** — in single-engine mode (`consensus="off"`),
-  the resolved engine name (never `"auto"`). In `consensus="vote"`
-  mode (including the S-075 bare-Scanner default), the literal string
-  `"consensus"`.
-- **`engines: tuple[str, ...] | None`** — the consensus subset.
-  `None` for single-engine paths. Resolved tuple for `consensus="vote"`
-  AND for the S-075 bare-Scanner default (where it's `("arbez", "zxing")`).
+- **`engine_name: str`** — on the single-engine path (`engine=` set),
+  the resolved engine name. On the multi-engine path (bare `Scanner()`
+  or any `consensus=N`), the literal string `"consensus"`.
+- **`engines: tuple[str, ...] | None`** — the participating engine set.
+  `None` on the single-engine path. On the multi-engine path, the
+  resolved tuple — for bare `Scanner()` this is every installed engine
+  (e.g. `("arbez", "apple_vision", "zxing")` on stock macOS).
 
 **Methods:**
 
@@ -138,14 +137,16 @@ schedule + macOS's malloc-reclamation timing.
   * file-like binary stream (anything with `.read()` + `.seek()`)
 
   Returns a `Result` with detections sorted by descending score, the
-  input image size, and per-stage timings in `timings_ms`. Timing
-  keys: `"engine"` (single-engine), `"consensus"` (consensus="vote"),
-  `"preprocess"` (when `preprocess="auto"` triggers).
+  input image size, the per-engine raw detections in `per_engine`, and
+  per-stage timings in `timings_ms`. Timing keys: `"engine"` (the
+  single-engine path), `"consensus"` (the multi-engine path — bare
+  `Scanner()` or `consensus=N`), `"preprocess"` (when
+  `preprocess="auto"` triggers).
 
 - **`warmup() -> None`** — pre-load the engine. Useful in
   latency-sensitive paths; the first `scan()` otherwise has to import
   the underlying library and (for some engines) load model files.
-  In `consensus="vote"` mode, pre-loads every voting engine.
+  On the multi-engine path, pre-loads every participating engine.
 
 - **`close() -> None`** — release the engine's
   native handles (ORT session, cv2.wechat_qrcode detector, pyobjc
@@ -164,12 +165,14 @@ schedule + macOS's malloc-reclamation timing.
 
 **Raises:**
 
-- `EngineUnavailable` — unknown engine name, or auto-pick found no
-  installed engine, or `consensus="vote"` with empty engine set.
-- `NotImplementedError` — `consensus` is not `"off"` or `"vote"`, or
-  `model is not None` (use `ArbezEngine(model_path=...)` directly).
-- `ValueError` — `min_votes < 1`, or `iou_threshold` outside `[0, 1]`,
-  or empty `engines` sequence.
+- `EngineUnavailable` — an engine name (`engine=` or in `engines=`)
+  that isn't installed, or no installed engine to union.
+- `NotImplementedError` — `model is not None` (use
+  `ArbezEngine(model_path=...)` directly).
+- `ValueError` — `consensus` greater than the number of participating
+  engines, `consensus` combined with `engine=`, `engine=` combined
+  with `engines=`, `iou_threshold` outside `[0, 1]`, or empty
+  `engines` sequence.
 - `TypeError` — `engine` is neither a string nor an `Engine` Protocol
   instance.
 - `InvalidInputError` — `scan(image)` couldn't coerce `image` into a
@@ -185,7 +188,7 @@ schedule + macOS's malloc-reclamation timing.
 from arbez import Scanner
 
 # String-name form (most common):
-scanner = Scanner()                           # S-075 default: consensus(arbez + zxing)
+scanner = Scanner()                           # default: union over every installed engine
 scanner.warmup()                              # optional, for low first-call latency
 result = scanner.scan("photo.jpg")
 print(f"{len(result)} codes in {scanner.engine_name}")
@@ -252,6 +255,7 @@ class Result:
     detections: tuple[Detection, ...]
     image_size: tuple[int, int]
     timings_ms: dict[str, float] = field(default_factory=dict)
+    per_engine: Mapping[str, tuple[Detection, ...]] = field(default_factory=dict)
 
     def __len__(self) -> int: ...
 ```
@@ -262,9 +266,10 @@ The full output of one `Scanner.scan()` call. Immutable.
 
 | Field | Type | Description |
 |---|---|---|
-| `detections` | `tuple[Detection, ...]` | All accepted detections, descending by score. |
+| `detections` | `tuple[Detection, ...]` | The merged, **per-code** result, descending by score. On the multi-engine path each `Detection` carries `extras["voted_by"]` (the engines that agreed on that code); for bare `Scanner()` (threshold `1`) this is the full union. On the single-engine path it's that engine's detections verbatim. |
 | `image_size` | `(width, height)` int | Input image dimensions in pixels. |
-| `timings_ms` | `dict[str, float]` | Per-stage wall-clock. Keys: `"engine"` (single-engine mode), `"consensus"` (vote mode), `"preprocess"` (when `preprocess="auto"` triggers). Read-only `MappingProxyType` view. |
+| `timings_ms` | `dict[str, float]` | Per-stage wall-clock. Keys: `"engine"` (the single-engine path), `"consensus"` (the multi-engine path — bare `Scanner()` or `consensus=N`), `"preprocess"` (when `preprocess="auto"` triggers). Read-only `MappingProxyType` view. |
+| `per_engine` | `Mapping[str, tuple[Detection, ...]]` | Each engine's **own raw detections** — what it independently saw, before the merge — keyed by engine name. Always populated for every engine that ran (on the single-engine path, the one engine's key). Use it to see which engine contributed what, independent of the consensus merge. Read-only `MappingProxyType` view. |
 
 `len(result)` returns `len(result.detections)`.
 
@@ -272,10 +277,14 @@ The full output of one `Scanner.scan()` call. Immutable.
 
 ```python
 result = Scanner().scan("photo.jpg")
-# Bare Scanner() runs the S-075 default consensus, so the timing
-# key is "consensus"; single-engine Scanners record "engine".
+# Bare Scanner() unions every installed engine, so the timing key is
+# "consensus"; single-engine Scanners record "engine".
 print(f"{len(result)} codes in a {result.image_size[0]}x{result.image_size[1]} image "
       f"({result.timings_ms['consensus']:.1f} ms)")
+
+# What each engine saw on its own, before the merge:
+for name, dets in result.per_engine.items():
+    print(f"  {name}: {len(dets)} raw detections")
 ```
 
 ---
@@ -476,9 +485,9 @@ weights ship in the wheel (YOLOX-s, 14-class, mAP@50 = 0.833 on QR,
 supports **user-supplied YOLOX-s, RT-DETR-v2, and YOLO11-s** ONNXes
 via the `model_path=` + `arch=` parameters; full contract in
 [`bring-your-own-weights.md`](bring-your-own-weights.md). Use the
-`name=` constructor arg when running two same-arch instances (e.g.
-bundled YOLOX-s + a user-trained YOLOX-s fine-tune) in one
-`Scanner(consensus="vote")`.
+`name=` constructor arg when voting two same-arch instances (e.g.
+bundled YOLOX-s + a user-trained YOLOX-s fine-tune) through one
+`run_consensus` call.
 
 **Constructor parameters:**
 
@@ -490,15 +499,15 @@ bundled YOLOX-s + a user-trained YOLOX-s fine-tune) in one
 | `decode` | `True` | Run zxing-cpp on each detected crop. False → detect-only (`payload=None`). Keyword-only. |
 | `providers` | `None` (auto) | ORT execution-provider preference (`["CPUExecutionProvider"]`, `["CoreMLExecutionProvider"]`, etc.). `None` = auto-pick (CoreML+CPU on Mac, CUDA+CPU on Linux w/ [cuda], CPU otherwise). Keyword-only. |
 | `arch` | `None` (auto) | Architecture identifier — `"yolox_s"`, `"rtdetr_v2_r18vd"`, `"yolo11s"`, or any fuzzy-prefix-matched variant. `None` = auto-detect from the ONNX's `arbez_arch` metadata, falling back to `"yolox_s"`. Explicit value always wins. Keyword-only. |
-| `name` | `None` | Explicit instance name override. `None` = derive from arch (the back-compat default — `"arbez"` for yolox_s, etc.). Set explicitly when you need two same-architecture ArbezEngine instances to coexist in a single `Scanner(consensus="vote")` — e.g. bundled YOLOX-s + a user-trained YOLOX-s fine-tune. Keyword-only. |
+| `name` | `None` | Explicit instance name override. `None` = derive from arch (the back-compat default — `"arbez"` for yolox_s, etc.). Set explicitly when you need two same-architecture ArbezEngine instances to coexist in a single `run_consensus` call — e.g. bundled YOLOX-s + a user-trained YOLOX-s fine-tune. Keyword-only. |
 
 **Properties:**
 
 - **`name: str`** — instance-level engine name, derived from arch
   by default. `"arbez"` for yolox_s (back-compat), `"arbez-rtdetr"`
   for RT-DETR, `"arbez-yolo11"` for YOLO11, `"arbez-<arch>"`
-  otherwise. Used as the per-engine key in `Scanner(consensus="vote")`
-  so multiple ArbezEngine instances coexist without collisions. Pass
+  otherwise. Used as the per-engine key in a multi-engine `run_consensus`
+  call so multiple ArbezEngine instances coexist without collisions. Pass
   the `name=` constructor arg to override.
 - **`model_path: Path`** — resolved .onnx path.
 - **`is_bundled: bool`** — `True` iff loaded the SDK-shipped weights.
@@ -550,11 +559,12 @@ def run_consensus(
 ) -> tuple[Detection, ...]: ...
 ```
 
-Vote across multiple engines on one image. Used internally by
-`Scanner(consensus="vote")` AND by the S-075 bare-`Scanner()`
-default consensus path; also exposed publicly so callers can run
-ad-hoc votes against any `dict[str, Engine]` (e.g., mixing
-SDK-builtins with a custom engine).
+Vote across multiple engines on one image. The low-level routine the
+`Scanner` multi-engine path is built on (bare `Scanner()` and any
+`consensus=N`); also exposed publicly so callers can run ad-hoc votes
+against any `dict[str, Engine]` (e.g., mixing SDK-builtins with a
+custom engine). `Scanner`'s integer `consensus=` threshold maps onto
+this function's `min_votes`.
 
 Full deterministic field-by-field spec: see
 [`docs/consensus-rules.md`](consensus-rules.md). Summary pipeline:
@@ -642,7 +652,7 @@ for the named engine. Always `>= 1`. Never raises.
 
 | `engine` | Heuristic |
 |---|---|
-| `"auto"` (default) | Resolves the engine `Scanner(engine="auto")` would pick, then dispatches |
+| `"auto"` (default) | Resolves the engine a stock install would pick first (`arbez`), then dispatches |
 | `"arbez"` | `min(8, max(2, cpu_count // 2))` — ONNX Runtime already parallelizes within a session, so extra Python-side workers see diminishing returns |
 | `"zxing"` | `os.cpu_count()` — stateless C++ call, releases the GIL, full parallelism |
 | `"wechat"` | `min(8, max(2, physical_cores * 3 // 4))` — heavy detector (~80 MB/instance), memory-bandwidth-bound. Empirical M1 sweet spot: 6 workers. |
@@ -966,7 +976,7 @@ busy-scene recall.
 | `Scanner(engine=Engine_instance)` | `0.1.0` | Pre-constructed Engine instances accepted |
 | `Symbology` member order | `0.1.0` | LOCKED — order is the model class_id mapping |
 | `Detection.extras` keys | not stable | Free-form per engine; never key off in production logic |
-| `consensus="vote"` + `min_votes` + `iou_threshold` | `0.1.0` | Multi-engine voting locked from v0.0.18; any other `consensus` value still raises `NotImplementedError` |
+| `consensus` (int threshold) + `engines` + `iou_threshold` | `0.2.0` | Multi-engine union/merge surface. Replaces the 0.1.x `consensus="off"`/`"vote"` string modes + `min_votes` + `engine="auto"`, removed in 0.2.0. |
 | Anything under `arbez._*` / not re-exported | not stable | Internal — fair game for refactoring |
 
 Full versioning convention in [`CHANGELOG.md`](../CHANGELOG.md). The

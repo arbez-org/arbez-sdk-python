@@ -11,6 +11,69 @@ ID prefix is `S-` (for SDK).
 
 ---
 
+## S-093 — Scanner consensus redesign: max-yield default + numeric `consensus` + per-engine results (2026-06-16)
+
+**Context.** The pre-0.2.0 `Scanner` model accreted three overlapping
+concepts: `engine="auto"` (S-008, single-engine auto-pick), `consensus="vote"`
++ `min_votes` (S-032, multi-engine voting), and the S-075 curated 2-engine
+(`arbez`+`zxing`) default. S-075 deliberately excluded `apple_vision`/`wechat`
+from the default for cross-platform predictability — but S-084 then made
+`apple_vision` a core dep on macOS, so "always installed" now differs by
+platform anyway. The maintainer's goal for the public API is simpler and
+higher-yield: **bare `Scanner()` should return whatever any installed engine
+can detect**, and consensus should be an explicit, numeric opt-in.
+
+**Decision.** Reshape the `Scanner` contract (breaking; 0.2.0):
+
+* **`Scanner()` = union of ALL installed engines.** Maximum yield. The default
+  engine set IS `installed_consensus_engines()`; the curated
+  `default_consensus_engine_names()` helper is removed. `Scanner().engines`
+  exposes the resolved all-installed set.
+* **`consensus: int = 1`** is the per-code agreement threshold. `1` = union
+  (keep a code if ANY engine saw it); `N >= 2` = keep only codes **≥ N
+  engines agree on**. The `"off"`/`"vote"` strings and `min_votes` are gone.
+* **Consensus stays per detected code**, not per image: agreement is applied
+  to each IoU cluster independently (unchanged `run_consensus` logic), so an
+  image with several codes votes each one separately.
+* **`Result.per_engine`** (new) exposes `{engine: that engine's own raw
+  detections}` alongside the merged, per-code `detections` (which keep
+  `extras["voted_by"]`). Backed by the new
+  `consensus.run_consensus_detailed() -> ConsensusResult`; `run_consensus()`
+  still returns just the merged tuple.
+* **`engine=` (single) and `engines=`/`consensus>1` are mutually exclusive.**
+  Single-engine `Scanner(engine="zxing")` is unchanged. Naming an uninstalled
+  engine → `EngineUnavailable`; `consensus` > engine count → `ValueError`.
+* **`engine="auto"` is removed.** Bare `Scanner()` replaces its purpose. (The
+  internal `resolve_auto_engine()` stays only for
+  `parallelism.recommended_workers("auto")`, a separate worker heuristic.)
+
+| Constructor | Behaviour |
+|---|---|
+| `Scanner()` | union of all installed engines (max yield) |
+| `Scanner(engine="zxing")` | single engine, no consensus |
+| `Scanner(engines=[...])` | union over that subset |
+| `Scanner(consensus=N)` | ≥N of all installed must agree (per code) |
+| `Scanner(consensus=N, engines=[...])` | ≥N of that subset must agree |
+
+**Why this reverses S-075's anti-divergence stance.** S-075 avoided
+platform-divergent defaults because the extra engines were *optional*. Post
+S-084 they're *always installed per platform*, so the default now tracks
+"every engine present on this install" — a precise, non-arbitrary rule.
+Max-yield is the explicit goal; divergence by what's installed is intended.
+
+**Consequences.**
+
+* **Breaking** (documented in CHANGELOG 0.2.0): `Scanner()` default set,
+  `consensus` semantics/type, removal of `engine="auto"` / `min_votes` /
+  `"off"`/`"vote"`. Adoption is ~zero (0.1.0 just shipped), so no deprecation
+  cycle — the breaks are loud (type/keyword changes fail fast).
+* Single-engine, IoU clustering, voting policy, and `Detection`/`Result` core
+  fields are unchanged. `run_consensus()` keeps its signature.
+* Supersedes the Scanner-facing parts of S-008 (`auto`), S-032 (`vote`/
+  `min_votes` spelling), and S-075 (curated default).
+
+---
+
 ## S-089 — bench3 polish: 1-12 engines, practical-correctness metric, Scanner() option, pedantic parameterisation (2026-05-19)
 
 **Context.** S-088 landed the professional PDF report layout but a
