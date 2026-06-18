@@ -32,13 +32,17 @@ def _img() -> Image.Image:
     return Image.new("RGB", (120, 120), "white")
 
 
+def _dmtx_unavailable() -> None:
+    return None
+
+
 def test_zxing_format_overrides_detector_class(monkeypatch: pytest.MonkeyPatch) -> None:
     """Detector says QR, zxing decodes a Data Matrix -> symbology is DATA_MATRIX,
     and the detector's QR guess is recorded in extras."""
     eng = ArbezEngine()
     rd = RawDetection(x1=10, y1=10, x2=70, y2=70, score=0.9, class_id=_qr_class_id(eng))
-    monkeypatch.setattr(eng, "_get_zxing", lambda: object())   # decoder_active=True
-    monkeypatch.setattr(eng, "_get_dmtx", lambda: None)
+    monkeypatch.setattr(eng, "_get_zxing", object)   # decoder_active=True
+    monkeypatch.setattr(eng, "_get_dmtx", _dmtx_unavailable)
     monkeypatch.setattr(
         eng, "_decode_one",
         lambda zxing, pil, np_img, d: ("PAYLOAD", "tight", Symbology.DATA_MATRIX),
@@ -58,8 +62,8 @@ def test_libdmtx_decode_forces_data_matrix(monkeypatch: pytest.MonkeyPatch) -> N
     DATA_MATRIX, so no override is recorded."""
     eng = ArbezEngine()
     rd = RawDetection(x1=10, y1=10, x2=70, y2=70, score=0.8, class_id=_dm_class_id(eng))
-    monkeypatch.setattr(eng, "_get_zxing", lambda: object())
-    monkeypatch.setattr(eng, "_get_dmtx", lambda: object())    # dmtx available
+    monkeypatch.setattr(eng, "_get_zxing", object)
+    monkeypatch.setattr(eng, "_get_dmtx", object)    # dmtx available
     monkeypatch.setattr(eng, "_decode_one", lambda zxing, pil, np_img, d: (None, None, None))
     monkeypatch.setattr(
         ArbezEngine, "_dmtx_decode_one",
@@ -78,8 +82,8 @@ def test_no_decode_keeps_detector_symbology(monkeypatch: pytest.MonkeyPatch) -> 
     """Nothing decodes -> detector's class stands; no override recorded."""
     eng = ArbezEngine()
     rd = RawDetection(x1=10, y1=10, x2=70, y2=70, score=0.7, class_id=_qr_class_id(eng))
-    monkeypatch.setattr(eng, "_get_zxing", lambda: object())
-    monkeypatch.setattr(eng, "_get_dmtx", lambda: None)
+    monkeypatch.setattr(eng, "_get_zxing", object)
+    monkeypatch.setattr(eng, "_get_dmtx", _dmtx_unavailable)
     monkeypatch.setattr(eng, "_decode_one", lambda zxing, pil, np_img, d: (None, None, None))
     dets = eng._decode_detections([rd], _img())
     d = dets[0]
@@ -94,8 +98,8 @@ def test_unmodeled_format_keeps_detector_symbology(monkeypatch: pytest.MonkeyPat
     (decoded_sym is None), keep the detector's class as the label."""
     eng = ArbezEngine()
     rd = RawDetection(x1=10, y1=10, x2=70, y2=70, score=0.9, class_id=_qr_class_id(eng))
-    monkeypatch.setattr(eng, "_get_zxing", lambda: object())
-    monkeypatch.setattr(eng, "_get_dmtx", lambda: None)
+    monkeypatch.setattr(eng, "_get_zxing", object)
+    monkeypatch.setattr(eng, "_get_dmtx", _dmtx_unavailable)
     monkeypatch.setattr(
         eng, "_decode_one",
         lambda zxing, pil, np_img, d: ("PAY", "fallback", None),  # unmapped format
