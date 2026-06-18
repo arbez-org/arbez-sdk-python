@@ -67,7 +67,7 @@ from arbez.engines._yolox import (
 from arbez.engines.base import ThreadSafety
 from arbez.engines.helpers import coerce_to_pil
 from arbez.exceptions import EngineUnavailable
-from arbez.types import Detection
+from arbez.types import Detection, Symbology
 
 # S-066: architecture dispatch — values come from the bundled (or
 # user-supplied) ONNX's ``arbez_arch`` metadata key. Unknown values
@@ -112,6 +112,24 @@ def _name_for_arch(arch: str) -> str:
     if arch == _ARCH_YOLOX or arch.startswith("yolox"):
         return "arbez"
     return f"arbez-{arch}"
+
+
+# Square 2D symbologies where the YOLOX detector mislabels Data Matrix as
+# QR (or Aztec / Micro QR). When zxing-cpp fails on such a crop, libdmtx
+# may still recover the payload — libdmtx decodes Data Matrix only, so
+# there is no risk of mis-decoding a genuine QR as something else.
+_LIBDMTX_FALLBACK_SYMBOLOGIES: frozenset[Symbology] = frozenset({
+    Symbology.DATA_MATRIX,
+    Symbology.QR,
+    Symbology.MICRO_QR,
+    Symbology.AZTEC,
+})
+
+
+def _should_try_libdmtx_fallback(symbology: Symbology) -> bool:
+    """Whether to offer a failed zxing crop to the libdmtx decoder (S-092+)."""
+    return symbology in _LIBDMTX_FALLBACK_SYMBOLOGIES
+
 
 if TYPE_CHECKING:
     import numpy.typing as npt
@@ -1100,17 +1118,17 @@ class ArbezEngine:
             # user-supplied custom). ``_class_id_to_symbology`` is
             # set in ``__init__`` from metadata and reconfirmed
             # against the actual output shape in ``_get_session``.
-            from arbez.types import Symbology
             if 0 <= d.class_id < len(self._class_id_to_symbology):
                 symbology = self._class_id_to_symbology[d.class_id]
             else:
                 symbology = Symbology.OTHER_1D
-            # S-092: when zxing-cpp failed on a Data Matrix detection, try the
-            # stronger libdmtx decoder on the same crop. Data-Matrix-only by
-            # design (libdmtx decodes nothing else); skipped entirely when the
+            # S-092: when zxing-cpp failed, try the stronger libdmtx decoder on
+            # the same crop for square-2D detector classes (DATA_MATRIX and
+            # the symbologies DM is commonly misfiled as — QR / Micro QR /
+            # Aztec). libdmtx decodes Data Matrix only; skipped when the
             # arbez-dmtx companion isn't installed (dmtx_decode is None).
             if (payload is None and dmtx_decode is not None
-                    and symbology == Symbology.DATA_MATRIX):
+                    and _should_try_libdmtx_fallback(symbology)):
                 dmtx_payload = self._dmtx_decode_one(dmtx_decode, pil_image, d)
                 if dmtx_payload is not None:
                     payload = dmtx_payload
