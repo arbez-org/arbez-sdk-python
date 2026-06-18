@@ -1,0 +1,88 @@
+name: WeChat SIGABRT hunt (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      attempts:
+        description: "Number of hunt iterations per mode"
+        required: false
+        default: "50"
+        type: string
+      mode:
+        description: "Hunt mode: raw (CI-exact pytest), gdb, or both"
+        required: false
+        default: "both"
+        type: choice
+        options:
+          - both
+          - raw
+          - gdb
+      python_version:
+        description: "Python version (CI failure was 3.10)"
+        required: false
+        default: "3.10"
+        type: choice
+        options:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  hunt:
+    name: wechat sigabrt hunt (py${{ inputs.python_version }} on ubuntu-24.04-arm)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install system tools (gdb for backtraces)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gdb
+
+      - name: Install Python deps (CI-identical editable dev install)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -c "import cv2; print('opencv', cv2.__version__, cv2.__file__)"
+
+      - name: Run SIGABRT hunt
+        run: |
+          chmod +x tools/ci/wechat_sigabrt_hunt_gha.sh
+          bash tools/ci/wechat_sigabrt_hunt_gha.sh "${{ inputs.attempts }}" "${{ inputs.mode }}"
+        # Exit 134 = SIGABRT reproduced (success for this workflow's purpose).
+        continue-on-error: true
+        id: hunt
+
+      - name: Summarize hunt result
+        if: always()
+        run: |
+          if [[ "${{ steps.hunt.outcome }}" == "success" ]]; then
+            echo "## Hunt result: no SIGABRT in ${{ inputs.attempts }} attempts" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Hunt result: SIGABRT reproduced — see artifacts for gdb/core logs" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "mode=${{ inputs.mode }} python=${{ inputs.python_version }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload hunt logs + core dumps
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: wechat-sigabrt-hunt-py${{ inputs.python_version }}-${{ github.run_id }}
+          path: |
+            wechat-sigabrt-hunt-logs/
+            wechat-sigabrt-cores/
+          retention-days: 14
+          if-no-files-found: warn

@@ -29,6 +29,9 @@ from tests._engine_availability import WECHAT_AVAILABLE
 # missing contrib build SKIPS these tests instead of failing them
 # (module-level analogue of the ``importorskip`` gate in
 # test_apple_vision.py).
+#
+# CI runs this file via ``tools/pytest_wechat_isolated.py`` (subprocess)
+# so a native SIGABRT on linux/arm64 cannot take down the full suite.
 pytestmark = pytest.mark.skipif(
     not WECHAT_AVAILABLE,
     reason="WeChatEngine requires opencv-contrib (cv2.wechat_qrcode)",

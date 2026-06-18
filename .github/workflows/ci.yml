@@ -51,7 +51,10 @@ jobs:
       # makes the directory a proper package and the corpus + parametrize
       # blocks were written with explicit ``set[str]`` annotations etc.
       - run: mypy src/arbez/ tools/ tests/
-      - run: pytest -q tests/
+      # WeChat e2e (tests/test_wechat.py) runs in a child process so an
+      # OpenCV SIGABRT on linux/arm64 cannot abort the whole matrix cell.
+      - run: pytest -q tests/ --ignore=tests/test_wechat.py
+      - run: python tools/pytest_wechat_isolated.py
 
   # ── Job 2 — wheel-matrix audit (the S-006 contract) ────────────────────
   # Doesn't actually install on every platform — it asks pip "would you
