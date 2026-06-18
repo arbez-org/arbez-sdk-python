@@ -231,16 +231,20 @@ def test_routing_square_2d_when_zxing_fails(
                            score=0.9, class_id=1)
     dets = engine._decode_detections([dm, qr, code128], img)
 
-    by_sym = {d.symbology: d for d in dets}
-    dm_out = by_sym[Symbology.DATA_MATRIX]
-    qr_out = by_sym[Symbology.QR]
-    c128_out = by_sym[Symbology.CODE_128]
+    by_class = {d.extras["model_class_id"]: d for d in dets}
+    dm_out = by_class[_CLASS_DATAMATRIX]
+    qr_out = by_class[_CLASS_QR]
+    c128_out = by_class[1]
 
-    # DATA_MATRIX and QR (potential mislabeled DM) recovered via libdmtx.
+    # DATA_MATRIX and QR-labeled (mislabeled DM) recovered via libdmtx.
     assert dm_out.payload == "DM-FROM-LIBDMTX"
     assert dm_out.extras["decoder"] == "libdmtx"
+    assert dm_out.symbology == Symbology.DATA_MATRIX
     assert qr_out.payload == "DM-FROM-LIBDMTX"
     assert qr_out.extras["decoder"] == "libdmtx"
+    # S-094: libdmtx rescue reports DATA_MATRIX; detector's QR guess preserved.
+    assert qr_out.symbology == Symbology.DATA_MATRIX
+    assert qr_out.extras["detector_symbology"] == "QR"
     # Linear 1D: libdmtx not invoked; stays undecoded.
     assert c128_out.payload is None
     assert c128_out.extras["decoder"] == "none"
