@@ -653,14 +653,14 @@ relevant to users:
 | ADR | Subject |
 |---|---|
 | S-007 | Public `Engine` Protocol + `coerce_to_pil` — the "write your own engine" contract |
-| S-008 | `Scanner(engine="auto")` — smart per-platform selection |
+| S-008 | Per-platform engine probing (superseded by S-093 union default in 0.2.0) |
 | S-011 | `ArbezEngine` two-stage decoding (our detector + classical decoder) |
 | S-018 | `installed_consensus_engines()` + consensus parallelism heuristic |
 | S-019 | Input-type expansion (bytes / file-like / HEIC / AVIF) |
 | S-027 | `Scanner(engines=...)` consensus subset selection |
 | S-029 | `ArbezEngine` YOLOX-s + full classical decoder pipeline |
 | S-031 | Embed `arbez_*` metadata in the bundled ONNX (`model_version`, mAP numbers, etc.) |
-| S-032 | Multi-engine consensus voting (`Scanner(consensus="vote")`) |
+| S-032 | Multi-engine consensus voting (`run_consensus`, IoU clustering) |
 | S-036 | `Symbology` enum expanded to 14 members + forward-compat dispatch |
 | S-053 | `preprocess="off"` is the recommended default — empirical evidence from v0.0.33 full-corpus benchmark across all 4 engines |
 | S-063 | Split publish targets: TestPyPI continuous deploy + production PyPI tagged (`v0.1.0+` only) |
@@ -676,7 +676,7 @@ relevant to users:
 | S-073 | Bench consolidation: bench3 absorbs bench2 + matplotlib charts |
 | S-074 | Lift v0.1.0+ gate on production PyPI publish |
 | S-075 | Bare `Scanner()` defaults to `arbez`+`zxing` 2-engine consensus (superseded by S-093) |
-| S-093 | `Scanner()` runs ALL installed engines (union); `consensus=<int>` threshold; `Result.per_engine`; `engine="auto"` removed (0.2.0) |
+| S-093 | `Scanner()` runs ALL installed engines (union); `consensus=<int>` threshold; `Result.per_engine`; `engine="auto"` removed in 0.2.0 |
 
 When something in the SDK surprises you, the ADR is usually a
 2-minute read that explains why it's that way.

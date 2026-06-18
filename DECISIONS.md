@@ -33,8 +33,9 @@ Meanwhile the decoder, when it succeeds, has ECC-validated a code of one **exact
 
 When the decoder overrides the detector, the detector's original guess is recorded in
 `extras["detector_symbology"]` for transparency / telemetry. The detector's class still
-gates the libdmtx fallback (Data-Matrix-only) and still drives `model_class_id` /
-`model_class_name`.
+gates the libdmtx fallback via `_should_try_libdmtx_fallback()` (square-2D detector
+classes — DATA_MATRIX, QR, Micro QR, Aztec; see PR #7 / S-092+) and still drives
+`model_class_id` / `model_class_name`.
 
 **Implementation.** The two zxing read helpers now return `(payload, symbology)` and
 `_decode_one` returns `(payload, stage, symbology)`; `_decode_detections` applies the

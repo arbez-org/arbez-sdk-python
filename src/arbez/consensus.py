@@ -1,18 +1,21 @@
-"""Multi-engine consensus voting (S-032, locked from v0.0.18).
+"""Multi-engine consensus voting (S-032, locked from v0.0.18; S-093, 0.2.0).
 
-Public function: :func:`run_consensus`. Used by ``Scanner(consensus="vote")``
-to vote across multiple engines on the same image. Engines run in parallel
-(one thread per engine per S-018); their detections are grouped by IoU
-and merged into a single :class:`Detection` per physical barcode.
+Public function: :func:`run_consensus`. Used by multi-engine
+:class:`~arbez.scanner.Scanner` paths — bare ``Scanner()`` (union,
+``consensus=1``) and ``Scanner(consensus=N)`` (require >= N engines per
+code). Engines run in parallel (one thread per engine per S-018); their
+detections are grouped by IoU and merged into a single
+:class:`Detection` per physical barcode.
 
 Voting policy (S-032)
 ---------------------
 For each detection group (overlapping bboxes from different engines):
 
 * **min_votes** — keep the group iff at least N unique engines
-  contributed. Default 2; configurable via ``Scanner(consensus="vote",
-  min_votes=N)``. Set to 1 for "union" mode (any engine's detection
-  passes); set to ``len(engines)`` for "all-agree" mode.
+  contributed. ``Scanner`` maps its integer ``consensus`` threshold onto
+  this parameter (default bare ``Scanner()`` → ``min_votes=1`` union;
+  ``Scanner(consensus=2)`` → ``min_votes=2``). Set to ``len(engines)``
+  for "all-agree" mode.
 * **bbox** — per-coord median across group members. Robust against
   one engine reporting a slightly off bbox.
 * **symbology** — most common Symbology in the group; ties go to the
@@ -149,8 +152,9 @@ def run_consensus_detailed(
     # Stage 1: per-engine scan.
     #
     # Code-review fix (2026-05-17): a 1-engine consensus is a legal
-    # call shape (``Scanner(consensus="vote", engines=("arbez",))``)
-    # plus the S-075 fallback path when ``zxing`` is somehow absent.
+    # call shape (``Scanner(consensus=2, engines=("arbez",))`` with a
+    # single installed engine still runs through the merge path)
+    # plus edge cases where only one engine is available.
     # Pre-fix, we always spun up a ``ThreadPoolExecutor`` even for
     # one engine, paying the pool-creation + thread-spawn + executor-
     # shutdown cost on every scan. Short-circuit synchronously when

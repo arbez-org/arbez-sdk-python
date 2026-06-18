@@ -38,8 +38,8 @@ Other constructor shapes
 * ``Scanner(engine=<Engine instance>)`` — a pre-configured engine (S-015),
   e.g. ``ZXingEngine(formats={Symbology.QR})``.
 
-``engine="auto"`` and the ``consensus="off"/"vote"`` + ``min_votes`` API
-were removed in 0.2.0 (S-093).
+The 0.1.x ``engine="auto"`` and ``consensus="off"/"vote"`` + ``min_votes``
+API were removed in 0.2.0 (S-093).
 """
 
 from __future__ import annotations
@@ -782,7 +782,7 @@ class Scanner:
         Together these move the warmup cost off the user's hot path.
         Single-engine wall-clock: ~500 ms on Apple Silicon for
         Apple Vision's first-inference initialization, ~50-200 ms for
-        ArbezEngine's ORT session-load. In ``consensus="vote"`` mode
+        ArbezEngine's ORT session-load. In multi-engine consensus mode
         warmup loops over every voting engine, so total wall-clock is
         the sum (0.5-1.5 s depending on installed extras). Idempotent.
         """
@@ -837,7 +837,7 @@ class Scanner:
         defined) and drops the cached engine reference, so the
         underlying ORT session / cv2 detector / pyobjc Vision module
         can be released by their destructors. The cached consensus
-        engines (S-032 ``consensus="vote"`` mode) are also closed.
+        engines (S-032 multi-engine consensus mode) are also closed.
 
         Idempotent: safe to call multiple times. After ``close()``,
         ``scan()`` will lazy-reinit the engine on next call (same
