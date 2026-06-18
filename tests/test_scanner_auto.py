@@ -161,7 +161,7 @@ def _with_probed(
     The autouse ``_clear_engine_discovery_cache`` fixture clears the caches on
     exit too, so no cross-test leakage.
     """
-    import arbez._engine_discovery as ed
+    from arbez import _engine_discovery as ed
 
     with patch.object(
         ed, "_probe_engines",
