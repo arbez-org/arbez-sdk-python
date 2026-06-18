@@ -114,6 +114,24 @@ def _name_for_arch(arch: str) -> str:
         return "arbez"
     return f"arbez-{arch}"
 
+
+# Square 2D symbologies where the YOLOX detector mislabels Data Matrix as
+# QR (or Aztec / Micro QR). When zxing-cpp fails on such a crop, libdmtx
+# may still recover the payload — libdmtx decodes Data Matrix only, so
+# there is no risk of mis-decoding a genuine QR as something else.
+_LIBDMTX_FALLBACK_SYMBOLOGIES: frozenset[Symbology] = frozenset({
+    Symbology.DATA_MATRIX,
+    Symbology.QR,
+    Symbology.MICRO_QR,
+    Symbology.AZTEC,
+})
+
+
+def _should_try_libdmtx_fallback(symbology: Symbology) -> bool:
+    """Whether to offer a failed zxing crop to the libdmtx decoder (S-092+)."""
+    return symbology in _LIBDMTX_FALLBACK_SYMBOLOGIES
+
+
 if TYPE_CHECKING:
     import numpy.typing as npt
     from PIL.Image import Image as PILImage
@@ -1109,12 +1127,14 @@ class ArbezEngine:
                 detector_symbology = self._class_id_to_symbology[d.class_id]
             else:
                 detector_symbology = Symbology.OTHER_1D
-            # S-092: when zxing-cpp failed on a Data Matrix detection, try the
-            # stronger libdmtx decoder on the same crop. Gated on the DETECTOR's
-            # class (libdmtx decodes Data Matrix only); skipped when the
-            # arbez-dmtx companion isn't installed (dmtx_decode is None).
+            # S-092: when zxing-cpp failed, try the stronger libdmtx decoder on
+            # the same crop for square-2D detector classes (DATA_MATRIX and
+            # the symbologies DM is commonly misfiled as — QR / Micro QR /
+            # Aztec). Gated on the detector's class; libdmtx decodes Data
+            # Matrix only; skipped when the arbez-dmtx companion isn't
+            # installed (dmtx_decode is None).
             if (payload is None and dmtx_decode is not None
-                    and detector_symbology == Symbology.DATA_MATRIX):
+                    and _should_try_libdmtx_fallback(detector_symbology)):
                 dmtx_payload = self._dmtx_decode_one(dmtx_decode, pil_image, d)
                 if dmtx_payload is not None:
                     payload = dmtx_payload

@@ -14,8 +14,9 @@ What's locked here:
 2. **Crop decode helper.** ``_dmtx_decode_one`` returns the UTF-8 payload from
    an injected libdmtx ``decode`` callable, and returns ``None`` on an empty
    result, a raised exception, or a degenerate bbox — never propagates.
-3. **DATA_MATRIX-only routing.** The fallback fires ONLY for DATA_MATRIX
-   detections that zxing-cpp failed on; QR (or any other symbology) is never
+3. **Square-2D routing.** The fallback fires for square-2D detector classes
+   (DATA_MATRIX, QR, Micro QR, Aztec) when zxing-cpp failed — covering Data
+   Matrix crops the detector mislabeled as QR. Linear 1D symbologies are not
    routed to libdmtx.
 4. **No redundant work.** When zxing-cpp already decoded the crop, libdmtx is
    not invoked at all (``decoder="zxing"``).
@@ -212,11 +213,11 @@ def _engine_with_failing_zxing_and_fake_dmtx(
     return engine
 
 
-def test_routing_datamatrix_only_when_zxing_fails(
+def test_routing_square_2d_when_zxing_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The libdmtx fallback fires for the DATA_MATRIX detection (zxing failed)
-    and is never offered the QR detection."""
+    """The libdmtx fallback fires for DATA_MATRIX and QR (mislabeled DM) when
+    zxing failed; linear 1D detections are not routed to libdmtx."""
     dmtx_calls: list[RawDetection] = []
     engine = _engine_with_failing_zxing_and_fake_dmtx(monkeypatch, dmtx_calls)
 
@@ -225,21 +226,27 @@ def test_routing_datamatrix_only_when_zxing_fails(
                       score=0.9, class_id=_CLASS_DATAMATRIX)
     qr = RawDetection(x1=160.0, y1=160.0, x2=280.0, y2=280.0,
                       score=0.9, class_id=_CLASS_QR)
-    dets = engine._decode_detections([dm, qr], img)
+    # Legacy 9-class: 1 -> CODE_128 (linear 1D — not square-2D routed).
+    code128 = RawDetection(x1=10.0, y1=200.0, x2=290.0, y2=240.0,
+                           score=0.9, class_id=1)
+    dets = engine._decode_detections([dm, qr, code128], img)
 
     by_sym = {d.symbology: d for d in dets}
     dm_out = by_sym[Symbology.DATA_MATRIX]
     qr_out = by_sym[Symbology.QR]
+    c128_out = by_sym[Symbology.CODE_128]
 
-    # DATA_MATRIX recovered via libdmtx.
+    # DATA_MATRIX and QR (potential mislabeled DM) recovered via libdmtx.
     assert dm_out.payload == "DM-FROM-LIBDMTX"
     assert dm_out.extras["decoder"] == "libdmtx"
-    assert dm_out.extras["decode_stage"] == "libdmtx"
-    # QR was never routed to libdmtx and stays undecoded.
-    assert qr_out.payload is None
-    assert qr_out.extras["decoder"] == "none"
-    # Exactly one libdmtx call, for the DATA_MATRIX detection only.
-    assert [d.class_id for d in dmtx_calls] == [_CLASS_DATAMATRIX]
+    assert qr_out.payload == "DM-FROM-LIBDMTX"
+    assert qr_out.extras["decoder"] == "libdmtx"
+    # Linear 1D: libdmtx not invoked; stays undecoded.
+    assert c128_out.payload is None
+    assert c128_out.extras["decoder"] == "none"
+    assert sorted(d.class_id for d in dmtx_calls) == sorted(
+        [_CLASS_DATAMATRIX, _CLASS_QR],
+    )
 
 
 def test_no_libdmtx_call_when_zxing_succeeds(
