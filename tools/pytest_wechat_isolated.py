@@ -74,7 +74,7 @@ def main() -> int:
 
     if _linux_arm64():
         print(
-            "pytest_wechat_isolated: SKIP — WeChat native crash on linux/arm64 "
+            "pytest_wechat_isolated: SKIP - WeChat native crash on linux/arm64 "
             f"after {_MAX_ATTEMPTS} attempts "
             f"(last exit {last.returncode}); treating as infra flake",
             file=sys.stderr,
