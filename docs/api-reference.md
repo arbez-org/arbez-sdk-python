@@ -522,6 +522,14 @@ bundled YOLOX-s + a user-trained YOLOX-s fine-tune) through one
   the session actually picked (empty until first `warmup()` /
   `detect_and_decode()`).
 
+**`Detection.symbology` is decoder-authoritative (S-094).** When a crop
+decodes, the symbology is the decoder's ECC-validated format (zxing-cpp's
+parsed format, or `DATA_MATRIX` for the libdmtx fallback), not the YOLOX
+detector's class — the detector both localizes and *guesses* a class, and the
+guess is unreliable on square 2D codes (e.g. a Data Matrix filed as "QR"). The
+detector's class is used only when nothing decodes (or the decoded format isn't
+one the SDK models).
+
 **Detection.extras** populated by this engine:
 
 - `decoder`: `"zxing"` (decoded by zxing-cpp), `"libdmtx"` (Data Matrix
@@ -530,6 +538,9 @@ bundled YOLOX-s + a user-trained YOLOX-s fine-tune) through one
 - `decode_stage`: present only when a payload was decoded — which strategy
   produced it: `"tight"` / `"medium"` / `"large"` / `"fallback"` (the staged
   zxing-cpp crops) or `"libdmtx"` (the S-092 Data Matrix fallback)
+- `detector_symbology`: present only when the decoder's symbology *overrode*
+  the detector's class (S-094) — the detector's original guess, a `Symbology`
+  name. Absent when detector and decoder agree (or nothing decoded).
 - `model_class_id`: int 0..(num_classes - 1)
 - `model_class_name`: native class name from the loaded model's
   vocabulary. The bundled weights yield 14-class names (qr, micro_qr,
@@ -541,7 +552,8 @@ The class-id → `Symbology` mapping is documented in
 legacy models are still loaded (with a deprecation warning) and may
 be removed in a future release.
 
-`ArbezEngine` is the auto-pick default.
+`ArbezEngine` is the bundled default detector + decoder engine, and a voter in
+the default `Scanner()` union.
 
 ---
 

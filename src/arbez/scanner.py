@@ -825,9 +825,8 @@ class Scanner:
         """Release the engine's native resources (S-042, v0.0.29).
 
         Long-running processes that create many ``Scanner`` instances
-        (web servers, batch jobs, the per-cell subprocesses used by
-        ``examples/arbez_benchmark.py``) need a way to release each
-        Scanner's native handles deterministically. Python's GC
+        (web servers, batch jobs, large benchmark runs) need a way to
+        release each Scanner's native handles deterministically. Python's GC
         eventually drops references, but the underlying C++/Objective-C
         destructors run on their own timeline, and macOS's allocator
         doesn't promptly return pages to the kernel — accumulated

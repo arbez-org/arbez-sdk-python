@@ -11,6 +11,57 @@ ID prefix is `S-` (for SDK).
 
 ---
 
+## S-094 — ArbezEngine: decoder-authoritative symbology reconciliation (2026-06-17)
+
+**Context.** ArbezEngine is the only built-in engine with a split detector→decoder
+pipeline: a YOLOX-s head both *localizes* a code and *classifies* its symbology, then a
+classical decoder (zxing-cpp, plus the S-092 libdmtx Data Matrix fallback) reads the
+payload from the crop. Until now `Detection.symbology` came from the **detector's** class.
+But that classification is a guess — square 2D codes (QR / Data Matrix / Aztec) look alike
+to a detector — and the 0.2.0 full-corpus benchmark showed it misfiles a meaningful share:
+~250 distinct Data Matrix / Aztec / ITF / EAN-13 codes were labeled "QR" or "Code 39".
+Meanwhile the decoder, when it succeeds, has ECC-validated a code of one **exact** format
+— ground truth — which the engine computed (`zxing result.format`) and then discarded.
+
+**Decision.** Reconcile before returning — a successful decode names the symbology:
+
+* zxing-cpp decoded the crop → `symbology = symbology_for_zxing_format(result.format)`
+  (the parsed format mapped to `Symbology`).
+* the libdmtx fallback decoded it → `DATA_MATRIX` (libdmtx decodes nothing else).
+* nothing decoded, or the decoded format is one the SDK doesn't model → keep the detector's
+  class (the best available label).
+
+When the decoder overrides the detector, the detector's original guess is recorded in
+`extras["detector_symbology"]` for transparency / telemetry. The detector's class still
+gates the libdmtx fallback (Data-Matrix-only) and still drives `model_class_id` /
+`model_class_name`.
+
+**Implementation.** The two zxing read helpers now return `(payload, symbology)` and
+`_decode_one` returns `(payload, stage, symbology)`; `_decode_detections` applies the
+precedence above. The zxing-format→`Symbology` map already lived in `engines/zxing.py`; it
+is exposed as a shared `symbology_for_zxing_format()` that returns `None` for unmodeled
+formats (so ArbezEngine keeps its label rather than *drop* the detection — which is what
+`ZXingEngine._translate` does). No new computation: the format was already on every zxing
+result. Negligible runtime cost.
+
+**Consequences.**
+
+* ArbezEngine's `Detection.symbology` is now decoder-accurate whenever a code decodes; the
+  detector's class is the fallback for the detect-but-not-decoded case.
+* **Consensus improves**: engines agree on symbology far more often, so IoU clusters carry
+  consistent symbology votes and the merged `Detection.symbology` (+ per-symbology
+  consensus counts) are more accurate.
+* Behaviour change (0.2.0): a caller reading `Detection.symbology` from ArbezEngine on a
+  *decoded* code may now see a different (more correct) value; the old detector label is at
+  `extras["detector_symbology"]` when it differs.
+* Validated on the full corpus: arbez's self-reported per-symbology counts converge to the
+  consensus-relabeled counts (QR 2,614 → ~2,364; Data Matrix 232 → ~320). Total decoded is
+  unchanged (3,478) — only the attribution is corrected.
+* Future: `extras["detector_symbology"]` mismatches are a free, ECC-validated training
+  signal to improve the detector's classification head (modeling-team follow-up).
+
+---
+
 ## S-093 — Scanner consensus redesign: max-yield default + numeric `consensus` + per-engine results (2026-06-16)
 
 **Context.** The pre-0.2.0 `Scanner` model accreted three overlapping

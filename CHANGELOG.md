@@ -89,6 +89,30 @@ yield (whatever any engine can detect is returned), replacing the curated
   (merged `detections` + `per_engine`). `run_consensus()` is unchanged
   (still returns the merged tuple).
 
+### Changed
+
+- **ArbezEngine symbology is now decoder-authoritative (S-094).** When the
+  classical decoder reads a crop, the decoded (ECC-validated) format names the
+  symbology, overriding the YOLOX detector's classification — so a Data Matrix
+  the detector had filed as "QR" is now correctly labeled `DATA_MATRIX`. The
+  detector's original guess is preserved in `extras["detector_symbology"]` when
+  it was overridden. When nothing decodes, the detector's class stands. This
+  also makes consensus symbology votes more accurate. A caller reading
+  `Detection.symbology` from ArbezEngine on a decoded code may now see a
+  different (more correct) value than in 0.1.x.
+
+### Removed
+
+- **Internal benchmark tooling dropped from `examples/`.** The maintainer-only
+  benchmark harnesses (`arbez_benchmark.py`, `arbez_benchmark3.py`,
+  `multi_code_benchmark.py`) and their helpers (`_bench_pdf`, `_bench_samples`,
+  `_bench_style`, `_corpus_source`, `_decode_metrics`, `_gt_scoring`) — with
+  their unit tests and the benchmark-only `[dev]` dependencies (`matplotlib`,
+  `markdown`, `fpdf2`, `pypdf`, `pyzint`) — are removed from the public repo.
+  `examples/` now contains only the four user-facing examples (`five_liner.py`,
+  `scan_image.py`, `custom_engine.py`, `five_liner_smoke.py`). No shipped SDK
+  code changed.
+
 ### Unchanged
 
 - Single-engine `Scanner(engine="zxing"|"arbez"|"wechat"|"apple_vision")`,

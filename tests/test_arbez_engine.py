@@ -1014,11 +1014,12 @@ def test_decoder_degenerate_bbox_returns_none() -> None:
     # S-035 expanded _decode_one's signature with an np_image kwarg
     # so the staged decoder can use numpy-slice crops. Passing None
     # exercises the PIL.crop fallback path.
-    # S-080: _decode_one returns (payload, stage_label). For a
-    # degenerate bbox both should be None.
-    payload, stage = ArbezEngine._decode_one(zxingcpp, pil_image, None, degen)
+    # S-080/S-094: _decode_one returns (payload, stage_label,
+    # decoded_symbology). For a degenerate bbox all three should be None.
+    payload, stage, sym = ArbezEngine._decode_one(zxingcpp, pil_image, None, degen)
     assert payload is None
     assert stage is None
+    assert sym is None
 
 
 def test_arbez_engine_loads_bundled_path_explicit() -> None:

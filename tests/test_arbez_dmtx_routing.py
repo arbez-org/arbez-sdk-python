@@ -194,7 +194,7 @@ def _engine_with_failing_zxing_and_fake_dmtx(
     engine._zxing_module = object()
     engine._zxing_probed = True
     monkeypatch.setattr(
-        engine, "_decode_one", lambda *_a, **_k: (None, None), raising=True,
+        engine, "_decode_one", lambda *_a, **_k: (None, None, None), raising=True,
     )
     # Inject a fake libdmtx decoder, pre-probed so _get_dmtx returns it.
     def fake_dmtx(crop: object, max_count: int = 0, timeout: int = 0) -> list[_FakeDmtxResult]:
@@ -231,16 +231,20 @@ def test_routing_square_2d_when_zxing_fails(
                            score=0.9, class_id=1)
     dets = engine._decode_detections([dm, qr, code128], img)
 
-    by_sym = {d.symbology: d for d in dets}
-    dm_out = by_sym[Symbology.DATA_MATRIX]
-    qr_out = by_sym[Symbology.QR]
-    c128_out = by_sym[Symbology.CODE_128]
+    by_class = {d.extras["model_class_id"]: d for d in dets}
+    dm_out = by_class[_CLASS_DATAMATRIX]
+    qr_out = by_class[_CLASS_QR]
+    c128_out = by_class[1]
 
-    # DATA_MATRIX and QR (potential mislabeled DM) recovered via libdmtx.
+    # DATA_MATRIX and QR-labeled (mislabeled DM) recovered via libdmtx.
     assert dm_out.payload == "DM-FROM-LIBDMTX"
     assert dm_out.extras["decoder"] == "libdmtx"
+    assert dm_out.symbology == Symbology.DATA_MATRIX
     assert qr_out.payload == "DM-FROM-LIBDMTX"
     assert qr_out.extras["decoder"] == "libdmtx"
+    # S-094: libdmtx rescue reports DATA_MATRIX; detector's QR guess preserved.
+    assert qr_out.symbology == Symbology.DATA_MATRIX
+    assert qr_out.extras["detector_symbology"] == "QR"
     # Linear 1D: libdmtx not invoked; stays undecoded.
     assert c128_out.payload is None
     assert c128_out.extras["decoder"] == "none"
@@ -258,10 +262,10 @@ def test_no_libdmtx_call_when_zxing_succeeds(
     engine = ArbezEngine(decode=True)
     engine._zxing_module = object()
     engine._zxing_probed = True
-    # zxing succeeds on the crop.
+    # zxing succeeds on the crop (S-094: 3-tuple — payload, stage, decoded symbology).
     monkeypatch.setattr(
         engine, "_decode_one",
-        lambda *_a, **_k: ("ZXING-DECODED", "tight"), raising=True,
+        lambda *_a, **_k: ("ZXING-DECODED", "tight", Symbology.DATA_MATRIX), raising=True,
     )
 
     def fake_dmtx(*_a: object, **_k: object) -> list[_FakeDmtxResult]:

@@ -67,10 +67,9 @@ if TYPE_CHECKING:
 #:   per-thread engine. WeChat is currently the only built-in in this
 #:   category (S-018 / S-020).
 #:
-#: Used by ``examples/arbez_benchmark.py`` to pick the right
-#: parallelization strategy per engine, and by the docs to document
-#: each engine's threading contract. Future external engines should
-#: set this attribute too.
+#: Used to pick the right parallelization strategy per engine, and by
+#: the docs to document each engine's threading contract. Future
+#: external engines should set this attribute too.
 ThreadSafety = Literal["shared", "per-thread"]
 
 
@@ -96,8 +95,7 @@ class Engine(Protocol):
     introspection, but they are NOT part of the runtime-checkable
     Protocol shape — adding them as Protocol members would break
     ``isinstance(obj, Engine)`` for any third-party engine class
-    that doesn't declare them. Consumers (e.g.
-    ``examples/arbez_benchmark.py``) should read them with
+    that doesn't declare them. Consumers should read them with
     ``getattr(eng, name, default)``.
 
     * ``name : str`` — stable identifier (``"arbez"``,

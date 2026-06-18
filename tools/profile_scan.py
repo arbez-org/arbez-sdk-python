@@ -106,9 +106,7 @@ def _run_sweep(scanner: Scanner, images: list[Path], preprocess: PreprocessMode)
             # Skip images this engine can't decode (corrupt files,
             # unsupported formats, etc.) — the profiler must continue
             # so we still get representative hot-spot data. We don't
-            # log per-image errors here; users wanting that detail
-            # can run examples/arbez_benchmark.py which reports
-            # errors per cell.
+            # log per-image errors here.
             pass
     return len(images), n_decoded
 

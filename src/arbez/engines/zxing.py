@@ -242,6 +242,27 @@ def _get_tables() -> tuple[
     return _build_format_table()
 
 
+def symbology_for_zxing_format(fmt: Any) -> Symbology | None:
+    """Map a DECODED ``zxingcpp.BarcodeFormat`` to an arbez :class:`Symbology`.
+
+    Shared with :class:`ArbezEngine` (S-094): when its zxing-cpp decode
+    succeeds, the decoded format is the ECC-validated, authoritative
+    symbology and overrides the detector's classification.
+
+    Returns ``None`` when the format isn't one the SDK models (an unmapped
+    matrix / specialty code). Unlike :meth:`ZXingEngine._translate` — which
+    *drops* such results — a caller that already has a detection (ArbezEngine's
+    detector supplied a label) should keep its own symbology in that case
+    rather than discard the detection.
+    """
+    _, zxing_to_arbez, other_1d, _drop = _get_tables()
+    if fmt in zxing_to_arbez:
+        return zxing_to_arbez[fmt]
+    if fmt in other_1d:
+        return Symbology.OTHER_1D
+    return None
+
+
 # ── Engine ─────────────────────────────────────────────────────────────────
 
 

@@ -5,10 +5,10 @@ Usage:
 
     python examples/scan_image.py path/to/image.jpg
 
-The Scanner returns a :class:`~arbez.Result` carrying the detections,
-the input image dimensions, and per-stage wall-clock timings (handy
-for benchmarking). From v0.0.20 (S-034) the default engine is
-ArbezEngine (CoreML-accelerated on Apple Silicon via S-037).
+The default ``Scanner()`` runs every installed engine and unions their
+detections (maximum yield). The returned :class:`~arbez.Result` carries
+the detections, the input image dimensions, and per-stage wall-clock
+timings (handy for benchmarking).
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from arbez import Scanner
 
 
 def main(path: str) -> int:
-    scanner = Scanner()  # S-075 default: 2-engine consensus (arbez + zxing, union mode)
+    scanner = Scanner()  # default: union of all installed engines
     result = scanner.scan(path)
 
     for d in result.detections:
