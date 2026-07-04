@@ -238,6 +238,117 @@ def test_aggregate_group_symbology_tiebreak_to_highest_score() -> None:
     assert out.symbology is Symbology.MICRO_QR
 
 
+# ── issue #12: payload canonicalization in the group aggregate ────────────
+#
+# Each of these builds a group where two engines saw the SAME physical code
+# but reported it in different framing. Pre-fix the group produced two
+# agreed_payloads entries (false disagreement); post-fix they collapse to
+# one canonical vote + one raw representative. Detection.payload stays RAW.
+
+_BOX = (0.0, 0.0, 100.0, 100.0)
+
+
+def _agreed(out: Detection) -> tuple[str, ...]:
+    """Typed accessor for extras['agreed_payloads'] (extras values are object)."""
+    agreed = out.extras["agreed_payloads"]
+    assert isinstance(agreed, tuple)
+    return agreed
+
+
+def test_aggregate_gs1_ai_framing_merged() -> None:
+    """GS1 (01)-AI+check form and the bare 13-digit GTIN canonicalize equal."""
+    group = [
+        ("zxing", _make_det(_BOX, symbology=Symbology.GS1_DATABAR,
+                            payload="(01)76075587716395", score=0.8)),
+        ("apple_vision", _make_det(_BOX, symbology=Symbology.GS1_DATABAR,
+                                   payload="7607558771639", score=0.7)),
+    ]
+    out = _aggregate_group(group)
+    # zxing wins on score; its RAW string is preserved (not canonicalized).
+    assert out.payload == "(01)76075587716395"
+    assert len(_agreed(out)) == 1
+
+
+def test_aggregate_upc_a_leading_zero_merged() -> None:
+    """UPC-A with an EAN-13 leading zero canonicalizes to the 12-digit form."""
+    group = [
+        ("apple_vision", _make_det(_BOX, symbology=Symbology.UPC_A,
+                                   payload="0236153819774", score=0.9)),
+        ("zxing", _make_det(_BOX, symbology=Symbology.UPC_A,
+                            payload="236153819774", score=0.8)),
+    ]
+    out = _aggregate_group(group)
+    assert out.payload == "0236153819774"
+    assert len(_agreed(out)) == 1
+
+
+def test_aggregate_upc_e_compressed_and_expanded_merged() -> None:
+    """Compressed UPC-E and the expanded 12-digit UPC-A share the 11-digit key."""
+    group = [
+        ("apple_vision", _make_det(_BOX, symbology=Symbology.UPC_E,
+                                   payload="0461580", score=0.9)),
+        ("zxing", _make_det(_BOX, symbology=Symbology.UPC_E,
+                            payload="046000001586", score=0.8)),
+    ]
+    out = _aggregate_group(group)
+    assert len(_agreed(out)) == 1
+    assert out.payload == "0461580"
+
+
+def test_aggregate_code39_fullascii_vs_standard_merged() -> None:
+    """Code-39 Full-ASCII ctrl char and its standard '$Q' shift pair merge."""
+    group = [
+        ("apple_vision", _make_det(_BOX, symbology=Symbology.CODE_39,
+                                   payload=chr(17), score=0.9)),
+        ("zxing", _make_det(_BOX, symbology=Symbology.CODE_39,
+                            payload="$Q", score=0.8)),
+    ]
+    out = _aggregate_group(group)
+    assert len(_agreed(out)) == 1
+    assert out.payload == chr(17)  # highest-scored raw preserved
+
+
+def test_aggregate_agreed_payloads_raw_representative() -> None:
+    """The single agreed_payloads entry is a RAW form an engine emitted --
+    specifically the highest-scored member's raw string."""
+    group = [
+        ("zxing", _make_det(_BOX, symbology=Symbology.GS1_DATABAR,
+                            payload="(01)76075587716395", score=0.8)),
+        ("apple_vision", _make_det(_BOX, symbology=Symbology.GS1_DATABAR,
+                                   payload="7607558771639", score=0.7)),
+    ]
+    out = _aggregate_group(group)
+    agreed = out.extras["agreed_payloads"]
+    assert isinstance(agreed, tuple)
+    assert agreed[0] in {"(01)76075587716395", "7607558771639"}
+    assert agreed[0] == "(01)76075587716395"
+
+
+def test_aggregate_genuinely_different_still_split() -> None:
+    """Two truly different QR payloads must NOT be falsely merged."""
+    group = [
+        ("zxing", _make_det(_BOX, symbology=Symbology.QR,
+                            payload="https://a.com", score=0.9)),
+        ("apple_vision", _make_det(_BOX, symbology=Symbology.QR,
+                                   payload="https://b.com", score=0.8)),
+    ]
+    out = _aggregate_group(group)
+    assert len(_agreed(out)) == 2
+    assert out.payload == "https://a.com"
+
+
+def test_aggregate_payload_none_tiebreak_preserved() -> None:
+    """S-077 regression guard: canonicalization must not change the
+    highest-scored-decoder tiebreak when best_det has payload=None."""
+    group = [
+        ("arbez", _make_det(_BOX, symbology=Symbology.QR, score=0.9, payload=None)),
+        ("zxing", _make_det(_BOX, symbology=Symbology.QR, score=0.7, payload="X")),
+        ("wechat", _make_det(_BOX, symbology=Symbology.QR, score=0.65, payload="Y")),
+    ]
+    out = _aggregate_group(group)
+    assert out.payload == "X"
+
+
 def test_run_consensus_single_engine_short_circuits_no_threadpool() -> None:
     """Code-review P1 #15: a 1-engine consensus (legal call shape; also the
     S-075 fallback path when zxing is absent) should bypass the
