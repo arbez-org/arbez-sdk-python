@@ -330,7 +330,11 @@ ignore = [
 convention = "pep257"
 
 [tool.mypy]
-python_version = "3.10"
+# 3.12 (was 3.10): modern numpy stubs (>=2.3) use `type` statements that mypy
+# cannot parse when targeting <3.12, which failed the type-check job on every
+# py3.11+ matrix cell (numpy resolves to 2.5.x there). Runtime py3.10 support is
+# still covered by the wheel + pytest matrix; mypy targets the typecheck floor.
+python_version = "3.12"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
