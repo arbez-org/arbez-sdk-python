@@ -50,6 +50,16 @@ the explicit maintainer act of tagging is the gate.
 
 ## Unreleased
 
+### Changed
+
+* **zxing-cpp floor is 3.1.1 (S-095).** Core, the `[zxing]` alias, the
+  dev extra, and `constraints/floor.txt` all move from 3.0.0 to 3.1.1,
+  the current release. 3.1 is the nanobind binding and publishes wheels
+  for Python 3.10–3.14, including free-threaded 3.13 and 3.14.
+  `ZXingEngine` passes a `BarcodeFormats` value, which is what that
+  stub requires. `zxingcpp` is no longer in the mypy
+  `ignore_missing_imports` override.
+
 ### Fixed
 
 * **Consensus payload voting now canonicalizes framing before comparing

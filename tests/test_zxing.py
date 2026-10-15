@@ -163,9 +163,12 @@ def test_s082_every_databar_variant_maps_to_gs1_databar(variant_name: str) -> No
 
     bf_value = getattr(zxingcpp.BarcodeFormat, variant_name, None)
     if bf_value is None:
+        # The typed zxingcpp module has no ``__version__``. getattr
+        # keeps the skip message and satisfies strict mypy (attr-defined).
+        zxing_version = getattr(zxingcpp, "__version__", "unknown")
         pytest.skip(
             f"BarcodeFormat.{variant_name} not exposed by zxing-cpp "
-            f"{zxingcpp.__version__}; skipping"
+            f"{zxing_version}; skipping"
         )
 
     _, zxing_to_arbez, _, _ = _get_tables()
@@ -190,9 +193,10 @@ def test_s082_translate_surfaces_databar_omni_detection() -> None:
     import zxingcpp
 
     if not hasattr(zxingcpp.BarcodeFormat, "DataBarOmni"):
+        zxing_version = getattr(zxingcpp, "__version__", "unknown")
         pytest.skip(
             f"BarcodeFormat.DataBarOmni not exposed by zxing-cpp "
-            f"{zxingcpp.__version__}"
+            f"{zxing_version}"
         )
 
     class _FakePos:

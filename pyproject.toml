@@ -65,10 +65,10 @@ dependencies = [
     # downstream apps that pin Pillow 10.x or 11.x.
     "pillow>=10.3",
     "onnxruntime>=1.18",
-    # NOTE: floor 3.0 — see comment in the legacy [zxing] alias below
-    # for why 2.2 was bumped. Pinned identically in
+    # Floor 3.1.1 (S-095). 3.1 is the nanobind binding: typed stubs,
+    # and read_barcodes takes BarcodeFormats. Pinned identically in
     # constraints/floor.txt so install-smoke-min catches drift.
-    "zxing-cpp>=3.0",
+    "zxing-cpp>=3.1.1",
     # S-092 (2026-06-14): arbez-dmtx — self-contained libdmtx Data Matrix decoder,
     # used as a fallback when zxing-cpp fails on a Data Matrix crop (libdmtx
     # recovers a large share of deformed / low-contrast Data Matrix on our eval
@@ -174,9 +174,10 @@ zxing = [
     #
     # NOTE: floor bumped 2.2 -> 3.0 on 2026-05-13 after install-smoke-min
     # caught AttributeError: BarcodeFormat.MicroPDF417 on the 2.2 floor.
-    # Our engine table references symbols that ONLY exist in zxing-cpp 3.0+.
-    # Keep this honest with constraints/floor.txt.
-    "zxing-cpp>=3.0",
+    # Bumped 3.0 -> 3.1.1 on 2026-10-15 (S-095): 3.1 ships the typed
+    # nanobind API the engine calls. Keep this honest with
+    # constraints/floor.txt.
+    "zxing-cpp>=3.1.1",
 ]
 
 # ── Image format extras (S-019) ──────────────────────────────────────
@@ -233,7 +234,7 @@ dev = [
     "build>=1.2",
     # Tests need real engines + synthetic-fixture generators. Pure-Python only
     # so CI doesn't need system libs (no ghostscript, libdmtx, etc.).
-    "zxing-cpp>=3.0",  # matches the floor in the [zxing] extra above
+    "zxing-cpp>=3.1.1",  # matches the floor in the [zxing] extra above
     "opencv-contrib-python>=4.9",  # matches the floor in the [wechat] extra above
     # Apple Vision deps are Darwin-only by marker. On Linux/Windows CI
     # cells these silently no-op, so the Apple Vision tests skip via
@@ -348,16 +349,18 @@ exclude = [
     "tools/convert_.*ckpt_to_onnx\\.py$",
 ]
 
-# zxing-cpp / qrcode / python-barcode / cv2 ship no type stubs as of 2026-05.
-# Treat them as Any inside the SDK rather than peppering ``# type: ignore``
-# at every callsite. When upstream stubs land, remove these overrides.
+# qrcode / python-barcode / cv2 ship no type stubs. Treat them as Any
+# rather than peppering ``# type: ignore`` at every callsite. When
+# upstream stubs land for one of these, remove that override.
+# zxing-cpp >= 3.1.1 (the floor, S-095) ships nanobind stubs and is
+# type-checked against them. Do not put ``zxingcpp`` back in this list:
+# ``ignore_missing_imports`` would hide a missing stub, and it does not
+# silence call sites once the stub is installed.
 [[tool.mypy.overrides]]
-# No upstream type stubs for any of these as of 2026-05.
-# Listed top-level only (not ``.*`` submodule globs) — the SDK only
-# imports the top-level name in every case, and unused override sections
-# emit a mypy note we'd rather not see.
+# No upstream stubs for these. Listed top-level only (not ``.*``
+# submodule globs) — the SDK only imports the top-level name in every
+# case, and unused override sections emit a mypy note we'd rather not see.
 module = [
-    "zxingcpp",
     "qrcode",
     "barcode",
     "barcode.writer",

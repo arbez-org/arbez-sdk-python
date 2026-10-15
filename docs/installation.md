@@ -19,7 +19,7 @@ default. No extras needed for a fully working scanner.
 
 `pip install arbez` pulls:
 
-- `numpy>=1.24`, `pillow>=10.3`, `onnxruntime>=1.18`, `zxing-cpp>=3.0`
+- `numpy>=1.24`, `pillow>=10.3`, `onnxruntime>=1.18`, `zxing-cpp>=3.1.1`
   — the inference + classical-decode baseline. All ship pre-built
   wheels on every supported cell.
 - The `arbez` Python package itself, including the bundled YOLOX-s
@@ -50,7 +50,7 @@ below mirrors the canonical engine order.
 | Extra | Adds | Use for |
 |---|---|---|
 | `[apple-vision]` | nothing extra | **No-op alias** — `pyobjc-framework-Vision` + `pyobjc-framework-Quartz` are core deps with `platform_system == 'Darwin'` markers (auto-pulled by `pip install arbez` on macOS, excluded everywhere else). Kept so pinned scripts keep resolving. New macOS code can just `pip install arbez`. |
-| `[zxing]` | `zxing-cpp>=3.0` | **No-op alias** — zxing-cpp is a core dep (ships with bare `pip install arbez`). Kept so pinned scripts keep resolving. |
+| `[zxing]` | `zxing-cpp>=3.1.1` | **No-op alias** — zxing-cpp is a core dep (ships with bare `pip install arbez`). Kept so pinned scripts keep resolving. |
 | `[wechat]` | `opencv-contrib-python>=4.9` | WeChat QR detector — best recall on tiny / damaged QRs. Joins consensus voting. |
 | `[consensus]` | apple-vision + wechat (zxing already core) | Bundle — all consensus engines (Apple Vision, WeChat, ZXing alongside the bundled arbez detector) |
 | `[coreml]` | `coremltools>=8` (Darwin only) | **Scaffolding** for future Core ML toolchain work. Note: the default `pip install arbez` already gets CoreML acceleration on Mac via ORT's `CoreMLExecutionProvider` — no `[coreml]` extra needed. Install this extra only when doing Core ML model conversion / inspection. |

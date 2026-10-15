@@ -420,11 +420,15 @@ class ZXingEngine:
             raw_results = _z.read_barcodes(pil_image)
         else:
             arbez_to_zxing, _, _, _ = _get_tables()
-            # zxing-cpp accepts a list/tuple of BarcodeFormat and combines them
-            # internally into the BarcodeFormats bitset. Avoid the deprecated
-            # ``a | b`` operator on BarcodeFormat.
-            zxing_formats = [arbez_to_zxing[s] for s in self._formats]
-            raw_results = _z.read_barcodes(pil_image, formats=zxing_formats)
+            # The 3.1 stub types ``formats`` as ``BarcodeFormats``. Build
+            # that set explicitly. Table values are Any (symbols are
+            # resolved with getattr), so append into a typed list rather
+            # than inferring list[Any]. Avoid the deprecated ``a | b``
+            # operator on BarcodeFormat.
+            chosen: list[_z.BarcodeFormat] = []
+            for sym in self._formats:
+                chosen.append(arbez_to_zxing[sym])
+            raw_results = _z.read_barcodes(pil_image, formats=_z.BarcodeFormats(chosen))
 
         detections: list[Detection] = []
         for r in raw_results:
