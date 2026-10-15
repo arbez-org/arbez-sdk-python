@@ -11,6 +11,39 @@ ID prefix is `S-` (for SDK).
 
 ---
 
+## S-095 — zxing-cpp floor raised to 3.1.1 (2026-10-15)
+
+**Context.** The advertised floor was `zxing-cpp>=3.0` (S-034, then the
+2.2 → 3.0 bump on 2026-05-13 for `BarcodeFormat.MicroPDF417`). CI does
+not pin an upper bound, so by 2026-07-13 pip resolved zxing-cpp 3.1.1.
+That release switched the Python binding from pybind11 to nanobind and
+ships `py.typed` plus `zxingcpp.pyi`. `read_barcodes(..., formats=)` is
+typed as `BarcodeFormats`, and the module has no `__version__`. mypy
+2.4 then failed every lint job. The 3.0 floor no longer described the
+package CI actually type-checks.
+
+3.1.1 (released 2026-07-29) is the current release. It publishes wheels
+for CPython 3.10, 3.11, and 3.12, a `cp312-abi3` wheel that covers GIL
+3.13 and 3.14, and `cp313t` / `cp314t` wheels, on Linux x86_64 and
+aarch64, macOS arm64 and x86_64, and Windows x64 and arm64.
+
+**Decision.** Raise the floor to `zxing-cpp>=3.1.1` in core dependencies,
+the `[zxing]` no-op extra, and the dev extra. Pin `zxing-cpp==3.1.1` in
+`constraints/floor.txt`. Construct `BarcodeFormats` at the `read_barcodes`
+call. Remove `zxingcpp` from the mypy `ignore_missing_imports` override
+so a future stub-less install fails the type check instead of being
+silenced. Decode behavior is unchanged: 3.0 already accepted that
+constructor, and 3.1.1 is what the suite has been running.
+
+**Consequences.**
+
+* `pip install arbez` will not resolve zxing-cpp 3.0.x.
+* install-smoke-min installs 3.1.1 exactly.
+* Downstream pins of `zxing-cpp>=3.0,<3.1` conflict with arbez. That
+  range never satisfied the typed API CI is checking.
+
+---
+
 ## S-094 — ArbezEngine: decoder-authoritative symbology reconciliation (2026-06-17)
 
 **Context.** ArbezEngine is the only built-in engine with a split detector→decoder

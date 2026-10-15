@@ -34,8 +34,10 @@
 #
 # zxing-cpp bumped 2.2 -> 3.0 on 2026-05-13. install-smoke-min on
 # py3.10 caught AttributeError: BarcodeFormat.MicroPDF417 — the symbol
-# doesn't exist until zxing-cpp 3.0. The advertised pyproject floor
-# must match.
+# doesn't exist until zxing-cpp 3.0.
+# Bumped 3.0.0 -> 3.1.1 on 2026-10-15 (S-095). 3.1 is the nanobind
+# binding. A 3.0 floor let CI resolve 3.1 and type-check a stub the
+# floor pin did not describe.
 numpy==1.24.0
 # pillow floor at 10.3.0 (S-048, superseding S-047). 10.3 closes the
 # 3 Dependabot alerts whose vulnerable code paths are reachable from
@@ -44,7 +46,7 @@ numpy==1.24.0
 # as not_used. install-smoke-min validates this floor on every CI run.
 pillow==10.3.0
 onnxruntime==1.18.0
-zxing-cpp==3.0.0
+zxing-cpp==3.1.1
 
 # S-092 (2026-06-14): arbez-dmtx — companion wheel (native libdmtx) used as
 # the ArbezEngine Data Matrix fallback. CORE on the four shipped platforms;
