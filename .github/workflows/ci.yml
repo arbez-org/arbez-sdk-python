@@ -47,6 +47,7 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
       - run: ruff check src/ tests/ tools/
+      - run: python tools/check_stale_api_docs.py
       # tests/ is now type-checked under strict mode too — tests/__init__.py
       # makes the directory a proper package and the corpus + parametrize
       # blocks were written with explicit ``set[str]`` annotations etc.

@@ -1,11 +1,11 @@
 """Consensus engines — third-party detectors we can vote against the Arbez model.
 
-Engines are lazy-loaded by ``Scanner`` on construction (S-008):
-``Scanner(engine="auto")`` runs a ``importlib.util.find_spec`` probe
-for each engine's optional dep at ``__init__`` time and picks the
-first one available. The actual engine instance is built lazily on
-the first ``scan()`` call (under a threading.Lock per S-012). This
-keeps both ``import arbez`` AND ``Scanner()`` cheap — the heavy
+Engines are lazy-loaded by ``Scanner`` on construction (S-008, S-093):
+bare ``Scanner()`` probes which optional engines are installed, then
+unions every available engine on ``scan()``. Single-engine use is
+``Scanner(engine="zxing")`` (etc.). The actual engine instance is built
+lazily on the first ``scan()`` call (under a threading.Lock per S-012).
+This keeps both ``import arbez`` AND ``Scanner()`` cheap — the heavy
 extras (opencv-contrib is ~80 MB) don't import until they're
 actually used.
 

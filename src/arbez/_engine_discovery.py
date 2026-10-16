@@ -8,9 +8,9 @@ a structural import cycle because each module needed the other:
 * ``arbez.scanner`` consumes :func:`installed_consensus_engines` to
   validate ``Scanner(engines=...)`` and to back
   ``Scanner._resolve_consensus_engine_names``.
-* ``arbez.parallelism.recommended_workers(engine="auto")`` consumes
-  :func:`resolve_auto_engine` to look up what the host's auto-pick
-  would resolve to.
+* ``arbez.parallelism.recommended_workers`` consumed
+  :func:`resolve_auto_engine` (pre-0.2.0 per-platform auto-pick) to
+  size thread pools.
 
 The pre-S-038 fix was to make both directions lazy (function-local
 imports). It worked at runtime but CodeQL still flagged it as a
@@ -74,7 +74,7 @@ def _probe_engines() -> tuple[bool, bool, bool, bool]:
     # module. ``find_spec("cv2")`` alone false-positives on plain
     # opencv-python (no contrib modules), so when the spec is present
     # we import cv2 and probe the attribute. Any import failure means
-    # unavailable — the probe backs eager ``Scanner(consensus="vote")``
+    # unavailable — the probe backs multi-engine ``Scanner(consensus=N)``
     # validation and must never raise. The find_spec gate keeps the
     # not-installed case cheap (no import attempt), and the import
     # itself is paid at most once per process (this function is cached).
