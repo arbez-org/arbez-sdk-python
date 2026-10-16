@@ -246,20 +246,13 @@ def test_scan_preprocess_is_keyword_only() -> None:
     """The ``preprocess`` parameter is keyword-only — passing it positionally fails (TypeError).
     This is what the ``*`` in the signature guarantees; pin it via a positive test.
 
-    S-024: hide the call from CodeQL's static signature-check —
-    the WHOLE POINT of this test is to verify wrong-arg-count
-    raises TypeError, so CodeQL flagging the call as
-    py/call/wrong-arguments is technically correct but defeats
-    the test's purpose. We pack the args into a tuple and splat;
-    CodeQL's call-site analyzer can't see the resulting argument
-    count.
+    The wrong positional arity is the subject of the test.
+    CodeQL alert #19 (py/call/wrong-arguments) reports this call,
+    including through the tuple splat. That report is the contract
+    being checked, not a defect in Scanner.scan.
     """
     img = Image.new("RGB", (50, 50), color="white")
     scanner = Scanner(engine="zxing")
-    # The Any-typed bound-method indirection alone didn't fool
-    # CodeQL (alert #18 in S-034's review). The ``*args`` splat
-    # does — CodeQL can't compute the call arity through a
-    # tuple-spread.
     from typing import Any as _Any
     scan_method: _Any = scanner.scan
     bad_args: tuple[object, ...] = (img, "auto")

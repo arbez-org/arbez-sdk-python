@@ -489,7 +489,6 @@ class AppleVisionEngine:
             from Quartz import CGImageGetHeight, CGImageGetWidth
             width = int(CGImageGetWidth(cg_image_direct))
             height = int(CGImageGetHeight(cg_image_direct))
-            pil_image = None  # signals "skip _pil_to_cgimage below"
         else:
             pil_image = coerce_to_pil(image)
             width, height = pil_image.size
