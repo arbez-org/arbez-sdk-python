@@ -80,8 +80,6 @@ from arbez.types import Detection, Symbology
 # S-067: extended to support YOLO11-s as a third architecture so the
 # same engine can run three detector models in parallel for consensus.
 _ARCH_YOLOX = "yolox_s"
-_ARCH_RTDETR = "rtdetr_v2_r18vd"
-_ARCH_YOLO11 = "yolo11s"
 _DEFAULT_ARCH = _ARCH_YOLOX
 
 # S-070: the 7 S-031 locked metadata keys. Used by the load-time

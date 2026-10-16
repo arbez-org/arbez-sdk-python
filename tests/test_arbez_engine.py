@@ -831,8 +831,10 @@ def test_s071_warmup_smoke_raises_engine_unavailable_on_broken_postprocess(
     def _broken_postprocess(*args: object, **kwargs: object) -> None:
         raise ValueError("synthetic postprocess failure for test")
 
-    import arbez.engines.arbez as arbez_mod
-    monkeypatch.setattr(arbez_mod, "yolox_postprocess", _broken_postprocess)
+    monkeypatch.setattr(
+        "arbez.engines.arbez.yolox_postprocess",
+        _broken_postprocess,
+    )
 
     eng = ArbezEngine()
     with pytest.raises(EngineUnavailable) as exc_info:

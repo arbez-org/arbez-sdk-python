@@ -3,7 +3,8 @@
 Covers:
 * Per-engine return-value shape (always int >= 1).
 * Engine-aware ordering of recommendations (ZXing >= WeChat).
-* ``"auto"`` resolves via :func:`arbez.scanner.resolve_auto_engine`.
+* ``"auto"`` resolves via ``arbez.parallelism._ed_resolve_auto_engine``
+  (the same function re-exported as ``arbez.scanner.resolve_auto_engine``).
 * No-engine-installed path returns a safe default rather than raising.
 * Unknown engine name returns a safe default rather than raising.
 * ``_physical_cores`` returns >= 1 on this host.
@@ -114,16 +115,24 @@ def test_unknown_engine_returns_safe_default_without_raising() -> None:
 
 
 def test_auto_with_no_engine_installed_falls_through() -> None:
-    """If ``resolve_auto_engine`` raises (no extras installed), the auto path should still return a
-    usable worker count rather than propagate the EngineUnavailable up to the caller — they wanted a
-    NUMBER, not engine resolution."""
-    with patch(
-        "arbez.scanner.resolve_auto_engine",
-        side_effect=Exception("no engine in test environment"),
+    """If auto-resolution raises EngineUnavailable, return the advisory fallback.
+
+    ``recommended_workers`` calls ``_ed_resolve_auto_engine``, not the
+    ``arbez.scanner`` re-export. With ``cpu_count == 1`` the fallback is
+    ``max(1, 1 // 2) == 1``, while the arbez branch would return
+    ``min(8, max(2, 0)) == 2``. The assertion tells those paths apart.
+    """
+    from arbez.exceptions import EngineUnavailable
+
+    with (
+        patch("arbez.parallelism.os.cpu_count", return_value=1),
+        patch(
+            "arbez.parallelism._ed_resolve_auto_engine",
+            side_effect=EngineUnavailable("no engine in test environment"),
+        ),
     ):
         n = recommended_workers("auto")
-        assert isinstance(n, int)
-        assert n >= 1
+        assert n == 1
 
 
 def test_physical_cores_at_least_one() -> None:
