@@ -24,7 +24,7 @@ The full table:
 | `0.x.y` | Iteration after first public release. Breaking changes permitted per [semver 0.x convention](https://semver.org/#spec-item-4). Documented here. |
 | `1.0.0` | **API stability commitment.** [Semantic Versioning](https://semver.org/) applies fully — breaking changes require a major bump. |
 
-**Where we are right now:** `0.1.0` — the first public release.
+**Where we are right now:** `0.2.1`.
 
 **Why we skip `0.0.1`:** the first tagged `0.0.x` release is
 `0.0.2`; `0.0.1` was an unreleased initial build.
@@ -50,7 +50,16 @@ the explicit maintainer act of tagging is the gate.
 
 ## Unreleased
 
+## 0.2.1 — 2026-10-16
+
 ### Changed
+
+* **Stale 0.1.x API references are rejected in CI.** Module docstrings
+  and `docs/concepts.md` now describe the 0.2.0 scanner contract
+  (`consensus` as an int, no `engine="auto"`). `tools/check_stale_api_docs.py`
+  runs in the lint job and fails the build if `docs/` or `src/` cite the
+  removed API without an explicit removal note. `CHANGELOG.md` and
+  `DECISIONS.md` stay exempt as the archive.
 
 * **zxing-cpp floor is 3.1.1 (S-095).** Core, the `[zxing]` alias, the
   dev extra, and `constraints/floor.txt` all move from 3.0.0 to 3.1.1,
