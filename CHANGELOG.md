@@ -50,7 +50,38 @@ the explicit maintainer act of tagging is the gate.
 
 ## Unreleased
 
-_Nothing yet._
+### Changed
+
+* **zxing-cpp floor is 3.1.1 (S-095).** Core, the `[zxing]` alias, the
+  dev extra, and `constraints/floor.txt` all move from 3.0.0 to 3.1.1,
+  the current release. 3.1 is the nanobind binding and publishes wheels
+  for Python 3.10–3.14, including free-threaded 3.13 and 3.14.
+  `ZXingEngine` passes a `BarcodeFormats` value, which is what that
+  stub requires. `zxingcpp` is no longer in the mypy
+  `ignore_missing_imports` override.
+
+### Fixed
+
+* **Consensus payload voting now canonicalizes framing before comparing
+  (issue #12).** Previously the per-code consensus vote and
+  `Detection.extras["agreed_payloads"]` compared raw decoded strings, so
+  two engines that reported the *same physical code* in different
+  symbology framing were treated as disagreement. The vote now keys on a
+  canonical form for `GS1_DATABAR` (strip `(NN)` AIs; drop the GTIN-14
+  check digit to a 13-digit GTIN), `UPC_A` (strip the EAN-13 leading
+  zero), `UPC_E` (expand to the 11-digit UPC-A body), and `CODE_39`
+  (map Full-ASCII shift pairs to a single standard form). Two such
+  reports now coalesce into one vote.
+* **Behavior change — `agreed_payloads` may now contain fewer entries.**
+  When engines' *raw* forms differed but the physical code was the same
+  (`GS1_DATABAR` / `UPC_A` / `UPC_E` / `CODE_39`), duplicates are removed
+  by canonical form and one **raw** representative per code is kept (the
+  highest-scored engine's string). Callers that used
+  `len(agreed_payloads)` to count *distinct physical codes at one
+  location* got a false-positive count before; use `Result.per_engine`
+  for raw per-engine multiplicity. `Detection.payload` is **unchanged**:
+  it remains the raw string of the winning detection (the canonical form
+  is only ever an internal vote key).
 
 ## 0.2.0 — 2026-06-16
 

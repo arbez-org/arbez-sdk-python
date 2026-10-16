@@ -173,7 +173,9 @@ def postprocess(
     y2 = np.clip(y2, 0, info.orig_height)
 
     # Per-class NMS — mirrors the YOLOX postprocess convention.
-    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
+    # float32 to match _per_class_nms's contract (clip on float coords yields
+    # float64; the stricter numpy>=2.3 stubs flag the dtype mismatch).
+    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)
     final_idx = _per_class_nms(boxes_xyxy, scores, classes, nms_threshold)
 
     raw_dets: list[RawDetection] = []

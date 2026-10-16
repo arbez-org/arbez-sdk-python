@@ -55,6 +55,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from arbez._canon import canonicalize_payload
 from arbez.types import Detection, Symbology
 
 if TYPE_CHECKING:
@@ -324,9 +325,13 @@ def _aggregate_group(group: list[tuple[str, Detection]]) -> Detection:
     * **engine**: hardcoded ``"consensus"``.
     * **extras**: ``voted_by`` (sorted tuple of unique engine names),
       ``vote_count`` (= len(voted_by)), ``agreed_payloads`` (sorted
-      tuple of distinct non-None payloads), ``source_count`` (total
-      members in cluster; may exceed ``vote_count`` when one engine
-      contributed multiple detections to the same IoU cluster).
+      tuple with one representative raw payload per canonical form
+      (issue #12) -- deduped by canonical vote key, so two engines that
+      reported the same physical code in different framing collapse to
+      one entry, but each entry stays a raw engine string),
+      ``source_count`` (total members in cluster; may exceed
+      ``vote_count`` when one engine contributed multiple detections to
+      the same IoU cluster).
     """
     # bbox: per-corner median (robust to one engine's bbox being off)
     medians = [
@@ -389,32 +394,52 @@ def _aggregate_group(group: list[tuple[str, Detection]]) -> Detection:
     # deterministic given score values; only N1 (tied scores) can
     # still produce non-determinism, which is documented in
     # docs/consensus-rules.md.
-    payloads = [d.payload for _, d in group if d.payload is not None]
+    # issue #12: vote/dedup on the CANONICAL form so two engines that
+    # report the same physical code in different framing (GS1 AI prefix,
+    # UPC-A leading zero, UPC-E compression, Code39 Full-ASCII) count as
+    # one vote. Detection.payload stays RAW: we carry (raw, canonical)
+    # pairs and only ever use canonical as the Counter key.
+    raw_and_canon: list[tuple[str, str]] = [
+        (d.payload, c)
+        for _, d in group
+        if d.payload is not None
+        and (c := canonicalize_payload(d.payload, d.symbology)) is not None
+    ]
     payload: str | None
-    if payloads:
-        payload_counts: Counter[str] = Counter(payloads)
-        top_payload, top_payload_n = payload_counts.most_common(1)[0]
-        if (
-            best_det.payload is not None
-            and payload_counts[best_det.payload] == top_payload_n
-        ):
+    if raw_and_canon:
+        canon_payloads = [c for _, c in raw_and_canon]
+        payload_counts: Counter[str] = Counter(canon_payloads)
+        top_canon, top_payload_n = payload_counts.most_common(1)[0]
+        best_canon = (
+            canonicalize_payload(best_det.payload, best_det.symbology)
+            if best_det.payload is not None
+            else None
+        )
+        if best_canon is not None and payload_counts[best_canon] == top_payload_n:
+            # best_det's canonical form is at the top count: return its RAW payload.
             payload = best_det.payload
         else:
-            # best_det's payload is None OR not at the top count.
-            # Find the highest-scored member with a non-None payload
-            # whose payload IS at the top count; if there is one,
-            # prefer it. This makes the tiebreak deterministic in the
-            # face of payload-count ties.
+            # best_det has no payload OR its canonical is not top-count.
+            # Among members whose canonical IS top-count, take the
+            # highest-scored one's RAW payload (S-077 deterministic tiebreak:
+            # score, then canonical value as stable secondary).
             decoder_candidates = [
                 d for _, d in group
                 if d.payload is not None
-                and payload_counts[d.payload] == top_payload_n
+                and canonicalize_payload(d.payload, d.symbology) == top_canon
             ]
             if decoder_candidates:
-                decoder_best = max(decoder_candidates, key=lambda d: d.score)
+                decoder_best = max(
+                    decoder_candidates,
+                    key=lambda d: (d.score, canonicalize_payload(d.payload, d.symbology)),
+                )
                 payload = decoder_best.payload
             else:
-                payload = top_payload
+                # Unreachable in practice (top_canon came from this group);
+                # deterministic fallback to the first raw mapping to top_canon.
+                payload = next(
+                    (raw for raw, c in raw_and_canon if c == top_canon), None
+                )
     else:
         payload = None
 
@@ -423,7 +448,15 @@ def _aggregate_group(group: list[tuple[str, Detection]]) -> Detection:
     polygon = best_det.polygon
 
     engines_voted: tuple[str, ...] = tuple(sorted({name for name, _ in group}))
-    agreed_payloads: tuple[str, ...] = tuple(sorted(set(payloads)))
+    # issue #12: dedup by canonical form, keep one RAW representative per
+    # canonical key (highest-scored detection first, since `group` is
+    # score-sorted descending from Stage 2). Fewer entries than before when
+    # engines' raw forms differed but the physical code was the same.
+    canon_to_raw: dict[str, str] = {}
+    for raw, c in raw_and_canon:
+        if c not in canon_to_raw:
+            canon_to_raw[c] = raw
+    agreed_payloads: tuple[str, ...] = tuple(sorted(canon_to_raw.values()))
     extras: dict[str, object] = {
         "voted_by": engines_voted,
         "vote_count": len(engines_voted),
