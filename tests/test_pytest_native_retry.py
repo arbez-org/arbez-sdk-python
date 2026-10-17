@@ -212,6 +212,7 @@ def test_process_abort_then_real_failure_stays_red(tmp_path: Path) -> None:
 
 
 def test_core_soft_limit_disables_dumps_without_lowering_hard_limit() -> None:
+    pytest.importorskip("resource")
     script = textwrap.dedent(
         f"""
         import importlib.util

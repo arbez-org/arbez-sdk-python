@@ -162,7 +162,13 @@ def _disable_core_dumps() -> None:
     ``fs/coredump.c`` treats as the off switch. The hard limit stays
     where it is: lowering it to 0 would make that switch unreachable.
     The manual hunt workflow is what keeps cores.
+
+    Windows has no ``resource`` module. The stdlib stub still exposes the
+    module there and hides ``getrlimit``, so the platform return has to
+    come first. Otherwise mypy on windows-latest reports ``attr-defined``.
     """
+    if sys.platform == "win32":
+        return
     try:
         import resource
     except ImportError:
