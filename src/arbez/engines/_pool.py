@@ -23,6 +23,7 @@ import logging
 import math
 import multiprocessing as mp
 import os
+import signal
 import struct
 import sys
 import threading
@@ -436,6 +437,23 @@ def _map_shared_image(
     return shm, shape, str(array.dtype.str)
 
 
+def _die_on_access_violation() -> None:
+    """End the worker so the parent sees a dead process, not an OSError.
+
+    A Unix fault never returns here. Windows turns a null write into
+    ``OSError`` ("access violation"). ``os.abort`` can then block on a
+    CRT dialog until the caller's deadline, and the parent records a
+    timeout. ``TerminateProcess`` (what ``os.kill`` does on Windows)
+    ends the process with no dialog, so the parent takes the
+    dead-worker path.
+    """
+    if sys.platform == "win32":
+        os.kill(os.getpid(), signal.SIGTERM)
+    else:
+        os.abort()
+    os._exit(3)
+
+
 def _worker_main(entrypoint: str, conn: Connection) -> None:
     """Spawn target. Top-level so the child pickles a string, not a closure."""
     import faulthandler
@@ -479,11 +497,11 @@ def _worker_main(entrypoint: str, conn: Connection) -> None:
                 value = engine(view)
             except BaseException as exc:
                 # Windows reports a null write as OSError ("access
-                # violation") instead of killing the child. Abort so
-                # the parent takes the dead-worker path. Any other
-                # OSError still goes back as an engine error.
+                # violation") instead of killing the child. Die so the
+                # parent takes the dead-worker path. Any other OSError
+                # still goes back as an engine error.
                 if isinstance(exc, OSError) and "access violation" in str(exc).lower():
-                    os.abort()
+                    _die_on_access_violation()
                 _send_tagged(conn, "error", exc)
             else:
                 try:
