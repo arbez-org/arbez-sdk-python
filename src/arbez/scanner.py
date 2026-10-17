@@ -41,6 +41,10 @@ Other constructor shapes
   Apple Vision requests, then applied after consensus to the decoding
   engine's symbology (S-099). Micro QR and rMQR stay opt-in
   (``micro_qr=`` / ``rmqr=``).
+* ``Scanner(full_frame_fallback=False)`` — WeChat engines this Scanner
+  constructs skip the classical full-frame pass (S-100). Default ``True``.
+  A pre-built ``WeChatEngine`` keeps the flag it was constructed with,
+  including the scan after ``close()``.
 
 The 0.1.x ``engine="auto"`` and ``consensus="off"/"vote"`` + ``min_votes``
 API were removed in 0.2.0 (S-093).
@@ -153,6 +157,7 @@ def _resolve_engine(
     symbologies: frozenset[Symbology] | None = None,
     micro_qr: bool = False,
     rmqr: bool = False,
+    full_frame_fallback: bool = True,
 ) -> Engine:
     """Map an engine name to an instance.
 
@@ -202,7 +207,7 @@ def _resolve_engine(
         # drops its results after the vote (S-099).
         from arbez.engines.wechat import WeChatEngine
 
-        return WeChatEngine()
+        return WeChatEngine(full_frame_fallback=full_frame_fallback)
     raise EngineUnavailable(
         f"Unknown engine name {name!r}. Expected one of: "
         f"'auto', 'arbez', 'apple_vision', 'zxing', 'wechat'."
@@ -540,9 +545,8 @@ class Scanner:
         on the decoding engine's symbology — not the voted cluster label.
         A prebuilt ``engine=`` instance is not rebuilt with these
         flags. ``scan`` still filters its results. After ``close()``,
-        a user-supplied engine is reconstructed by name without
-        ``symbologies`` / ``micro_qr`` / ``rmqr``; a string name
-        keeps those flags. Keyword-only.
+        that same instance is used again, so its own configuration
+        stands. A string name still receives these flags. Keyword-only.
     micro_qr:
         Also request Micro QR. With an allow-list, ``MICRO_QR`` is
         unioned in. Keyword-only. Default ``False``.
@@ -550,6 +554,14 @@ class Scanner:
         Also request rMQR from zxing and the arbez crop decoder. Reported
         as ``Symbology.QR``. Ignored when the allow-list excludes QR.
         Apple Vision has no rMQR symbology. Keyword-only. Default ``False``.
+    full_frame_fallback:
+        Whether a WeChat engine this Scanner constructs decodes the whole
+        frame again when the ONNX nets return no payload (S-100). Default
+        ``True``, which is maximum yield (S-093). ``False`` keeps the net
+        pass only. Ignored for every engine other than WeChat, and ignored
+        when ``engine=`` is an already-built instance: that object's own
+        ``full_frame_fallback`` stands, including on the scan after
+        ``close()``. Keyword-only.
 
     Raises
     ------
@@ -560,8 +572,8 @@ class Scanner:
     TypeError
         ``engine=`` is neither a string nor an Engine instance; ``engines=``
         is neither None nor a tuple/list; ``consensus=`` is not an int;
-        ``micro_qr`` / ``rmqr`` are not bools; or ``symbologies`` is a bare
-        string or a single ``Symbology``.
+        ``micro_qr`` / ``rmqr`` / ``full_frame_fallback`` are not bools; or
+        ``symbologies`` is a bare string or a single ``Symbology``.
     ValueError
         ``consensus < 1``; ``consensus`` greater than the number of engines;
         ``iou_threshold`` outside ``[0, 1]``; ``engine=`` combined with
@@ -583,6 +595,7 @@ class Scanner:
         symbologies: Iterable[Symbology | str] | None = None,
         micro_qr: bool = False,
         rmqr: bool = False,
+        full_frame_fallback: bool = True,
     ) -> None:
         # S-093 (0.2.0): engine-selection model.
         #
@@ -625,6 +638,11 @@ class Scanner:
             raise TypeError(
                 f"micro_qr and rmqr must be bools; got micro_qr={micro_qr!r}, rmqr={rmqr!r}."
             )
+        if not isinstance(full_frame_fallback, bool):
+            raise TypeError(
+                "full_frame_fallback must be a bool; "
+                f"got {type(full_frame_fallback).__name__}"
+            )
         # Imported here so scanner and consensus don't cycle at import.
         # Coerce before any early return so every construction path
         # stores the allow-list scan() filters on (S-099).
@@ -642,15 +660,18 @@ class Scanner:
         self._consensus_engines: dict[str, Engine] | None = None
         self._consensus_engines_lock = threading.Lock()
         self._engine: Engine | None = None
+        # Set only when the caller passed an Engine instance. close()
+        # drops the cached slot; the next scan puts this object back
+        # instead of building a new one from the Scanner flag (S-100).
+        self._supplied_engine: Engine | None = None
         self._engines: tuple[str, ...] | None = None
+        # S-100: applied only when this Scanner constructs a WeChatEngine.
+        self._full_frame_fallback = full_frame_fallback
         self._is_consensus = False
         self._consensus_min_votes = 1
         self._symbology_allow: frozenset[Symbology] | None = allow
         self._micro_qr = micro_qr
         self._rmqr = rmqr
-        # A user-supplied instance is not rebuilt with the flags above.
-        # String names stay False and keep receiving them (S-099).
-        self._user_supplied_engine = False
 
         # ── Single-engine path: ``engine=`` was given ────────────────────
         if engine is not None:
@@ -679,7 +700,7 @@ class Scanner:
                     )
                 self._engine_name = getattr(engine, "name", type(engine).__name__)
                 self._engine = engine
-                self._user_supplied_engine = True
+                self._supplied_engine = engine
                 _log.debug(
                     "Scanner: accepted user-supplied engine instance %r (name=%r)",
                     engine,
@@ -817,7 +838,9 @@ class Scanner:
         ``"consensus"``, and ``"engine.<name>"``), and
         ``extras["stage_hit"]``. ``extras`` also records engine
         isolation (S-097): whether a native engine ran in a worker,
-        and any crash or deadline that was contained.
+        and any crash or deadline that was contained. When a WeChat
+        call finishes, ``wechat_full_frame_fallback`` says whether the
+        classical full-frame pass ran (S-100).
         """
         # Delegate to the public ``coerce_to_pil`` helper — same code
         # path the engines themselves use. Previously Scanner had a
@@ -1032,9 +1055,11 @@ class Scanner:
         engines (S-032 multi-engine consensus mode) are also closed.
 
         Idempotent: safe to call multiple times. After ``close()``,
-        ``scan()`` will lazy-reinit the engine on next call (same
-        pattern as before construction). Most users should treat
-        ``close()`` as terminal and not call ``scan()`` after it.
+        ``scan()`` lazy-reinits on the next call. A name-built engine
+        is constructed again. A caller-supplied instance is that same
+        object again, so its own configuration stands (S-100). Most
+        users should treat ``close()`` as terminal and not call
+        ``scan()`` after it.
 
         Use the context manager form for the common case::
 
@@ -1061,11 +1086,13 @@ class Scanner:
         # in ``_get_engine`` reads ``self._engine`` without taking the
         # lock, so holding the lock while closing never stopped a
         # concurrent reader from grabbing the reference — but swapping
-        # to ``None`` BEFORE closing means any reader arriving after
-        # the swap rebuilds a fresh engine instead of receiving one
-        # that is mid-teardown. A scan that grabbed the reference
-        # before the swap can still race a concurrent close(); callers
-        # who close while scans are in flight own that coordination.
+        # to ``None`` BEFORE closing means a name-built reader arriving
+        # after the swap builds a new engine instead of receiving one
+        # that is mid-teardown. A caller-supplied instance is that same
+        # object on the next scan (S-100). A scan that starts while
+        # ``close()`` is still running, or that grabbed the reference
+        # before the swap, can still race that close(); callers who
+        # close while scans are in flight own that coordination.
         # Rebuild-after-close stays supported (see docstring above).
         engine_snapshot: Engine | None
         with self._engine_lock:
@@ -1146,17 +1173,20 @@ class Scanner:
             # Re-check inside the lock — another thread may have raced
             # us to the assignment while we were waiting.
             if self._engine is None:
-                if self._user_supplied_engine:
-                    # close() dropped the caller's instance. Rebuilding
-                    # it with Scanner's opt-in flags would change the
-                    # decode set. A string name still receives them.
-                    self._engine = _resolve_engine(self._engine_name)
+                # close() has already dropped a supplied engine's pool.
+                # Putting that object back keeps its full_frame_fallback
+                # and its own format set. Building from the name would
+                # apply this Scanner's flags.
+                supplied = self._supplied_engine
+                if supplied is not None:
+                    self._engine = supplied
                 else:
                     self._engine = _resolve_engine(
                         self._engine_name,
                         symbologies=self._symbology_allow,
                         micro_qr=self._micro_qr,
                         rmqr=self._rmqr,
+                        full_frame_fallback=self._full_frame_fallback,
                     )
             return self._engine
 
@@ -1189,6 +1219,7 @@ class Scanner:
                         symbologies=self._symbology_allow,
                         micro_qr=self._micro_qr,
                         rmqr=self._rmqr,
+                        full_frame_fallback=self._full_frame_fallback,
                     )
                     for name in names
                 }

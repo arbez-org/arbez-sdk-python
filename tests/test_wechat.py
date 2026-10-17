@@ -14,6 +14,7 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, cast
 
@@ -412,6 +413,332 @@ def test_scanner_wechat_runs_in_a_worker_with_the_ten_second_deadline(
         assert engine._pool is not None
         assert engine._pool.isolation == "process"
         assert engine._pool.last_deadline_s == 10.0
+    finally:
+        engine.close()
+
+
+def _unicode_error() -> UnicodeDecodeError:
+    return UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+
+@pytest.mark.usefixtures("wechat_inprocess")
+def test_full_frame_fallback_off_skips_the_no_argument_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+    blank_image: PILImage,
+) -> None:
+    """S-100: the switch stops the classical pass. The nets still run."""
+    import cv2
+
+    calls: list[int] = []
+
+    class _Empty:
+        def __init__(self, *args: object) -> None:
+            calls.append(len(args))
+            self._nets = bool(args)
+
+        def detectAndDecode(self, _bgr: Any) -> tuple[list[str], list[Any]]:
+            if not self._nets:
+                raise AssertionError("no-argument constructor must not run")
+            return [], []
+
+    monkeypatch.setattr(cv2.wechat_qrcode, "WeChatQRCode", _Empty)
+    engine = WeChatEngine(full_frame_fallback=False)
+    assert engine.detect_and_decode(blank_image) == ()
+    assert calls == [2]
+    assert repr(engine) == "WeChatEngine(full_frame_fallback=False)"
+
+
+@pytest.mark.usefixtures("wechat_inprocess")
+def test_scanner_records_whether_the_fallback_ran(
+    monkeypatch: pytest.MonkeyPatch,
+    blank_image: PILImage,
+) -> None:
+    """A finished WeChat scan reports the classical pass on Result.extras."""
+    import cv2
+
+    class _Sequence:
+        def __init__(self, *args: object) -> None:
+            self._nets = bool(args)
+
+        def detectAndDecode(self, _bgr: Any) -> tuple[list[str], list[Any]]:
+            if self._nets:
+                return [], []
+            corners = np.array([[1, 1], [30, 1], [30, 30], [1, 30]], np.float32)
+            return ["fallback-payload"], [corners]
+
+    monkeypatch.setattr(cv2.wechat_qrcode, "WeChatQRCode", _Sequence)
+    result = Scanner(engine="wechat").scan(blank_image)
+    assert [d.payload for d in result.detections] == ["fallback-payload"]
+    assert result.extras["wechat_full_frame_fallback"] is True
+
+
+@pytest.mark.usefixtures("wechat_inprocess")
+def test_scanner_option_builds_wechat_without_the_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    blank_image: PILImage,
+) -> None:
+    import cv2
+
+    calls: list[int] = []
+
+    class _Empty:
+        def __init__(self, *args: object) -> None:
+            calls.append(len(args))
+
+        def detectAndDecode(self, _bgr: Any) -> tuple[list[str], list[Any]]:
+            return [], []
+
+    monkeypatch.setattr(cv2.wechat_qrcode, "WeChatQRCode", _Empty)
+    result = Scanner(engine="wechat", full_frame_fallback=False).scan(blank_image)
+    assert result.detections == ()
+    assert result.extras["wechat_full_frame_fallback"] is False
+    assert calls == [2]
+
+
+@pytest.mark.usefixtures("wechat_inprocess")
+def test_scanner_flag_does_not_override_a_supplied_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    blank_image: PILImage,
+) -> None:
+    import cv2
+
+    calls: list[int] = []
+
+    class _Empty:
+        def __init__(self, *args: object) -> None:
+            calls.append(len(args))
+
+        def detectAndDecode(self, _bgr: Any) -> tuple[list[str], list[Any]]:
+            return [], []
+
+    monkeypatch.setattr(cv2.wechat_qrcode, "WeChatQRCode", _Empty)
+    engine = WeChatEngine(full_frame_fallback=False)
+    result = Scanner(engine=engine, full_frame_fallback=True).scan(blank_image)
+    assert result.detections == ()
+    assert result.extras["wechat_full_frame_fallback"] is False
+    assert calls == [2]
+    assert engine.full_frame_fallback is False
+
+
+@pytest.mark.usefixtures("wechat_inprocess")
+def test_scanner_false_flag_does_not_override_a_supplied_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    blank_image: PILImage,
+) -> None:
+    """Fallback-on engine stays on when Scanner asks for the net pass only."""
+    import cv2
+
+    calls: list[int] = []
+
+    class _Sequence:
+        def __init__(self, *args: object) -> None:
+            calls.append(len(args))
+            self._nets = bool(args)
+
+        def detectAndDecode(self, _bgr: Any) -> tuple[list[str], list[Any]]:
+            if self._nets:
+                return [], []
+            corners = np.array([[1, 1], [30, 1], [30, 30], [1, 30]], np.float32)
+            return ["fallback-payload"], [corners]
+
+    monkeypatch.setattr(cv2.wechat_qrcode, "WeChatQRCode", _Sequence)
+    engine = WeChatEngine()
+    result = Scanner(engine=engine, full_frame_fallback=False).scan(blank_image)
+    assert [d.payload for d in result.detections] == ["fallback-payload"]
+    assert result.extras["wechat_full_frame_fallback"] is True
+    assert engine.full_frame_fallback is True
+    assert calls == [2, 0]
+
+
+@pytest.mark.usefixtures("wechat_inprocess")
+def test_supplied_engine_keeps_fallback_off_after_close(
+    monkeypatch: pytest.MonkeyPatch,
+    blank_image: PILImage,
+) -> None:
+    """After close(), the next scan is the same object, still skipping the classical pass."""
+    import cv2
+
+    calls: list[int] = []
+
+    class _NetsOnly:
+        def __init__(self, *args: object) -> None:
+            calls.append(len(args))
+            if not args:
+                raise AssertionError("no-argument constructor must not run")
+
+        def detectAndDecode(self, _bgr: Any) -> tuple[list[str], list[Any]]:
+            return [], []
+
+    monkeypatch.setattr(cv2.wechat_qrcode, "WeChatQRCode", _NetsOnly)
+    engine = WeChatEngine(full_frame_fallback=False)
+    scanner = Scanner(engine=engine)
+    try:
+        first = scanner.scan(blank_image)
+        assert first.extras["wechat_full_frame_fallback"] is False
+        scanner.close()
+        assert scanner._engine is None
+        second = scanner.scan(blank_image)
+        assert second.extras["wechat_full_frame_fallback"] is False
+        assert scanner._engine is engine
+        assert engine.full_frame_fallback is False
+        assert calls == [2, 2]
+    finally:
+        scanner.close()
+
+
+@pytest.mark.usefixtures("wechat_inprocess")
+def test_supplied_engine_keeps_fallback_on_after_close(
+    monkeypatch: pytest.MonkeyPatch,
+    blank_image: PILImage,
+) -> None:
+    """After close(), a default WeChatEngine still runs the classical pass."""
+    import cv2
+
+    calls: list[int] = []
+
+    class _Both:
+        def __init__(self, *args: object) -> None:
+            calls.append(len(args))
+
+        def detectAndDecode(self, _bgr: Any) -> tuple[list[str], list[Any]]:
+            return [], []
+
+    monkeypatch.setattr(cv2.wechat_qrcode, "WeChatQRCode", _Both)
+    engine = WeChatEngine()
+    scanner = Scanner(engine=engine, full_frame_fallback=False)
+    try:
+        first = scanner.scan(blank_image)
+        assert first.extras["wechat_full_frame_fallback"] is True
+        scanner.close()
+        assert scanner._engine is None
+        second = scanner.scan(blank_image)
+        assert second.extras["wechat_full_frame_fallback"] is True
+        assert scanner._engine is engine
+        assert engine.full_frame_fallback is True
+        assert calls == [2, 0, 2, 0]
+    finally:
+        scanner.close()
+
+
+@pytest.mark.usefixtures("wechat_inprocess")
+def test_consensus_wechat_uses_the_scanner_fallback_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    blank_image: PILImage,
+) -> None:
+    """Consensus WeChat is built by Scanner, so the Scanner flag applies."""
+    import cv2
+
+    calls: list[int] = []
+
+    class _NetsOnly:
+        def __init__(self, *args: object) -> None:
+            calls.append(len(args))
+            if not args:
+                raise AssertionError("no-argument constructor must not run")
+
+        def detectAndDecode(self, _bgr: Any) -> tuple[list[str], list[Any]]:
+            return [], []
+
+    monkeypatch.setattr(cv2.wechat_qrcode, "WeChatQRCode", _NetsOnly)
+    with Scanner(engines=("zxing", "wechat"), full_frame_fallback=False) as scanner:
+        result = scanner.scan(blank_image)
+    assert result.extras["wechat_full_frame_fallback"] is False
+    assert calls == [2]
+
+
+@pytest.mark.usefixtures("wechat_inprocess")
+def test_net_hit_records_that_the_fallback_did_not_run(
+    monkeypatch: pytest.MonkeyPatch,
+    blank_image: PILImage,
+) -> None:
+    import cv2
+
+    class _Hit:
+        def __init__(self, *_args: object) -> None:
+            return
+
+        def detectAndDecode(self, _bgr: Any) -> tuple[list[str], list[Any]]:
+            corners = np.array([[1, 1], [30, 1], [30, 30], [1, 30]], np.float32)
+            return ["net-payload"], [corners]
+
+    monkeypatch.setattr(cv2.wechat_qrcode, "WeChatQRCode", _Hit)
+    result = Scanner(engine="wechat").scan(blank_image)
+    assert [d.payload for d in result.detections] == ["net-payload"]
+    assert result.extras["wechat_full_frame_fallback"] is False
+
+
+@pytest.mark.usefixtures("wechat_inprocess")
+def test_unicode_decode_error_is_no_read_and_one_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    blank_image: PILImage,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The binding's UnicodeDecodeError must not leave a single-engine scan."""
+    import cv2
+
+    calls: list[int] = []
+
+    class _BadText:
+        def __init__(self, *args: object) -> None:
+            calls.append(len(args))
+
+        def detectAndDecode(self, _bgr: Any) -> tuple[list[str], list[Any]]:
+            raise _unicode_error()
+
+    monkeypatch.setattr(cv2.wechat_qrcode, "WeChatQRCode", _BadText)
+    engine = WeChatEngine()
+    with caplog.at_level(logging.WARNING, logger="arbez.engines.wechat"):
+        assert engine.detect_and_decode(blank_image) == ()
+        result = Scanner(engine=engine).scan(blank_image)
+    assert result.detections == ()
+    assert result.extras["wechat_full_frame_fallback"] is False
+    warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warns) == 2
+    assert all("UnicodeDecodeError" in r.getMessage() for r in warns)
+    assert all("no read" in r.getMessage() for r in warns)
+    # The net pass raised. The classical constructor was not built.
+    assert calls == [2]
+
+
+@pytest.mark.usefixtures("wechat_inprocess")
+def test_unicode_decode_error_on_the_fallback_is_still_no_read(
+    monkeypatch: pytest.MonkeyPatch,
+    blank_image: PILImage,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import cv2
+
+    class _FallbackBad:
+        def __init__(self, *args: object) -> None:
+            self._nets = bool(args)
+
+        def detectAndDecode(self, _bgr: Any) -> tuple[list[str], list[Any]]:
+            if self._nets:
+                return [], []
+            raise _unicode_error()
+
+    monkeypatch.setattr(cv2.wechat_qrcode, "WeChatQRCode", _FallbackBad)
+    with caplog.at_level(logging.WARNING, logger="arbez.engines.wechat"):
+        result = Scanner(engine="wechat").scan(blank_image)
+    assert result.detections == ()
+    assert result.extras["wechat_full_frame_fallback"] is True
+    warns = [r for r in caplog.records if "UnicodeDecodeError" in r.getMessage()]
+    assert len(warns) == 1
+
+
+def test_full_frame_fallback_rejects_non_bool() -> None:
+    with pytest.raises(TypeError, match="full_frame_fallback"):
+        WeChatEngine(full_frame_fallback=0)  # type: ignore[arg-type]
+
+
+def test_clean_tiny_qr_is_missed_when_the_fallback_is_off() -> None:
+    """S-100: this canvas is the measured full-frame hit. Nets alone miss it."""
+    code = _qr_array(_RECALL_PAYLOAD, box_size=2)
+    canvas = np.full((1600, 1600, 3), 255, np.uint8)
+    canvas[533:587, 533:587] = code
+    engine = WeChatEngine(full_frame_fallback=False)
+    try:
+        assert engine.detect_and_decode(Image.fromarray(canvas, "RGB")) == ()
     finally:
         engine.close()
 

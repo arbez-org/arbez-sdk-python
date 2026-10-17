@@ -159,6 +159,20 @@ seconds, so a direct call can come back empty on a frame that
 `Scanner` still reads. Scan with `Scanner` before treating the image
 as unreadable.
 
+`extras["wechat_full_frame_fallback"]` is `true` when that classical
+pass ran and `false` when a finished WeChat call did not run it. Turn
+it off with `Scanner(full_frame_fallback=False)` or
+`WeChatEngine(full_frame_fallback=False)`. The default stays on.
+Passing an already-built `WeChatEngine` keeps that object's own flag.
+
+A QR payload that is not UTF-8 makes OpenCV's binding raise
+`UnicodeDecodeError`. WeChat catches that, logs one warning, and
+returns no detection. `Scanner(engine="wechat")` does not raise.
+
+OpenCV 4 installs lose the WeChat engine. `WeChatEngine()` raises
+`EngineUnavailable`. Install `[wechat]` (`opencv-contrib-python` 5 and
+numpy >= 2) instead of plain `opencv-python` or an OpenCV 4 wheel.
+
 `extras["isolation_reason"]` is set when the engine had to run in the
 calling process. That happens for `ARBEZ_ISOLATION=off`, a daemonic
 caller, Linux with no writable `/dev/shm`, or a program started
