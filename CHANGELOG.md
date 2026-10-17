@@ -63,6 +63,26 @@ the explicit maintainer act of tagging is the gate.
   `if __name__ == "__main__"` guard runs the engine in-process. That
   choice is logged once.
 
+### Security
+
+* **Decompression-bomb pixel limit (S-101).** `coerce_to_pil` rejects
+  an image whose width times height is above 89,478,485 pixels
+  (Pillow's default `Image.MAX_IMAGE_PIXELS`). The error is
+  `InvalidInputError` and names the size and the limit. The check uses
+  the container header, before the pixels are decoded, and it still
+  applies when `Image.MAX_IMAGE_PIXELS` is `None`. Pillow itself only
+  raises above twice that limit. An oversize array shape is rejected
+  the same way.
+
+### Deprecated
+
+* **`Scanner.scan(..., preprocess="auto")` (S-101).** Emits
+  `DeprecationWarning` and behaves as `"off"`. The long-axis downscale
+  and autocontrast are not applied, and `timings_ms` no longer gains a
+  `"preprocess"` key. Removed in 0.4.0. Omit the argument, or pass
+  `"off"`. Callers who wanted the downscale should resize before
+  `scan`.
+
 ### Changed
 
 * **QR defaults are Model 2, and symbology allow-lists apply after consensus (S-099).**
@@ -91,6 +111,23 @@ the explicit maintainer act of tagging is the gate.
   1.95 s). A direct `WeChatEngine.detect_and_decode` that exceeds 2 s
   comes back empty and sets `engine_faults` when a `Scanner` bound the
   call. Scan through `Scanner` when that frame matters.
+
+* **EXIF orientation is applied on load (S-101).** `coerce_to_pil`
+  transposes orientations 2–8 and clears the tag, so a second coerce
+  does not rotate again. `Result.image_size` and detection coordinates
+  are that oriented frame. A missing tag, or orientation 1, is
+  unchanged, including the no-copy path for an RGB PIL image.
+
+* **Per-stage and per-engine timings (S-101).** `Result.timings_ms`
+  now includes `"coerce"` on every scan and `"engine.<name>"` for each
+  engine that ran. `"engine"` (single-engine total) and `"consensus"`
+  (multi-engine wall clock) are unchanged. On the parallel path each
+  `"engine.<name>"` is that engine's own time, not a slice of
+  `"consensus"`.
+
+* **`Result.extras["stage_hit"]` (S-101).** Tuple of engine names that
+  returned a decoded payload, in engine-set order, or `()` when
+  nothing decoded. `extras` is read-only, same as `timings_ms`.
 
 * **WeChatEngine loads the vendored WeChat QR nets (S-096).**
   `detect.onnx` and `sr.onnx` ship in the package and are passed to

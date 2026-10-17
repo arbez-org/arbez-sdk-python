@@ -365,3 +365,192 @@ def test_scanner_scan_accepts_bytesio(qr_payload: str) -> None:
     result = scanner.scan(buf)  # file-like
     assert len(result.detections) == 1
     assert result.detections[0].payload == qr_payload
+
+
+# ── S-101: EXIF orientation + decompression-bomb pixel limit ─────────────
+
+# EXIF Orientation tag. Integer, not PIL.ExifTags.Base, so the fixture
+# does not depend on that enum existing.
+_EXIF_ORIENTATION = 274
+
+
+def _png_with_orientation(orientation: int) -> bytes:
+    """Asymmetric PNG whose EXIF tag says how to display it.
+
+    Pixels stay as drawn. The tag is the only thing that distinguishes
+    stored order from visual order.
+    """
+    img = Image.new("RGB", (40, 20), "white")
+    img.putpixel((0, 0), (255, 0, 0))
+    img.putpixel((39, 0), (0, 255, 0))
+    img.putpixel((0, 19), (0, 0, 255))
+    exif = img.getexif()
+    exif[_EXIF_ORIENTATION] = orientation
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", exif=exif)
+    return buf.getvalue()
+
+
+def _reference_oriented(raw: bytes) -> PILImage:
+    """What ``coerce_to_pil`` must return: EXIF applied, then RGB."""
+    from PIL import ImageOps
+
+    with Image.open(io.BytesIO(raw)) as src:
+        transposed = ImageOps.exif_transpose(src)
+        assert transposed is not None
+        return transposed.convert("RGB")
+
+
+@pytest.mark.parametrize("orientation", [2, 3, 6, 8])
+def test_coerce_to_pil_applies_exif_orientation(orientation: int) -> None:
+    """Stored pixels are transposed to the EXIF display orientation.
+
+    Orientation 6 and 8 swap the axes. 2 and 3 keep the size and change
+    pixels. A second coerce must not rotate again.
+    """
+    raw = _png_with_orientation(orientation)
+    with Image.open(io.BytesIO(raw)) as src:
+        assert src.getexif().get(_EXIF_ORIENTATION) == orientation
+        stored_size = src.size
+    out = coerce_to_pil(raw)
+    ref = _reference_oriented(raw)
+    assert out.mode == "RGB"
+    assert out.size == ref.size
+    assert out.tobytes() == ref.tobytes()
+    if orientation in (6, 8):
+        assert out.size != stored_size
+    again = coerce_to_pil(out)
+    assert again is out
+
+
+@pytest.mark.parametrize("kind", ["bytes", "path", "file"])
+def test_coerce_to_pil_applies_exif_from_every_loader(
+    kind: str, tmp_path: Path
+) -> None:
+    """Path, bytes, and file-like loads all apply the orientation tag."""
+    raw = _png_with_orientation(6)
+    if kind == "bytes":
+        source: object = raw
+    elif kind == "path":
+        path = tmp_path / "oriented.png"
+        path.write_bytes(raw)
+        source = path
+    else:
+        source = io.BytesIO(raw)
+    out = coerce_to_pil(source)  # type: ignore[arg-type]
+    assert out.size == (20, 40)
+
+
+def test_coerce_to_pil_applies_exif_on_open_pil_without_mutating_it() -> None:
+    """An already-open PIL image is oriented too, and the caller's image is not."""
+    raw = _png_with_orientation(6)
+    with Image.open(io.BytesIO(raw)) as src:
+        src.load()
+        out = coerce_to_pil(src)
+        assert src.size == (40, 20)
+    assert out.size == (20, 40)
+    assert out is not src
+
+
+def test_scanner_scan_reports_exif_oriented_size_and_decodes(qr_payload: str) -> None:
+    """A sideways-stored QR with an EXIF tag scans in the upright frame.
+
+    The code sits on a wide canvas so orientation 6 changes ``image_size``.
+    A square symbol would hide a missed transpose.
+    """
+    import qrcode
+
+    from arbez import Scanner
+
+    qr = qrcode.QRCode(version=2, box_size=10, border=4)
+    qr.add_data(qr_payload)
+    qr.make(fit=True)
+    upright = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    canvas = Image.new("RGB", (upright.width + 80, upright.height), "white")
+    canvas.paste(upright, (0, 0))
+    # ROTATE_90 is 90 CCW. EXIF 6 asks for 90 CW, which restores this.
+    stored = canvas.transpose(Image.Transpose.ROTATE_90)
+    exif = stored.getexif()
+    exif[_EXIF_ORIENTATION] = 6
+    buf = io.BytesIO()
+    stored.save(buf, format="PNG", exif=exif)
+    raw = buf.getvalue()
+
+    result = Scanner(engine="zxing").scan(raw)
+    assert result.image_size == canvas.size
+    assert result.image_size != stored.size
+    assert len(result.detections) == 1
+    assert result.detections[0].payload == qr_payload
+
+
+def _ppm(width: int, height: int, *, pixels: bytes = b"") -> bytes:
+    """PPM header plus optional payload. No file is committed."""
+    return f"P6\n{width} {height}\n255\n".encode("ascii") + pixels
+
+
+def test_coerce_to_pil_accepts_small_ppm() -> None:
+    """A PPM under the pixel limit still decodes. The bomb tests use the same format."""
+    raw = _ppm(2, 2, pixels=bytes([255, 0, 0]) * 4)
+    out = coerce_to_pil(raw)
+    assert out.mode == "RGB"
+    assert out.size == (2, 2)
+    assert out.getpixel((0, 0)) == (255, 0, 0)
+
+
+def test_coerce_to_pil_rejects_pixels_over_the_bomb_limit() -> None:
+    """Just over ``MAX_IMAGE_PIXELS`` is an error, before the pixels are decoded.
+
+    Pillow only warns in this band (it raises above twice the limit). The
+    header declares the size and the payload is omitted, so a check that
+    waits for decode will try to allocate the image.
+    """
+    from arbez.engines.helpers import MAX_IMAGE_PIXELS
+
+    width = MAX_IMAGE_PIXELS + 1
+    height = 1
+    raw = _ppm(width, height)
+    with pytest.raises(InvalidInputError, match="decompression-bomb limit of") as exc_info:
+        coerce_to_pil(raw)
+    message = str(exc_info.value)
+    assert f"{width}x{height}" in message
+    assert str(MAX_IMAGE_PIXELS) in message
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.parametrize("kind", ["bytes", "path", "file"])
+def test_coerce_to_pil_wraps_pillow_decompression_bomb(
+    kind: str, tmp_path: Path
+) -> None:
+    """Above Pillow's hard ceiling the raw ``DecompressionBombError`` stays inside."""
+    from arbez.engines.helpers import MAX_IMAGE_PIXELS
+
+    raw = _ppm(1, MAX_IMAGE_PIXELS * 2 + 1)
+    if kind == "bytes":
+        source: object = raw
+    elif kind == "path":
+        path = tmp_path / "bomb.ppm"
+        path.write_bytes(raw)
+        source = path
+    else:
+        source = io.BytesIO(raw)
+    with pytest.raises(InvalidInputError, match="decompression-bomb limit of") as exc_info:
+        coerce_to_pil(source)  # type: ignore[arg-type]
+    assert type(exc_info.value).__name__ == "InvalidInputError"
+    cause = exc_info.value.__cause__
+    assert cause is not None
+    assert type(cause).__name__ == "DecompressionBombError"
+
+
+def test_coerce_to_pil_rejects_oversize_array_shape() -> None:
+    """A numpy-like shape over the limit is rejected before ``fromarray`` copies it."""
+    from arbez.engines.helpers import MAX_IMAGE_PIXELS
+
+    class _ShapeOnly:
+        def __init__(self, shape: tuple[int, ...]) -> None:
+            self.shape = shape
+
+    # ndarray shape is (height, width, channels). The message quotes width x height.
+    fake = _ShapeOnly((1, MAX_IMAGE_PIXELS + 1, 3))
+    with pytest.raises(InvalidInputError, match="decompression-bomb limit of") as exc_info:
+        coerce_to_pil(fake)  # type: ignore[arg-type]
+    assert f"{MAX_IMAGE_PIXELS + 1}x1" in str(exc_info.value)

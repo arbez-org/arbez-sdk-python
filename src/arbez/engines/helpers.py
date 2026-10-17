@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import warnings
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
@@ -23,6 +24,17 @@ if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
 
 _log = logging.getLogger(__name__)
+
+# Pillow's ``Image.MAX_IMAGE_PIXELS`` default: about a gigabyte of
+# 24-bit pixels. Inlined on purpose (S-101). Writing ``None`` to that
+# global turns Pillow's check off, and Pillow only *raises* above
+# twice this value (it warns above the value itself). The guard below
+# raises above this value, on the header, before pixels are decoded.
+MAX_IMAGE_PIXELS: int = 1024 * 1024 * 1024 // 4 // 3
+
+# TIFF/EXIF Orientation. Not ``PIL.ExifTags.Base``: the tag number is
+# the stable contract, and the enum is only a convenience.
+_EXIF_ORIENTATION_TAG = 274
 
 
 # Candidate allow-list of Pillow format names arbez accepts as input.
@@ -188,6 +200,88 @@ def _reject_zero_dims(image: PILImage) -> PILImage:
     return image
 
 
+def _reject_too_many_pixels(width: int, height: int, *, where: str) -> None:
+    """Raise when ``width * height`` is over the decompression-bomb limit.
+
+    Zero axes are left to :func:`_reject_zero_dims`. A dimension that is
+    not positive is not a bomb.
+    """
+    if width < 1 or height < 1:
+        return
+    pixels = width * height
+    if pixels > MAX_IMAGE_PIXELS:
+        raise InvalidInputError(
+            f"{where} is {width}x{height} ({pixels} pixels), which exceeds "
+            f"the decompression-bomb limit of {MAX_IMAGE_PIXELS} pixels"
+        )
+
+
+def _reject_array_too_many_pixels(image: object) -> None:
+    """Reject a numpy-like ``shape`` before ``Image.fromarray`` copies it.
+
+    Shape is ``(height, width, ...)``. Objects without a tuple shape
+    fall through to the existing fromarray error path.
+    """
+    shape = getattr(image, "shape", None)
+    if not isinstance(shape, tuple) or len(shape) < 2:
+        return
+    try:
+        height = int(shape[0])
+        width = int(shape[1])
+    except (TypeError, ValueError):
+        return
+    _reject_too_many_pixels(width, height, where=f"{type(image).__name__} array")
+
+
+def _apply_exif_orientation(image: PILImage) -> PILImage:
+    """Return ``image`` transposed to its EXIF display orientation.
+
+    No copy when the orientation tag is missing or 1, and the caller's
+    image is not mutated. Orientations 2 through 8 are the ones Pillow
+    knows how to apply. A tag that cannot be read is left as stored:
+    rejecting the scan would drop photos whose pixels still decode.
+    ``ImageOps.exif_transpose`` clears the tag, so a second call does
+    not rotate again.
+    """
+    from PIL import ImageOps
+
+    try:
+        raw = image.getexif().get(_EXIF_ORIENTATION_TAG, 1)
+        orientation = 1 if raw is None else int(raw)
+    except (OSError, ValueError, TypeError, KeyError):
+        _log.debug("exif orientation unreadable; leaving pixels as stored", exc_info=True)
+        return image
+    if orientation not in range(2, 9):
+        return image
+    try:
+        transposed = ImageOps.exif_transpose(image)
+    except (OSError, ValueError, TypeError, KeyError):
+        _log.debug("exif transpose failed; leaving pixels as stored", exc_info=True)
+        return image
+    if transposed is None:
+        return image
+    return transposed
+
+
+def _open_rgb(source: Any, *, where: str) -> PILImage:
+    """Decode ``source`` to RGB, applying the pixel limit and EXIF first.
+
+    Pillow warns (and does not raise) for sizes between
+    ``MAX_IMAGE_PIXELS`` and twice that. That warning is swallowed
+    here because this function raises ``InvalidInputError`` for the
+    same images, before ``convert`` allocates the pixel buffer.
+    ``convert`` runs inside the ``with`` so a lazy image is loaded
+    before the file handle closes.
+    """
+    from PIL import Image as _Image
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=_Image.DecompressionBombWarning)
+        with _Image.open(source, formats=_supported_input_formats()) as src:
+            _reject_too_many_pixels(src.width, src.height, where=where)
+            return _apply_exif_orientation(src).convert("RGB")
+
+
 def coerce_to_pil(
     image: PILImage | npt.NDArray[Any] | str | Path | bytes | bytearray | IO[bytes],
 ) -> PILImage:
@@ -225,9 +319,19 @@ def coerce_to_pil(
     / numpy ``AttributeError``. The original error chains via ``__cause__``.
     Pillow's ``DecompressionBombError`` (a direct ``Exception`` subclass,
     NOT ``OSError``) is wrapped the same way on every decode branch.
-    Images with a zero-pixel dimension are rejected with
+    Images whose pixel count is above :data:`MAX_IMAGE_PIXELS` (Pillow's
+    default ``Image.MAX_IMAGE_PIXELS``, S-101) raise ``InvalidInputError``
+    from the header, before the pixel buffer is allocated. That limit
+    still applies when the process has set ``Image.MAX_IMAGE_PIXELS``
+    to ``None``. Images with a zero-pixel dimension are rejected with
     ``InvalidInputError`` after coercion — see :func:`_reject_zero_dims`
     for why letting them through is engine-crashing.
+
+    EXIF orientation (S-101) is applied on this path, for files and for
+    an already-open PIL image. The result is the display orientation.
+    ``Result.image_size`` and detection coordinates use that frame.
+    A missing tag, or orientation 1, does not copy. The tag is cleared
+    so a second ``coerce_to_pil`` does not rotate again.
 
     Branch order: PIL duck-type FIRST because the common case is
     "Scanner already coerced; engine re-coerces defensively". Hot path
@@ -259,8 +363,12 @@ def coerce_to_pil(
     # InvalidInputError messages. An RGB PIL.Image returns AS-IS
     # without a copy.
     if isinstance(image, _Image.Image):
+        # Outside the try: InvalidInputError is a ValueError, and the
+        # handler below would re-wrap it with a misleading message.
+        _reject_too_many_pixels(image.width, image.height, where="PIL image")
         try:
-            coerced = image if image.mode == "RGB" else image.convert("RGB")
+            oriented = _apply_exif_orientation(image)
+            coerced = oriented if oriented.mode == "RGB" else oriented.convert("RGB")
         except (ValueError, OSError) as e:
             # Defensive: a PIL image that fails mode access / convert()
             # — e.g. a closed file handle, a torn-down lazy image —
@@ -279,22 +387,22 @@ def coerce_to_pil(
         # S-049: ``formats=`` restricts which Pillow decoders are
         # attempted — exotic formats (PSD, FITS, ...) are not tried.
         try:
-            with _Image.open(image, formats=_supported_input_formats()) as src:
-                coerced = src.convert("RGB")
+            coerced = _open_rgb(image, where=f"Image at {str(image)!r}")
         except (FileNotFoundError, IsADirectoryError, PermissionError) as e:
             raise InvalidInputError(
                 f"Cannot read image at {str(image)!r}: {type(e).__name__}: {e}"
             ) from e
+        except InvalidInputError:
+            raise
         except _Image.DecompressionBombError as e:
             # Pillow's decompression-bomb guard raises a direct
             # Exception subclass — NOT OSError — in Pillow 12, so the
-            # clause below doesn't catch it. Without this clause a
-            # crafted huge-pixel-count file leaks a raw
-            # DecompressionBombError through the InvalidInputError
-            # envelope.
+            # clause below doesn't catch it. It only fires above twice
+            # MAX_IMAGE_PIXELS. Sizes between the limit and that ceiling
+            # are rejected in ``_open_rgb`` before this clause.
             raise InvalidInputError(
-                f"Image at {str(image)!r} exceeds Pillow's "
-                f"decompression-bomb safety limit: {e}"
+                f"Image at {str(image)!r} exceeds the decompression-bomb "
+                f"limit of {MAX_IMAGE_PIXELS} pixels: {e}"
             ) from e
         except (UnidentifiedImageError, OSError) as e:
             # PIL can't decode the file — corrupt, wrong format, zero
@@ -312,16 +420,19 @@ def coerce_to_pil(
         import io as _io
 
         try:
-            with _Image.open(
-                _io.BytesIO(bytes(image)), formats=_supported_input_formats()
-            ) as src:
-                coerced = src.convert("RGB")
+            coerced = _open_rgb(
+                _io.BytesIO(bytes(image)),
+                where=f"{len(image)}-byte image buffer",
+            )
+        except InvalidInputError:
+            raise
         except _Image.DecompressionBombError as e:
             # Direct Exception subclass in Pillow 12 — not caught by
             # the OSError/ValueError clause below. See the path branch.
             raise InvalidInputError(
                 f"Cannot decode {len(image)}-byte buffer as an image: "
-                f"exceeds Pillow's decompression-bomb safety limit: {e}"
+                f"exceeds the decompression-bomb limit of "
+                f"{MAX_IMAGE_PIXELS} pixels: {e}"
             ) from e
         except (UnidentifiedImageError, OSError, ValueError) as e:
             raise InvalidInputError(
@@ -339,20 +450,21 @@ def coerce_to_pil(
         try:
             # S-049 / S-052: formats= allow-list (dynamic; see
             # _supported_input_formats above). ``image`` is duck-typed
-            # (read+seek); narrowed type union still includes ``ndarray``
-            # from the function signature, so mypy rejects it on the
-            # literal Image.open call line.
-            with _Image.open(
-                image,  # type: ignore[arg-type]
-                formats=_supported_input_formats(),
-            ) as src:
-                coerced = src.convert("RGB")
+            # (read+seek); the narrowed union still includes ``ndarray``,
+            # so the open helper takes ``Any``.
+            coerced = _open_rgb(
+                image,
+                where=f"file-like {type(image).__name__}",
+            )
+        except InvalidInputError:
+            raise
         except _Image.DecompressionBombError as e:
             # Direct Exception subclass in Pillow 12 — not caught by
             # the OSError/ValueError clause below. See the path branch.
             raise InvalidInputError(
                 f"Cannot decode file-like ({type(image).__name__}) as an image: "
-                f"exceeds Pillow's decompression-bomb safety limit: {e}"
+                f"exceeds the decompression-bomb limit of "
+                f"{MAX_IMAGE_PIXELS} pixels: {e}"
             ) from e
         except (UnidentifiedImageError, OSError, ValueError) as e:
             raise InvalidInputError(
@@ -364,7 +476,9 @@ def coerce_to_pil(
     # Last branch: assume numpy-like. ``Image.fromarray`` accepts any
     # object with ``__array_interface__`` — anything else (None, int,
     # a list) raises ``AttributeError`` / ``TypeError`` / ``ValueError``
-    # from PIL or numpy.
+    # from PIL or numpy. Reject a huge shape first so fromarray does
+    # not copy a bomb that never went through Pillow's header check.
+    _reject_array_too_many_pixels(image)
     try:
         coerced = _Image.fromarray(image).convert("RGB")
     except (AttributeError, TypeError, ValueError) as e:

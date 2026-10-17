@@ -51,6 +51,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import warnings
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -83,15 +84,13 @@ from arbez.engines.helpers import coerce_to_pil
 from arbez.exceptions import EngineRuntimeError, EngineUnavailable
 from arbez.types import Detection, Result, Symbology
 
-# S-022: preprocess modes. Locked in v0.0.8 (additive; new modes may
-# be added in future releases, existing values stay valid).
+# S-022 added "auto". S-101 deprecates it: ``scan()`` warns and treats
+# it as "off". The literal stays until removal in 0.4.0 so existing
+# callers still type-check.
 PreprocessMode = Literal["off", "auto"]
 
-# Default downscale target — long-axis pixel cap when ``preprocess="auto"``.
-# 2000 px is the empirical sweet spot for ZXing / Apple Vision / WeChat:
-# bigger inputs waste CPU on detail the detectors don't use, smaller can
-# lose barcode legibility on busy scenes. Users who need a different
-# target can pre-scale themselves before calling scan().
+# Long-axis cap of the retired ``preprocess="auto"`` downscale.
+# ``_auto_preprocess`` still uses it; ``scan()`` does not (S-101).
 _PREPROCESS_MAX_LONG_AXIS_PX = 2000
 
 if TYPE_CHECKING:
@@ -314,7 +313,11 @@ def _per_scan_image(pil_image: PILImage) -> PILImage:
 
 
 def _auto_preprocess(pil_image: PILImage) -> tuple[PILImage, float, float]:
-    """``preprocess="auto"`` implementation.
+    """Retired ``preprocess="auto"`` downscale + autocontrast.
+
+    ``Scanner.scan`` no longer calls this (S-101): ``"auto"`` warns and
+    behaves as ``"off"``. The helper stays until the parameter is
+    removed in 0.4.0 so the rescale contract remains tested.
 
     Two transformations, applied in order:
 
@@ -409,6 +412,59 @@ def _rescale_detection(
         new_polygon = tuple((x * inv_scale_x, y * inv_scale_y) for x, y in detection.polygon)
 
     return replace(detection, bbox_xyxy=new_bbox, polygon=new_polygon)
+
+
+class _TimedEngine:
+    """Record one engine's ``detect_and_decode`` wall time.
+
+    The multi-engine vote runs engines on worker threads and does not
+    return their individual times. Wrapping for that one call records
+    them without changing the vote. Each engine writes its own key;
+    the lock is only there so those writes do not race.
+    """
+
+    def __init__(
+        self,
+        inner: Engine,
+        sink: dict[str, float],
+        key: str,
+        lock: threading.Lock,
+    ) -> None:
+        self._inner = inner
+        self._sink = sink
+        self._key = key
+        self._lock = lock
+
+    def detect_and_decode(
+        self,
+        image: (PILImage | npt.NDArray[Any] | str | Path | bytes | bytearray | IO[bytes]),
+    ) -> tuple[Detection, ...]:
+        """Call the wrapped engine and store elapsed milliseconds."""
+        t0 = time.perf_counter()
+        try:
+            return self._inner.detect_and_decode(image)
+        finally:
+            elapsed_ms = (time.perf_counter() - t0) * 1_000.0
+            with self._lock:
+                self._sink[self._key] = elapsed_ms
+
+
+def _stage_hit(
+    per_engine: dict[str, tuple[Detection, ...]],
+    order: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Engine names in ``order`` that returned a decoded payload.
+
+    The parallel vote records per-engine results in completion order,
+    which is not stable across runs. ``order`` is the Scanner's engine
+    set, which is.
+    """
+    hits: list[str] = []
+    for name in order:
+        detections = per_engine.get(name, ())
+        if any(detection.payload is not None for detection in detections):
+            hits.append(name)
+    return tuple(hits)
 
 
 # ── Scanner ────────────────────────────────────────────────────────────────
@@ -754,34 +810,21 @@ class Scanner:
         * File-like binary stream — anything with ``.read()`` +
           ``.seek()`` (open file handle, ``io.BytesIO``, etc.)
 
-        ``preprocess`` (S-022, locked in v0.0.8) controls image
-        manipulation before the engine sees it:
+        ``preprocess`` (S-022, S-101):
 
-        * ``"off"`` (default, **recommended**) — pass the coerced PIL
-          image straight to the engine. No-op; preserves the
-          pre-v0.0.8 behavior. Per the v0.0.33 full-corpus benchmark
-          (S-053), ``"off"`` produces a higher decode rate than
-          ``"auto"`` on every built-in engine (delta range +0.1 to
-          +1.9 percentage points across a 4276-image corpus).
-        * ``"auto"`` — downscale the long axis to 2000 px max
-          (LANCZOS resampling, preserves aspect ratio) + apply
-          ``PIL.ImageOps.autocontrast`` (stretches histogram to use
-          the full 0-255 range). Originally intended to help
-          oversized phone-camera photos and low-contrast scans;
-          empirically (S-053) the aggregate decode rate is slightly
-          lower than ``"off"``. Available for callers who need the
-          downscale (memory pressure on huge inputs) or the
-          autocontrast effect — benchmark your specific corpus
-          before turning it on. Detection coordinates are
-          **rescaled back to the ORIGINAL image dimensions** before
-          returning — callers see bboxes in the unmodified coordinate
-          system.
+        * ``"off"`` (default) — pass the coerced PIL image straight
+          to the engine.
+        * ``"auto"`` — **deprecated**, removed in 0.4.0. Emits
+          ``DeprecationWarning`` and behaves as ``"off"``. The old
+          downscale + autocontrast path is not applied. S-053 measured
+          it as a decode regression on every built-in engine.
 
         Returns a :class:`~arbez.Result` with detections sorted by
-        descending score, the **original** input image size (for
-        client overlay code), and per-stage wall-clock timings in
-        ``timings_ms``. When ``preprocess != "off"``, ``timings_ms``
-        includes a ``"preprocess"`` key. ``extras`` records engine
+        descending score, the input image size after EXIF orientation
+        (S-101; that is the frame the engine saw), per-stage timings
+        in ``timings_ms`` (``"coerce"``, ``"engine"`` or
+        ``"consensus"``, and ``"engine.<name>"``), and
+        ``extras["stage_hit"]``. ``extras`` also records engine
         isolation (S-097): whether a native engine ran in a worker,
         and any crash or deadline that was contained.
         """
@@ -790,19 +833,19 @@ class Scanner:
         # near-duplicate ``_to_pil`` that dropped numpy support; we now
         # share the canonical implementation so accepting-input contracts
         # can't drift between Scanner and engines.
+        t_coerce = time.perf_counter()
         pil_image = coerce_to_pil(image)
-        original_size = pil_image.size  # (W, H) — the size we report
+        coerce_ms = (time.perf_counter() - t_coerce) * 1_000.0
+        original_size = pil_image.size  # (W, H) after EXIF orientation
 
-        # S-022: preprocessing. ``"off"`` is the default + identity;
-        # ``"auto"`` downscales + autocontrasts and tracks the inverse
-        # scale factor so we can rescale detection bboxes back to the
-        # original image coordinates before returning.
-        scale_inv_x, scale_inv_y = 1.0, 1.0
-        preprocess_ms = 0.0
+        # S-101: "auto" is an alias of "off" until 0.4.0. Warn on every
+        # call. The warnings filter may display it once per call site.
         if preprocess == "auto":
-            t0 = time.perf_counter()
-            pil_image, scale_inv_x, scale_inv_y = _auto_preprocess(pil_image)
-            preprocess_ms = (time.perf_counter() - t0) * 1_000.0
+            warnings.warn(
+                "preprocess='auto' is deprecated and behaves as 'off'; it will be removed in 0.4.0",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         elif preprocess != "off":
             raise ValueError(f"preprocess must be 'off' or 'auto'; got {preprocess!r}")
 
@@ -818,10 +861,7 @@ class Scanner:
             return self._scan_with_diagnostics(
                 pil_image,
                 original_size,
-                scale_inv_x,
-                scale_inv_y,
-                preprocess,
-                preprocess_ms,
+                coerce_ms,
                 diag,
             )
         finally:
@@ -831,23 +871,30 @@ class Scanner:
         self,
         pil_image: PILImage,
         original_size: tuple[int, int],
-        scale_inv_x: float,
-        scale_inv_y: float,
-        preprocess: PreprocessMode,
-        preprocess_ms: float,
+        coerce_ms: float,
         diag: ScanDiagnostics,
     ) -> Result:
         # Branch on consensus mode (S-032). The off-path runs a single
         # engine; the vote-path dispatches all engines in parallel and
-        # votes on the merged result.
+        # votes on the merged result. Per-engine times are recorded by
+        # ``_TimedEngine`` because the vote does not return them (S-101).
         t0 = time.perf_counter()
         per_engine: dict[str, tuple[Detection, ...]]
+        per_engine_ms: dict[str, float] = {}
         if self._is_consensus:
             from arbez.consensus import run_consensus_detailed
 
+            engines = self._get_consensus_engines()
+            lock = threading.Lock()
+            # dict is invariant, so the wrapper has to be typed as Engine
+            # at the boundary the vote expects.
+            timed: dict[str, Engine] = {
+                name: _TimedEngine(eng, per_engine_ms, f"engine.{name}", lock)
+                for name, eng in engines.items()
+            }
             cr = run_consensus_detailed(
                 pil_image,
-                self._get_consensus_engines(),
+                timed,
                 min_votes=self._consensus_min_votes,
                 iou_threshold=self._consensus_iou_threshold,
                 symbologies=self._symbology_allow,
@@ -857,10 +904,15 @@ class Scanner:
             # and a second pass would revive the T4 mis-keep (S-099).
             detections = cr.detections
             per_engine = dict(cr.per_engine)
-            timing_label = "consensus"
+            order = self._engines if self._engines is not None else tuple(engines)
+            timings: dict[str, float] = {
+                "coerce": coerce_ms,
+                "consensus": (time.perf_counter() - t0) * 1_000.0,
+            }
         else:
             engine = self._get_engine()
             detections = engine.detect_and_decode(pil_image)
+            engine_ms = (time.perf_counter() - t0) * 1_000.0
             # Single-engine detections are already decoder-authoritative
             # (S-094 for arbez; native for the others), so the allow-list
             # can use Detection.symbology directly. A prebuilt engine is
@@ -870,31 +922,28 @@ class Scanner:
             # Single engine: the per_engine breakdown is just that engine's
             # own detections under its name (S-093).
             per_engine = {self._engine_name: detections}
-            timing_label = "engine"
-        engine_ms = (time.perf_counter() - t0) * 1_000.0
-
-        # Rescale detections back to original-image coordinates if
-        # preprocessing downscaled. Skipped when no scale was applied
-        # (the common case — either preprocess=off OR a small input
-        # that didn't hit the long-axis cap).
-        if scale_inv_x != 1.0 or scale_inv_y != 1.0:
-            detections = tuple(_rescale_detection(d, scale_inv_x, scale_inv_y) for d in detections)
-            # Rescale the per-engine breakdown to the same original coords.
-            per_engine = {
-                name: tuple(_rescale_detection(d, scale_inv_x, scale_inv_y) for d in dets)
-                for name, dets in per_engine.items()
+            order = (self._engine_name,)
+            timings = {
+                "coerce": coerce_ms,
+                "engine": engine_ms,
             }
+            per_engine_ms[f"engine.{self._engine_name}"] = engine_ms
 
-        timings: dict[str, float] = {timing_label: engine_ms}
-        if preprocess != "off":
-            timings["preprocess"] = preprocess_ms
+        # Stable key order: the engine set, not whichever thread finished
+        # first. A missing key means that engine did not run.
+        for name in order:
+            key = f"engine.{name}"
+            if key in per_engine_ms:
+                timings[key] = per_engine_ms[key]
 
+        extras = diag.to_extras()
+        extras["stage_hit"] = _stage_hit(per_engine, order)
         return Result(
             detections=detections,
             image_size=original_size,
             per_engine=per_engine,
             timings_ms=timings,
-            extras=diag.to_extras(),
+            extras=extras,
         )
 
     def warmup(self) -> None:

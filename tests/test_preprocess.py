@@ -1,16 +1,16 @@
-"""Tests for S-022 preprocessing API.
+"""Tests for S-022 preprocessing and the S-101 retirement of ``"auto"``.
 
-Covers the three contracts of ``Scanner.scan(..., preprocess=...)``:
+Covers:
 
-1. ``"off"`` (default) preserves pre-S-022 behavior exactly — no
-   timing key, no image mutation, bbox in original coordinates.
-2. ``"auto"`` downscales (long axis cap = 2000 px) + autocontrasts,
-   reports the ORIGINAL image_size, rescales detections back to
-   original coordinates, and records a ``"preprocess"`` timing key.
+1. ``"off"`` (default) does not record a ``"preprocess"`` timing key.
+2. ``"auto"`` warns (``DeprecationWarning``, removal in 0.4.0) and
+   behaves as ``"off"``: no downscale, no ``"preprocess"`` timing.
 3. Invalid mode strings raise ``ValueError`` with a friendly message.
+4. ``Result.timings_ms`` records coerce plus per-engine time, and
+   ``Result.extras["stage_hit"]`` names the engines that decoded a payload.
 
-Also exercises the private helpers (``_auto_preprocess`` and
-``_rescale_detection``) directly to pin their contracts.
+``_auto_preprocess`` / ``_rescale_detection`` stay until the parameter
+is removed. ``scan()`` no longer calls them.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import pytest
 from PIL import Image
 from PIL.Image import Image as PILImage
 
-from arbez import Scanner, Symbology
+from arbez import Result, Scanner, Symbology
 from arbez.scanner import (
     _PREPROCESS_MAX_LONG_AXIS_PX,
     _auto_preprocess,
@@ -168,63 +168,43 @@ def test_rescale_detection_identity_when_scale_is_one() -> None:
 # ── End-to-end Scanner.scan(preprocess="auto") ───────────────────────────
 
 
-def test_scan_auto_records_preprocess_timing(qr_image: PILImage) -> None:
-    """When preprocess != "off", timings_ms gets a ``"preprocess"`` key in addition to
-    ``"engine"``."""
-    r = Scanner(engine="zxing").scan(qr_image, preprocess="auto")
-    assert "engine" in r.timings_ms
-    assert "preprocess" in r.timings_ms
-    assert r.timings_ms["preprocess"] > 0
-    assert r.timings_ms["engine"] > 0
+def test_scan_auto_warns_and_matches_off(qr_payload: str) -> None:
+    """``preprocess="auto"`` is a deprecated alias of ``"off"`` (S-101).
 
-
-def test_scan_auto_reports_original_image_size() -> None:
-    """Even when preprocessing downscales internally, ``image_size`` in the Result is the ORIGINAL
-    image dimensions.
-
-    Callers rendering overlays should never see the scaled size.
+    The image is wider than the old 2000 px cap, so the retired downscale
+    would have changed the bbox. Removal is 0.4.0.
     """
-    big = Image.new("RGB", (3000, 4000), color="white")
-    r = Scanner(engine="zxing").scan(big, preprocess="auto")
-    assert r.image_size == (3000, 4000)
-
-
-def test_scan_auto_rescales_detections_to_original_coords(qr_payload: str) -> None:
-    """End-to-end: scan a real QR via auto-preprocess, verify the returned bbox fits within the
-    ORIGINAL image bounds — proving the rescale-back step worked."""
     import qrcode
 
     qr = qrcode.QRCode(version=2, box_size=10, border=4)
     qr.add_data(qr_payload)
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-    # Upscale so preprocessing definitely downscales it.
-    upscaled = qr_img.resize((qr_img.width * 5, qr_img.height * 5))
-
-    r = Scanner(engine="zxing").scan(upscaled, preprocess="auto")
-    assert r.image_size == upscaled.size, (
-        f"Expected original size {upscaled.size}, got {r.image_size}"
+    upscaled = qr_img.resize(
+        (qr_img.width * 8, qr_img.height * 8), Image.Resampling.NEAREST
     )
-    assert len(r) == 1, f"Expected 1 detection, got {len(r)}"
+    assert max(upscaled.size) > _PREPROCESS_MAX_LONG_AXIS_PX
 
-    d = r.detections[0]
-    assert d.payload == qr_payload
+    scanner = Scanner(engine="zxing")
+    off = scanner.scan(upscaled, preprocess="off")
+    with pytest.warns(DeprecationWarning, match="removed in 0.4.0"):
+        auto = scanner.scan(upscaled, preprocess="auto")
 
-    # bbox must lie within the ORIGINAL image bounds (with a small
-    # tolerance for floating-point rescale rounding).
-    x1, y1, x2, y2 = d.bbox_xyxy
-    w, h = r.image_size
-    assert 0 <= x1 < x2 <= w + 1
-    assert 0 <= y1 < y2 <= h + 1
+    assert "preprocess" not in auto.timings_ms
+    assert auto.image_size == upscaled.size == off.image_size
+    assert len(auto) == len(off) == 1
+    assert auto.detections[0].payload == off.detections[0].payload == qr_payload
+    assert auto.detections[0].bbox_xyxy == off.detections[0].bbox_xyxy
 
 
-def test_scan_auto_works_on_already_small_image(qr_image: PILImage) -> None:
-    """Small image: ``auto`` doesn't downscale but DOES autocontrast.
-
-    The Result still works; detection still decodes.
-    """
-    r = Scanner(engine="zxing").scan(qr_image, preprocess="auto")
-    assert len(r) >= 1, "Small QR should still decode after autocontrast"
+def test_scan_auto_still_decodes_small_image(qr_image: PILImage) -> None:
+    """The deprecated mode does not drop a code the default scan finds."""
+    scanner = Scanner(engine="zxing")
+    off = scanner.scan(qr_image)
+    with pytest.warns(DeprecationWarning, match="behaves as 'off'"):
+        auto = scanner.scan(qr_image, preprocess="auto")
+    assert [d.payload for d in auto.detections] == [d.payload for d in off.detections]
+    assert len(auto) >= 1
 
 
 # ── Validation ───────────────────────────────────────────────────────────
@@ -258,3 +238,69 @@ def test_scan_preprocess_is_keyword_only() -> None:
     bad_args: tuple[object, ...] = (img, "auto")
     with pytest.raises(TypeError):
         scan_method(*bad_args)
+
+
+# ── S-101: per-stage timings and stage_hit ───────────────────────────────
+
+
+def test_single_engine_timings_and_stage_hit(qr_image: PILImage) -> None:
+    """One engine records coerce, the ``engine`` total, and ``engine.<name>``.
+
+    ``stage_hit`` is that engine when it returned a payload.
+    """
+    from types import MappingProxyType
+
+    result = Scanner(engine="zxing").scan(qr_image)
+    assert "coerce" in result.timings_ms
+    assert "engine" in result.timings_ms
+    assert result.timings_ms["engine.zxing"] == result.timings_ms["engine"]
+    assert result.timings_ms["coerce"] >= 0.0
+    assert result.timings_ms["engine"] >= 0.0
+    assert "consensus" not in result.timings_ms
+    assert "preprocess" not in result.timings_ms
+    assert isinstance(result.extras, MappingProxyType)
+    assert result.extras["stage_hit"] == ("zxing",)
+
+
+def test_stage_hit_empty_when_nothing_decoded() -> None:
+    """No payload means no stage hit. The timing keys are still present."""
+    result = Scanner(engine="zxing").scan(Image.new("RGB", (16, 16), "white"))
+    assert result.detections == ()
+    assert result.extras["stage_hit"] == ()
+    assert "engine" in result.timings_ms
+    assert "engine.zxing" in result.timings_ms
+
+
+def test_consensus_timings_are_per_engine_and_stage_hit_follows_engine_order(
+    qr_image: PILImage,
+) -> None:
+    """Parallel engines get their own timing keys. The hit list is not completion order."""
+    scanner = Scanner(engines=("zxing", "arbez"))
+    assert scanner.engines == ("zxing", "arbez")
+    result = scanner.scan(qr_image)
+    assert "consensus" in result.timings_ms
+    assert "engine" not in result.timings_ms
+    assert "coerce" in result.timings_ms
+    assert result.timings_ms["engine.zxing"] >= 0.0
+    assert result.timings_ms["engine.arbez"] >= 0.0
+    expected = tuple(
+        name
+        for name in scanner.engines
+        if any(d.payload is not None for d in result.per_engine[name])
+    )
+    assert result.extras["stage_hit"] == expected
+    assert "zxing" in result.extras["stage_hit"]
+
+
+def test_result_extras_defensive_copy() -> None:
+    """Caller mutation of the extras dict passed in does not leak."""
+    from types import MappingProxyType
+
+    source: dict[str, object] = {"stage_hit": ("zxing",)}
+    result = Result(detections=(), image_size=(8, 8), extras=source)
+    source["other"] = 1
+    assert isinstance(result.extras, MappingProxyType)
+    assert "other" not in result.extras
+    assert result.extras["stage_hit"] == ("zxing",)
+    with pytest.raises(TypeError):
+        result.extras["stage_hit"] = ()  # type: ignore[index]

@@ -58,23 +58,23 @@ class Symbology(str, Enum):
     canonicalize to a plain string before keying.
     """
 
-    QR = "qr"                  # 0
-    MICRO_QR = "micro_qr"      # 1   S-036: promoted from being folded into QR
-    AZTEC = "aztec"            # 2   S-036: was 1
+    QR = "qr"  # 0
+    MICRO_QR = "micro_qr"  # 1   S-036: promoted from being folded into QR
+    AZTEC = "aztec"  # 2   S-036: was 1
     DATA_MATRIX = "data_matrix"  # 3   S-036: was 2
-    PDF417 = "pdf417"          # 4   S-036: was 3
-    CODE_128 = "code_128"      # 5   S-036: was 4
-    CODE_39 = "code_39"        # 6   S-036: was 5
-    CODE_93 = "code_93"        # 7   S-036: new (was bucketed into OTHER_1D)
-    EAN_13 = "ean_13"          # 8   S-036: was 6
-    EAN_8 = "ean_8"            # 9   S-036: new
-    UPC_A = "upc_a"            # 10  S-036: was 7
-    UPC_E = "upc_e"            # 11  S-036: new
+    PDF417 = "pdf417"  # 4   S-036: was 3
+    CODE_128 = "code_128"  # 5   S-036: was 4
+    CODE_39 = "code_39"  # 6   S-036: was 5
+    CODE_93 = "code_93"  # 7   S-036: new (was bucketed into OTHER_1D)
+    EAN_13 = "ean_13"  # 8   S-036: was 6
+    EAN_8 = "ean_8"  # 9   S-036: new
+    UPC_A = "upc_a"  # 10  S-036: was 7
+    UPC_E = "upc_e"  # 11  S-036: new
     GS1_DATABAR = "gs1_databar"  # 12  S-036: new (databar family pooled —
-                                 #     RSS-14 / RSS-Limited / RSS-Expanded
-                                 #     all collapse here; variants don't
-                                 #     justify 3 separate classes today)
-    OTHER_1D = "other_1d"      # 13  S-036: was 8, now genuinely "other"
+    #     RSS-14 / RSS-Limited / RSS-Expanded
+    #     all collapse here; variants don't
+    #     justify 3 separate classes today)
+    OTHER_1D = "other_1d"  # 13  S-036: was 8, now genuinely "other"
     # ── S-076 additions (2026-05-17): zxing parity ──
     # These three are detected by zxing-cpp but were previously
     # bucketed (Codabar/ITF → OTHER_1D) or dropped entirely
@@ -85,9 +85,9 @@ class Symbology(str, Enum):
     # do not change the bundled-model class-id contract. See
     # DECISIONS.md S-076 for the cost/benefit table that ruled out
     # also extending training scope.
-    CODABAR = "codabar"        # 14  S-076: zxing-detected, was OTHER_1D
-    ITF = "itf"                # 15  S-076: zxing-detected, was OTHER_1D
-    MAXICODE = "maxicode"      # 16  S-076: zxing-detected, was dropped
+    CODABAR = "codabar"  # 14  S-076: zxing-detected, was OTHER_1D
+    ITF = "itf"  # 15  S-076: zxing-detected, was OTHER_1D
+    MAXICODE = "maxicode"  # 16  S-076: zxing-detected, was dropped
 
     @classmethod
     def from_class_id(cls, class_id: int) -> Symbology:
@@ -242,31 +242,42 @@ class Result:
 
     **Read-only** post-construction (S-016 — wrapped in ``types.MappingProxyType``).
 
-    Current key set:
+    Current key set (S-101):
 
-    * ``"engine"`` — engine ``detect_and_decode()`` call wall-clock.
+    * ``"coerce"`` — ``coerce_to_pil`` (decode, EXIF, pixel limit, RGB).
+      Present on every ``Scanner.scan`` that returns.
+    * ``"engine"`` — single-engine ``detect_and_decode()`` wall-clock.
       Present on the single-engine path (``Scanner(engine="<name>")``).
-    * ``"consensus"`` — multi-engine wall-clock (``max`` over per-engine
-      times since they run in parallel). Present whenever more than one
-      engine runs: bare ``Scanner()`` (all-installed union) and
-      ``Scanner(consensus=N, engines=...)`` (S-093).
-    * ``"preprocess"`` — added when ``Scanner.scan(image,
-      preprocess="auto")`` triggers the downscale + autocontrast
-      path. Reports the preprocess wall-clock, not the engine.
+      Absent on the multi-engine path.
+    * ``"consensus"`` — multi-engine wall-clock, including the merge.
+      Present whenever more than one engine runs: bare ``Scanner()``
+      and ``Scanner(consensus=N, engines=...)`` (S-093).
+    * ``"engine.<name>"`` — that engine's own ``detect_and_decode``
+      wall-clock. On the single-engine path this equals ``"engine"``.
+      On the multi-engine path the engines run in parallel, so each
+      value is that engine's time, not a slice of ``"consensus"``.
+
+    ``"preprocess"`` is no longer written. ``preprocess="auto"`` is
+    deprecated and behaves as ``"off"`` (S-101, removed in 0.4.0).
 
     The dict is intentionally open-ended — engines + Scanner MAY add
-    keys for internal stages we want to expose (e.g. ``"warmup"``,
-    ``"coerce"``). Users iterating the dict should NOT assume any
-    specific key is present; treat each as informational. Useful for
-    benchmarking and per-stage latency monitoring.
+    keys for internal stages. Users iterating the dict should NOT
+    assume any specific key is present; treat each as informational.
     """
 
     extras: Mapping[str, object] = field(default_factory=dict)
-    """Scan-level metadata that is not a detection (S-097).
+    """Scan-level metadata that is not a detection (S-097, S-101).
 
-    Read-only post-construction, same wrap as ``timings_ms``. Keys are
-    omitted when they have nothing to say. Current keys:
+    **Read-only** post-construction (wrapped in ``types.MappingProxyType``).
+    Not part of the cross-version stability contract beyond the keys
+    documented here; new keys may appear. Isolation keys are omitted
+    when they have nothing to say.
 
+    * ``"stage_hit"`` — ``tuple[str, ...]`` of engine names that
+      returned at least one decoded payload, in the Scanner's engine
+      order (not thread-completion order). ``()`` when nothing decoded.
+      Today the entries are engine names. Later stages may append
+      other stage names to the same tuple.
     * ``"isolation"`` — ``{engine_name: "process" | "inprocess"}``.
       ``"process"`` means a spawned worker. ``"inprocess"`` means the
       engine ran in the caller because a pool could not.
@@ -290,7 +301,7 @@ class Result:
                 {name: tuple(dets) for name, dets in self.per_engine.items()}
             )
             object.__setattr__(self, "per_engine", frozen_pe)
-        # S-097: same read-only contract as timings_ms. Shallow wrap.
+        # S-097 / S-101: same read-only contract as timings_ms. Shallow wrap.
         if not isinstance(self.extras, MappingProxyType):
             object.__setattr__(self, "extras", MappingProxyType(dict(self.extras)))
 
