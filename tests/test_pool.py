@@ -15,6 +15,7 @@ import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -473,6 +474,35 @@ def _pretend_linux_tmpfs(
     )
     if fallocate is not None:
         monkeypatch.setattr(pool_mod.os, "posix_fallocate", fallocate, raising=False)  # type: ignore[attr-defined]
+        # Windows shared memory has no POSIX fd. The charge path then
+        # raises before the stand-in fallocate runs. A zero-filled file
+        # is enough to mmap and to see that the store has not run.
+        real_init = shared_memory.SharedMemory.__init__
+        stand_in_files: list[Any] = []
+
+        def init_with_posix_fd(
+            self: shared_memory.SharedMemory, *args: Any, **kwargs: Any
+        ) -> None:
+            real_init(self, *args, **kwargs)
+            fd = getattr(self, "_fd", None)
+            if isinstance(fd, int) and fd >= 0:
+                return
+            size = int(getattr(self, "size", 0) or 0)
+            # Stays open until the test ends. fallocate mmaps it after
+            # this constructor returns, so a with-block would close it
+            # too soon.
+            handle = tempfile.TemporaryFile()  # noqa: SIM115
+            if size:
+                handle.write(b"\x00" * size)
+                handle.flush()
+            self._fd = handle.fileno()  # type: ignore[attr-defined]
+            stand_in_files.append(handle)
+
+        monkeypatch.setattr(
+            pool_mod.shared_memory.SharedMemory,  # type: ignore[attr-defined]
+            "__init__",
+            init_with_posix_fd,
+        )
     return pool_mod
 
 
