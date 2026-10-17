@@ -478,6 +478,12 @@ def _worker_main(entrypoint: str, conn: Connection) -> None:
             try:
                 value = engine(view)
             except BaseException as exc:
+                # Windows reports a null write as OSError ("access
+                # violation") instead of killing the child. Abort so
+                # the parent takes the dead-worker path. Any other
+                # OSError still goes back as an engine error.
+                if isinstance(exc, OSError) and "access violation" in str(exc).lower():
+                    os.abort()
                 _send_tagged(conn, "error", exc)
             else:
                 try:
