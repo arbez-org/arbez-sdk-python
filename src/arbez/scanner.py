@@ -687,8 +687,10 @@ class Scanner:
         self._consensus_engines_lock = threading.Lock()
         self._engine: Engine | None = None
         # Set only when the caller passed an Engine instance. close()
-        # drops the cached slot; the next scan puts this object back
-        # instead of building a new one from the Scanner flag (S-100).
+        # drops the cached slot. The next scan puts a WeChatEngine
+        # back so its full_frame_fallback stands (S-100). Any other
+        # supplied engine is rebuilt from its name without this
+        # Scanner's flags (S-099).
         self._supplied_engine: Engine | None = None
         self._engines: tuple[str, ...] | None = None
         # S-100: applied only when this Scanner constructs a WeChatEngine.
@@ -1087,9 +1089,11 @@ class Scanner:
 
         Idempotent: safe to call multiple times. After ``close()``,
         ``scan()`` lazy-reinits on the next call. A name-built engine
-        is constructed again. A caller-supplied instance is that same
-        object again, so its own configuration stands (S-100). Most
-        users should treat ``close()`` as terminal and not call
+        is constructed again with this Scanner's flags. A supplied
+        WeChatEngine is that same object again, so its own
+        ``full_frame_fallback`` stands (S-100). Any other supplied
+        engine is rebuilt from its name without those flags (S-099).
+        Most users should treat ``close()`` as terminal and not call
         ``scan()`` after it.
 
         Use the context manager form for the common case::
@@ -1119,8 +1123,10 @@ class Scanner:
         # concurrent reader from grabbing the reference — but swapping
         # to ``None`` BEFORE closing means a name-built reader arriving
         # after the swap builds a new engine instead of receiving one
-        # that is mid-teardown. A caller-supplied instance is that same
-        # object on the next scan (S-100). A scan that starts while
+        # that is mid-teardown. A supplied WeChatEngine is that same
+        # object on the next scan (S-100). Another supplied engine is
+        # rebuilt from its name without this Scanner's flags (S-099).
+        # A scan that starts while
         # ``close()`` is still running, or that grabbed the reference
         # before the swap, can still race that close(); callers who
         # close while scans are in flight own that coordination.
@@ -1204,14 +1210,25 @@ class Scanner:
             # Re-check inside the lock — another thread may have raced
             # us to the assignment while we were waiting.
             if self._engine is None:
-                # close() has already dropped a supplied engine's pool.
-                # Putting that object back keeps its full_frame_fallback
-                # and its own format set. Building from the name would
-                # apply this Scanner's flags.
+                # close() dropped the cached engine. A supplied
+                # WeChatEngine goes back as the same object so its
+                # full_frame_fallback stands (S-100). Any other
+                # supplied engine is rebuilt from its name without
+                # this Scanner's flags (S-099). A string name still
+                # receives those flags.
                 supplied = self._supplied_engine
+                if supplied is not None and type(supplied).__name__ == "WeChatEngine":
+                    # Import only on this branch. The module does not
+                    # load cv2; Scanner must not import it otherwise.
+                    from arbez.engines.wechat import WeChatEngine
+
+                    if isinstance(supplied, WeChatEngine):
+                        self._engine = supplied
+                        # Matched. The branches below rebuild.
+                        supplied = None
                 if supplied is not None:
-                    self._engine = supplied
-                else:
+                    self._engine = _resolve_engine(self._engine_name)
+                elif self._engine is None:
                     self._engine = _resolve_engine(
                         self._engine_name,
                         symbologies=self._symbology_allow,

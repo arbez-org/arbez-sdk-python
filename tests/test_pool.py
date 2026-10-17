@@ -478,7 +478,9 @@ def _pretend_linux_tmpfs(
 
     monkeypatch.setattr(pool_mod.os.path, "isdir", isdir)  # type: ignore[attr-defined]
     monkeypatch.setattr(pool_mod.os, "access", access)  # type: ignore[attr-defined]
-    monkeypatch.setattr(pool_mod.os, "statvfs", statvfs)  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        pool_mod.os, "statvfs", statvfs, raising=False  # type: ignore[attr-defined]
+    )
     if fallocate is not None:
         monkeypatch.setattr(pool_mod.os, "posix_fallocate", fallocate, raising=False)  # type: ignore[attr-defined]
     return pool_mod
