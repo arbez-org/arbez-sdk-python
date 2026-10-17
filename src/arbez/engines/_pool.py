@@ -23,11 +23,14 @@ import logging
 import math
 import multiprocessing as mp
 import os
+import struct
 import sys
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from multiprocessing import resource_tracker, shared_memory
+from multiprocessing import shared_memory
+from multiprocessing.reduction import ForkingPickler
 from typing import TYPE_CHECKING, Any, cast
 from weakref import WeakSet
 
@@ -57,6 +60,9 @@ _logged_choices: set[str] = set()
 _live_pools: WeakSet[EnginePool] = WeakSet()
 _libdmtx_guard = threading.Lock()
 _libdmtx_pool: EnginePool | None = None
+# Two pools (a WeChat frame and a libdmtx crop) otherwise both trust one
+# statvfs snapshot and both store. Held from the check through the store.
+_shm_charge_lock = threading.Lock()
 
 
 @dataclass
@@ -275,27 +281,19 @@ def _send_tagged(conn: Connection, kind: str, exc: BaseException) -> None:
 def _attach_shared_memory(name: str) -> shared_memory.SharedMemory:
     """Open the parent's segment in this process without owning it.
 
-    ``track=False`` exists on 3.13+. Older interpreters reject the keyword,
-    so those open the name and unregister it. The child must not be the
-    owner: a tracked death unlinks the parent's mapping.
+    ``track=False`` exists on 3.13+ and does not touch the tracker. Older
+    interpreters reject the keyword, so those attach by name. Do not
+    unregister. Spawn shares the parent's tracker fd, the cache is a set
+    rather than a refcount, and the child's ``UNREGISTER`` deletes the
+    only entry. A second ``REGISTER`` is a no-op, and the child's exit
+    does not unlink while the parent still holds the tracker fd.
     """
     try:
         # The cast keeps the 3.12 mypy target quiet about the 3.13 keyword.
         ctor = cast(Any, shared_memory.SharedMemory)
-        opened = cast(shared_memory.SharedMemory, ctor(name=name, track=False))
+        return cast(shared_memory.SharedMemory, ctor(name=name, track=False))
     except TypeError:
-        opened = shared_memory.SharedMemory(name=name)
-        _forget_child_tracker(opened)
-    return opened
-
-
-def _forget_child_tracker(shm: shared_memory.SharedMemory) -> None:
-    """Drop this process's tracker entry. The parent still unlinks."""
-    raw = getattr(shm, "_name", None)
-    if not isinstance(raw, str):
-        return
-    with contextlib.suppress(Exception):
-        resource_tracker.unregister(raw, "shared_memory")
+        return shared_memory.SharedMemory(name=name)
 
 
 def _release_shared_memory(shm: shared_memory.SharedMemory) -> None:
@@ -315,22 +313,42 @@ def _release_shared_memory(shm: shared_memory.SharedMemory) -> None:
         shm.unlink()
 
 
+def _shm_page_bytes() -> int:
+    """Page size tmpfs charges, including a partial last page."""
+    sysconf = getattr(os, "sysconf", None)
+    if sysconf is None:
+        return 4096
+    try:
+        value = sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError):
+        return 4096
+    if isinstance(value, int) and value > 0:
+        return value
+    return 4096
+
+
+def _page_charged_bytes(nbytes: int) -> int:
+    """Bytes tmpfs will charge for a mapping of ``nbytes``."""
+    page = _shm_page_bytes()
+    rounded = ((max(nbytes, 1) + page - 1) // page) * page
+    return max(rounded, page)
+
+
 def _posix_shm_free_bytes() -> int | None:
     """Free bytes on the Linux tmpfs that backs POSIX shm, else ``None``.
 
     A write into a mapping larger than that tmpfs SIGBUS-kills the parent.
     The signal cannot be caught, and a hard kill cannot unlink the segment
     in-process, so the caller refuses the frame instead of mapping it.
+    A failed ``statvfs`` on Linux is a capacity error: unknown free space
+    is not permission to store. ``OSError`` propagates to that caller.
     """
     if sys.platform != "linux":
         return None
     path = "/dev/shm"
     if not os.path.isdir(path):
         return None
-    try:
-        stats = os.statvfs(path)
-    except OSError:
-        return None
+    stats = os.statvfs(path)
     return int(stats.f_bavail) * int(stats.f_frsize)
 
 
@@ -345,6 +363,26 @@ class _SharedMemoryCapacityError(Exception):
         self.free = free
 
 
+def _reserve_linux_pages(shm: shared_memory.SharedMemory, nbytes: int) -> None:
+    """Charge the tmpfs pages the following store will touch.
+
+    ``ftruncate`` inside ``SharedMemory`` succeeds without allocating those
+    pages. The store then SIGBUS-kills the parent when the charge fails.
+    ``posix_fallocate`` of the page-rounded length either charges the pages
+    or raises ``OSError``.
+    """
+    if sys.platform != "linux":
+        return
+    fallocate = getattr(os, "posix_fallocate", None)
+    fd = getattr(shm, "_fd", None)
+    if fallocate is None or not isinstance(fd, int) or fd < 0:
+        raise _SharedMemoryCapacityError(nbytes, 0)
+    try:
+        fallocate(fd, 0, nbytes)
+    except OSError as exc:
+        raise _SharedMemoryCapacityError(nbytes, 0) from exc
+
+
 def _create_shared_image(
     image: npt.NDArray[Any],
 ) -> tuple[shared_memory.SharedMemory, tuple[int, ...], str]:
@@ -355,11 +393,37 @@ def _create_shared_image(
     nbytes = int(array.nbytes)
     # SharedMemory rejects size 0. An empty frame still has to round-trip.
     need = max(nbytes, 1)
-    free = _posix_shm_free_bytes()
-    if free is not None and need > free:
-        raise _SharedMemoryCapacityError(need, free)
-    shm = shared_memory.SharedMemory(create=True, size=need)
+    # tmpfs charges whole pages. A frame that only rounds past free space
+    # faults the same way as one that is larger than the snapshot.
+    reserve = _page_charged_bytes(need)
+    if sys.platform == "linux":
+        with _shm_charge_lock:
+            return _map_shared_image(array, shape, nbytes, need, reserve)
+    return _map_shared_image(array, shape, nbytes, need, reserve)
+
+
+def _map_shared_image(
+    array: Any,
+    shape: tuple[int, ...],
+    nbytes: int,
+    need: int,
+    reserve: int,
+) -> tuple[shared_memory.SharedMemory, tuple[int, ...], str]:
+    """Create the segment, charge Linux pages, then copy."""
+    import numpy as np
+
     try:
+        free = _posix_shm_free_bytes()
+    except OSError as exc:
+        raise _SharedMemoryCapacityError(reserve, 0) from exc
+    if free is not None and reserve > free:
+        raise _SharedMemoryCapacityError(reserve, free)
+    # On Linux the file is the page-rounded length so fallocate matches it.
+    # Other platforms keep the logical size; they have no tmpfs charge.
+    alloc = reserve if sys.platform == "linux" else need
+    shm = shared_memory.SharedMemory(create=True, size=alloc)
+    try:
+        _reserve_linux_pages(shm, reserve)
         if nbytes:
             view = np.ndarray(shape, dtype=array.dtype, buffer=shm.buf)
             view[...] = array
@@ -422,6 +486,147 @@ def _worker_main(entrypoint: str, conn: Connection) -> None:
             del view
             with contextlib.suppress(BufferError):
                 shm.close()
+
+
+class _ReplyTimeout(Exception):
+    """The shared reply budget expired before a full frame arrived."""
+
+
+def _seconds_left(deadline_at: float) -> float:
+    return deadline_at - time.monotonic()
+
+
+def _read_ready(conn: Any, nbytes: int) -> bytes:
+    """Read bytes that ``poll`` already reported, without waiting for ``nbytes``.
+
+    ``Connection._read`` is ``os.read`` or a socket ``recv``. Either returns
+    the bytes already buffered, at most ``nbytes``, and does not block for
+    the rest. Windows pipes have no ``_read``; they use ``_recv_pipe_message``.
+    """
+    read = getattr(conn, "_read", None)
+    handle = getattr(conn, "_handle", None)
+    if read is None or handle is None:
+        raise OSError("connection cannot be read on the calling thread")
+    chunk = read(handle, nbytes)
+    if isinstance(chunk, bytes):
+        return chunk
+    return bytes(chunk)
+
+
+def _read_exact(conn: Any, nbytes: int, deadline_at: float) -> bytes:
+    """Read ``nbytes`` using one deadline shared with every ``poll``."""
+    if nbytes == 0:
+        return b""
+    parts: list[bytes] = []
+    got = 0
+    while got < nbytes:
+        left = _seconds_left(deadline_at)
+        if left <= 0:
+            raise _ReplyTimeout
+        try:
+            ready = conn.poll(left)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            raise OSError("engine pool poll failed") from exc
+        if not ready:
+            raise _ReplyTimeout
+        try:
+            chunk = _read_ready(conn, nbytes - got)
+        except InterruptedError:
+            continue
+        except KeyboardInterrupt:
+            raise
+        if len(chunk) > nbytes - got:
+            raise OSError("read returned more bytes than requested")
+        if not chunk:
+            raise EOFError
+        parts.append(chunk)
+        got += len(chunk)
+    return b"".join(parts)
+
+
+def _recv_length_prefixed(conn: Any, deadline_at: float) -> bytes:
+    """Unix (and Windows socket) frame: 4-byte length, or -1 then 8 bytes."""
+    header = _read_exact(conn, 4, deadline_at)
+    size = int(struct.unpack("!i", header)[0])
+    if size == -1:
+        extended = _read_exact(conn, 8, deadline_at)
+        size = int(struct.unpack("!Q", extended)[0])
+    if size < 0:
+        raise OSError(f"invalid frame size {size}")
+    return _read_exact(conn, size, deadline_at)
+
+
+def _recv_reply(conn: Any, deadline_at: float) -> Any:
+    """Unpickle one worker reply on the calling thread.
+
+    Windows pipes are message-oriented and carry the pickle as one
+    message, without the Unix length prefix. A second thread is never
+    inside ``recv`` while the fd is closed or reused.
+    """
+    if sys.platform == "win32" and type(conn).__name__ == "PipeConnection":
+        payload = _recv_pipe_message(conn, deadline_at)
+    else:
+        payload = _recv_length_prefixed(conn, deadline_at)
+    return ForkingPickler.loads(payload)
+
+
+def _recv_pipe_message(conn: Any, deadline_at: float) -> bytes:
+    """One Windows pipe message, waiting only for the time still left."""
+    if sys.platform != "win32":
+        raise OSError("pipe messages are a Windows connection")
+    import _winapi
+
+    handle = getattr(conn, "_handle", None)
+    if not isinstance(handle, int):
+        raise OSError("connection cannot be read on the calling thread")
+    # Message mode delivers one write per read. Assemble MORE_DATA parts.
+    # Each wait uses the shared deadline and is cancelled when it expires,
+    # so no overlapped read outlives this call.
+    parts: list[bytes] = []
+    while True:
+        left = _seconds_left(deadline_at)
+        if left <= 0:
+            raise _ReplyTimeout
+        overlapped, err = _winapi.ReadFile(handle, 128, True)
+        try:
+            if err == _winapi.ERROR_IO_PENDING:
+                timeout_ms = int(left * 1000)
+                if timeout_ms <= 0:
+                    raise _ReplyTimeout
+                waitres = _winapi.WaitForMultipleObjects([overlapped.event], False, timeout_ms)
+                if waitres != _winapi.WAIT_OBJECT_0:
+                    raise _ReplyTimeout
+            nread, completed = overlapped.GetOverlappedResult(True)
+        except _ReplyTimeout:
+            overlapped.cancel()
+            with contextlib.suppress(Exception):
+                overlapped.GetOverlappedResult(True)
+            raise
+        except KeyboardInterrupt:
+            overlapped.cancel()
+            with contextlib.suppress(Exception):
+                overlapped.GetOverlappedResult(True)
+            raise
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            if winerror == _winapi.ERROR_BROKEN_PIPE:
+                raise EOFError from exc
+            raise
+        if completed == _winapi.ERROR_BROKEN_PIPE:
+            raise EOFError
+        raw = overlapped.getbuffer()
+        piece = b"" if raw is None else bytes(raw[:nread])
+        if completed == 0:
+            parts.append(piece)
+            return b"".join(parts)
+        if completed == _winapi.ERROR_MORE_DATA:
+            parts.append(piece)
+            if nread <= 0:
+                raise OSError("pipe message did not grow")
+            continue
+        raise OSError(completed)
 
 
 class EnginePool:
@@ -627,42 +832,21 @@ class EnginePool:
         )
 
     def _await_reply(self, conn: Connection, proc: mp.Process, deadline: float) -> PoolResult:
-        """Wait for one reply. A transport failure replaces the worker."""
+        """Wait for one reply. A transport failure replaces the worker.
+
+        The poll and the frame read share one deadline. The read runs on
+        this thread, so closing the pipe is never concurrent with ``recv``.
+        """
         try:
-            readable = conn.poll(deadline)
-        except Exception:
-            return self._crashed(proc)
-        if not readable:
+            reply = _recv_reply(conn, time.monotonic() + deadline)
+        except _ReplyTimeout:
             if not proc.is_alive():
                 return self._crashed(proc)
             self._replace_worker()
             return self._timeout_result(deadline)
-        # poll is true when the pipe is readable, including a partial
-        # pickle. recv on this thread would then block past the deadline.
-        box: dict[str, Any] = {}
-
-        def _read() -> None:
-            try:
-                box["reply"] = conn.recv()
-            except BaseException as exc:
-                box["exc"] = exc
-
-        reader = threading.Thread(target=_read, name="arbez-pool-recv", daemon=True)
-        reader.start()
-        reader.join(deadline)
-        if reader.is_alive():
-            # Closing the worker end unblocks recv. Join before the
-            # replacement reuses nothing of this pipe.
-            self._kill_process(proc)
-            reader.join(5)
-            self._replace_worker()
-            return self._timeout_result(deadline)
-        exc = box.get("exc")
-        if isinstance(exc, KeyboardInterrupt):
-            raise exc
-        if exc is not None:
+        except Exception:
             return self._crashed(proc)
-        return self._interpret(box.get("reply"), proc)
+        return self._interpret(reply, proc)
 
     def _interpret(self, reply: Any, proc: mp.Process) -> PoolResult:
         if not isinstance(reply, tuple) or not reply:

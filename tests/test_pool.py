@@ -8,14 +8,18 @@ images stay in the private benchmark.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
+import struct
 import subprocess
 import sys
 import threading
 import time
 import types
 from multiprocessing import shared_memory
+from multiprocessing.reduction import ForkingPickler
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, cast
 
@@ -31,6 +35,7 @@ from arbez.engines._pool import (
     START_METHOD,
     EnginePool,
     ScanDiagnostics,
+    _attach_shared_memory,
     active_deadline,
     attach_diagnostics,
     bind_diagnostics,
@@ -204,33 +209,500 @@ def test_hang_hits_the_deadline_and_the_next_call_works() -> None:
     assert fault["kind"] == "timeout"
 
 
-def test_attach_shared_memory_omits_an_unsupported_track_keyword(
+def _tracker_attach_and_exit(name: str, started: Any) -> None:
+    """Attach, prove the bytes are visible, then close without unregistering."""
+    shm = _attach_shared_memory(name)
+    try:
+        buf = shm.buf
+        if buf is None or int(buf[0]) != 9:
+            raise SystemExit("payload mismatch")
+        started.set()
+    finally:
+        shm.close()
+
+
+def _tracker_attach_and_hold(name: str, started: Any) -> None:
+    """Stay attached until the parent is gone and this process is killed."""
+    shm = _attach_shared_memory(name)
+    try:
+        started.set()
+        time.sleep(30)
+    finally:
+        shm.close()
+
+
+def _tracker_round_trip_main() -> None:
+    """Create, let a spawn child attach, unlink, and exit. No KeyError."""
+    import multiprocessing as mp
+
+    shm = shared_memory.SharedMemory(create=True, size=64)
+    name = shm.name
+    try:
+        buf = shm.buf
+        if buf is None:
+            raise SystemExit("segment has no buffer")
+        buf[0] = 9
+        ctx = mp.get_context("spawn")
+        started = ctx.Event()
+        proc = ctx.Process(target=_tracker_attach_and_exit, args=(name, started))
+        proc.start()
+        if not started.wait(30):
+            raise SystemExit("child did not attach")
+        proc.join(30)
+        if proc.exitcode != 0:
+            raise SystemExit(f"child exit {proc.exitcode}")
+    finally:
+        shm.close()
+        shm.unlink()
+    try:
+        leftover = shared_memory.SharedMemory(name=name)
+    except FileNotFoundError:
+        return
+    leftover.close()
+    leftover.unlink()
+    raise SystemExit("segment survived parent unlink")
+
+
+def _tracker_hard_kill_main() -> None:
+    """Die after the child attaches, without unlinking.
+
+    The tracker still has the parent's registration, so once this process
+    and the child both exit it removes the name.
+    """
+    import multiprocessing as mp
+
+    shm = shared_memory.SharedMemory(create=True, size=64)
+    ctx = mp.get_context("spawn")
+    started = ctx.Event()
+    proc = ctx.Process(target=_tracker_attach_and_hold, args=(shm.name, started))
+    proc.start()
+    if not started.wait(30):
+        shm.close()
+        shm.unlink()
+        proc.kill()
+        raise SystemExit("child did not attach")
+    sys.stdout.write(f"TRACKER {shm.name} {proc.pid}\n")
+    sys.stdout.flush()
+    sigkill = getattr(signal, "SIGKILL", None)
+    if not isinstance(sigkill, int):
+        raise SystemExit("SIGKILL is required")
+    os.kill(os.getpid(), sigkill)
+
+
+def _tracker_probe_paths(tmp_path: Any, fn_name: str) -> tuple[str, dict[str, str], str]:
+    script = tmp_path / f"{fn_name}.py"
+    script.write_text(
+        f"from tests.test_pool import {fn_name} as main\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n",
+        encoding="ascii",
+    )
+    root = str(Path(__file__).resolve().parents[1])
+    env = os.environ.copy()
+    previous = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = root if not previous else root + os.pathsep + previous
+    env["PYTHONUNBUFFERED"] = "1"
+    return str(script), env, root
+
+
+def test_child_attach_keeps_the_parent_tracker_entry(tmp_path: Any) -> None:
+    """A spawn child must not delete the parent's tracker registration.
+
+    The round-trip unlinks from the parent: the tracker must not print
+    KeyError. A parent SIGKILL after the child has attached must still
+    let the tracker remove the name.
+    """
+    _require_process_pools()
+    script, env, root = _tracker_probe_paths(tmp_path, "_tracker_round_trip_main")
+    round_trip = subprocess.run(
+        [sys.executable, script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=root,
+        env=env,
+    )
+    assert round_trip.returncode == 0, round_trip.stderr
+    assert "KeyError" not in round_trip.stderr
+
+    sigkill = getattr(signal, "SIGKILL", None)
+    if not isinstance(sigkill, int):
+        return
+    script, env, root = _tracker_probe_paths(tmp_path, "_tracker_hard_kill_main")
+    proc = subprocess.Popen(
+        [sys.executable, script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=root,
+        env=env,
+    )
+    child_pid = -1
+    name = ""
+    assert proc.stdout is not None
+    box: list[str] = []
+
+    def _read_line() -> None:
+        box.append(proc.stdout.readline() if proc.stdout is not None else "")
+
+    reader = threading.Thread(target=_read_line, daemon=True)
+    reader.start()
+    reader.join(40)
+    if reader.is_alive():
+        proc.kill()
+        proc.wait(timeout=10)
+        raise AssertionError("parent did not report the segment")
+    line = box[0].strip()
+    try:
+        _label, name, pid_text = line.split()
+        assert _label == "TRACKER"
+        child_pid = int(pid_text)
+        assert proc.wait(timeout=15) is not None
+        os.kill(child_pid, sigkill)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except OSError:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("attach child survived SIGKILL")
+        try:
+            _stdout, stderr = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise AssertionError("tracker did not exit after the attach child died") from None
+        assert "KeyError" not in stderr
+        removed = False
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                leftover = shared_memory.SharedMemory(name=name)
+            except FileNotFoundError:
+                removed = True
+                break
+            else:
+                leftover.close()
+                time.sleep(0.05)
+        assert removed, f"tracker left {name} behind; stderr={stderr!r}"
+    finally:
+        if child_pid > 0:
+            with contextlib.suppress(OSError):
+                os.kill(child_pid, sigkill)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+        if name:
+            try:
+                leftover = shared_memory.SharedMemory(name=name)
+            except FileNotFoundError:
+                pass
+            else:
+                leftover.close()
+                leftover.unlink()
+
+
+def _quiet_pool(monkeypatch: pytest.MonkeyPatch) -> EnginePool:
+    """A pool that does not spawn. Capacity failures are decided in-process."""
+    pool = _pool()
+    monkeypatch.setattr(pool, "_ensure_worker", lambda: None)
+
+    class _Conn:
+        def send(self, _message: object) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        def poll(self, _timeout: float = 0.0) -> bool:
+            return False
+
+    class _Proc:
+        exitcode = 0
+
+        def is_alive(self) -> bool:
+            return False
+
+        def join(self, _timeout: float | None = None) -> None:
+            return None
+
+        def kill(self) -> None:
+            return None
+
+    pool._conn = cast(Any, _Conn())
+    pool._proc = cast(Any, _Proc())
+    return pool
+
+
+def _pretend_linux_tmpfs(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """3.10 through 3.12 SharedMemory rejects track=. Attach must still open."""
+    *,
+    free: int | None,
+    fallocate: Any | None = None,
+) -> Any:
     import arbez.engines._pool as pool_mod
 
-    class BareMemory:
-        def __init__(
-            self,
-            name: str | None = None,
-            create: bool = False,
-            size: int = 0,
-        ) -> None:
-            self._name = name
-            self.name = name
+    monkeypatch.setattr(pool_mod.sys, "platform", "linux")  # type: ignore[attr-defined]
+    real_isdir = os.path.isdir
+    real_access = os.access
 
-    monkeypatch.setattr(pool_mod.shared_memory, "SharedMemory", BareMemory)  # type: ignore[attr-defined]
-    unregistered: list[tuple[str, str]] = []
+    def isdir(path: str) -> bool:
+        if path == "/dev/shm":
+            return True
+        return real_isdir(path)
 
-    def unregister(name: str, rtype: str) -> None:
-        unregistered.append((name, rtype))
+    def access(path: str, mode: int) -> bool:
+        # A pool built while this patch is active must still be allowed to
+        # isolate. The capacity checks are what this test is poking.
+        if path == "/dev/shm":
+            return True
+        return real_access(path, mode)
 
-    monkeypatch.setattr(pool_mod.resource_tracker, "unregister", unregister)  # type: ignore[attr-defined]
-    opened = pool_mod._attach_shared_memory("seg-name")
-    assert isinstance(opened, BareMemory)
-    assert opened.name == "seg-name"
-    assert unregistered == [("seg-name", "shared_memory")]
+    def statvfs(_path: str) -> Any:
+        if free is None:
+            raise OSError("statvfs failed")
+        return types.SimpleNamespace(f_bavail=free, f_frsize=1)
+
+    monkeypatch.setattr(pool_mod.os.path, "isdir", isdir)  # type: ignore[attr-defined]
+    monkeypatch.setattr(pool_mod.os, "access", access)  # type: ignore[attr-defined]
+    monkeypatch.setattr(pool_mod.os, "statvfs", statvfs)  # type: ignore[attr-defined]
+    if fallocate is not None:
+        monkeypatch.setattr(pool_mod.os, "posix_fallocate", fallocate, raising=False)  # type: ignore[attr-defined]
+    return pool_mod
+
+
+def test_linux_statvfs_failure_is_a_crash_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool_mod = _pretend_linux_tmpfs(monkeypatch, free=None)
+    pool = _quiet_pool(monkeypatch)
+    try:
+        result = pool.call(_image(0))
+    finally:
+        pool._conn = None
+        pool._proc = None
+        pool.close()
+    assert result.status == "crash"
+    assert "frame needs" in result.detail
+    assert pool_mod._shm_charge_lock.locked() is False
+
+
+def test_linux_page_round_refuses_before_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    import arbez.engines._pool as pool_mod
+
+    page = pool_mod._page_charged_bytes(1)
+    created: list[str] = []
+    real = shared_memory.SharedMemory
+
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        created.append("mapped")
+        return real(*args, **kwargs)
+
+    _pretend_linux_tmpfs(monkeypatch, free=page - 1)
+    monkeypatch.setattr(pool_mod.shared_memory, "SharedMemory", wrapped)  # type: ignore[attr-defined]
+    with pytest.raises(pool_mod._SharedMemoryCapacityError, match="frame needs"):
+        pool_mod._create_shared_image(_image(0))
+    assert created == []
+
+
+def test_linux_fallocate_failure_is_a_crash_and_unlinks(monkeypatch: pytest.MonkeyPatch) -> None:
+    import arbez.engines._pool as pool_mod
+
+    def fallocate(_fd: int, _offset: int, length: int) -> None:
+        assert length == pool_mod._page_charged_bytes(1)
+        assert pool_mod._shm_charge_lock.locked()
+        raise OSError(28, "No space left on device")
+
+    _pretend_linux_tmpfs(monkeypatch, free=10**12, fallocate=fallocate)
+    unlinked: list[str] = []
+    real_unlink = shared_memory.SharedMemory.unlink
+
+    def unlink(self: shared_memory.SharedMemory) -> None:
+        unlinked.append(self.name)
+        real_unlink(self)
+
+    monkeypatch.setattr(shared_memory.SharedMemory, "unlink", unlink)
+    with pytest.raises(pool_mod._SharedMemoryCapacityError):
+        pool_mod._create_shared_image(_image(0))
+    assert unlinked
+
+    pool = _quiet_pool(monkeypatch)
+    try:
+        result = pool.call(_image(0))
+    finally:
+        pool._conn = None
+        pool._proc = None
+        pool.close()
+    assert result.status == "crash"
+    assert "frame needs" in result.detail
+
+
+def test_linux_shm_charges_are_serialized(monkeypatch: pytest.MonkeyPatch) -> None:
+    import arbez.engines._pool as pool_mod
+
+    current = 0
+    max_seen = 0
+    guard = threading.Lock()
+
+    def fallocate(_fd: int, _offset: int, _length: int) -> None:
+        nonlocal current, max_seen
+        assert pool_mod._shm_charge_lock.locked()
+        with guard:
+            current += 1
+            max_seen = max(max_seen, current)
+        time.sleep(0.15)
+        with guard:
+            current -= 1
+
+    _pretend_linux_tmpfs(monkeypatch, free=10**12, fallocate=fallocate)
+    errors: list[BaseException] = []
+    opened: list[Any] = []
+
+    def run() -> None:
+        try:
+            opened.append(pool_mod._create_shared_image(_image(0)))
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run), threading.Thread(target=run)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    try:
+        assert errors == []
+        assert max_seen == 1
+        assert len(opened) == 2
+    finally:
+        for shm, _shape, _dtype in opened:
+            shm.close()
+            shm.unlink()
+
+
+class _LateHeader:
+    """Header becomes readable after 0.5 s, then the payload never arrives."""
+
+    def __init__(self) -> None:
+        self._header = struct.pack("!i", 16)
+        self._off = 0
+        self._announced = False
+
+    def poll(self, timeout: float = 0.0) -> bool:
+        if not self._announced:
+            self._announced = True
+            time.sleep(min(timeout, 0.5))
+            return True
+        time.sleep(max(timeout, 0.0))
+        return False
+
+    def _read(self, _handle: object, nbytes: int) -> bytes:
+        chunk = self._header[self._off : self._off + nbytes]
+        self._off += len(chunk)
+        return chunk
+
+    _handle = 0
+
+
+class _ChunkedFrame:
+    """One reply, delivered a byte at a time on this thread."""
+
+    def __init__(self, frame: bytes, caller: threading.Thread) -> None:
+        self._frame = frame
+        self._off = 0
+        self._caller = caller
+
+    def poll(self, _timeout: float = 0.0) -> bool:
+        assert threading.current_thread() is self._caller
+        return self._off < len(self._frame)
+
+    def _read(self, _handle: object, _nbytes: int) -> bytes:
+        assert threading.current_thread() is self._caller
+        chunk = self._frame[self._off : self._off + 1]
+        self._off += len(chunk)
+        return chunk
+
+    _handle = 0
+
+
+def test_partial_frame_uses_one_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A late header must not grant the payload read a second full deadline."""
+    pool = _pool()
+    replaced: list[str] = []
+    monkeypatch.setattr(pool, "_replace_worker", lambda: replaced.append("replaced"))
+    try:
+        started = time.perf_counter()
+        result = pool._await_reply(cast(Any, _LateHeader()), cast(Any, types.SimpleNamespace(is_alive=lambda: True, exitcode=None)), 0.8)
+        elapsed = time.perf_counter() - started
+    finally:
+        pool.close()
+    assert result.status == "timeout"
+    assert "0.8" in result.detail
+    assert replaced == ["replaced"]
+    assert elapsed > 0.7
+    assert elapsed < 1.05
+
+
+def test_reply_frame_is_read_on_the_calling_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = ForkingPickler.dumps(("ok", {"n": 1}))
+    frame = struct.pack("!i", len(payload)) + payload
+    pool = _pool()
+    replaced: list[str] = []
+    monkeypatch.setattr(pool, "_replace_worker", lambda: replaced.append("replaced"))
+    caller = threading.current_thread()
+    try:
+        result = pool._await_reply(cast(Any, _ChunkedFrame(frame, caller)), cast(Any, types.SimpleNamespace(is_alive=lambda: True, exitcode=None)), 2.0)
+    finally:
+        pool.close()
+    assert result.status == "ok"
+    assert result.value == {"n": 1}
+    assert replaced == []
+    assert "arbez-pool-recv" not in {thread.name for thread in threading.enumerate()}
+
+
+def test_keyboard_interrupt_during_reply_replaces_the_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = _quiet_pool(monkeypatch)
+    replaced: list[str] = []
+    monkeypatch.setattr(pool, "_replace_worker", lambda: replaced.append("replaced"))
+    conn = pool._conn
+    assert conn is not None
+
+    def poll(_timeout: float = 0.0) -> bool:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(conn, "poll", poll)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            pool._call_process(_image(0), 1.0)
+        assert replaced == ["replaced"]
+    finally:
+        pool._conn = None
+        pool._proc = None
+        pool.close()
+
+
+def test_scanner_scan_accepts_a_lazy_rgb_image(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``Image.open`` of an RGB file is lazy. The per-scan shell must load it."""
+    monkeypatch.setenv("ARBEZ_ISOLATION", "off")
+    path = tmp_path / "photo.jpg"
+    Image.new("RGB", (8, 8), (200, 10, 10)).save(path, format="JPEG")
+    opened = Image.open(path)
+    assert opened.mode == "RGB"
+    with pytest.raises(AssertionError):
+        _ = opened.im
+
+    class _Touch:
+        name = "fake"
+
+        def detect_and_decode(self, image: object) -> tuple[()]:
+            assert getattr(image, "size", None) == (8, 8)
+            return ()
+
+    result = Scanner(engine=_Touch()).scan(opened)
+    assert "engine_faults" not in result.extras
 
 
 def test_non_finite_deadline_is_a_timeout_before_a_worker_starts() -> None:

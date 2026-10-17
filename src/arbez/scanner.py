@@ -249,9 +249,11 @@ def _per_scan_image(pil_image: PILImage) -> PILImage:
     """Distinct shell around the same pixels.
 
     Diagnostics are remembered by object identity. Two threads scanning
-    one ``Image`` would otherwise share that slot. ``_new`` does not
-    copy the buffer; engines read the pixels and do not mutate them.
+    one ``Image`` would otherwise share that slot. ``load`` materializes
+    a lazy file image so the core exists; ``_new`` does not copy the
+    buffer. Engines read the pixels and do not mutate them.
     """
+    pil_image.load()
     return pil_image._new(pil_image.im)
 
 
