@@ -150,8 +150,10 @@ schedule + macOS's malloc-reclamation timing.
   native handles (ORT session, cv2.wechat_qrcode detector, pyobjc
   Vision module). Idempotent — safe to call multiple times. After
   `close()`, a subsequent `scan()` lazy-reinit's the engine. A
-  name-built engine is constructed again. A caller-supplied instance
-  is that same object, so its configuration stands. Most callers
+  name-built engine is constructed again with this Scanner's flags. A
+  supplied WeChatEngine is that same object, so its
+  `full_frame_fallback` stands. Any other supplied engine is rebuilt
+  from its name without those flags. Most callers
   treat `close()` as terminal; the lazy reinit makes the API
   forgiving for test fixtures + context managers. Use via
   `with Scanner(...)` for the common case.
