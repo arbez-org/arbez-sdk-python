@@ -9,6 +9,7 @@ images stay in the private benchmark.
 from __future__ import annotations
 
 import contextlib
+import mmap
 import os
 import signal
 import struct
@@ -508,9 +509,16 @@ def test_linux_page_round_refuses_before_mapping(monkeypatch: pytest.MonkeyPatch
 def test_linux_fallocate_failure_is_a_crash_and_unlinks(monkeypatch: pytest.MonkeyPatch) -> None:
     import arbez.engines._pool as pool_mod
 
-    def fallocate(_fd: int, _offset: int, length: int) -> None:
-        assert length == pool_mod._page_charged_bytes(1)
+    payload = np.full((8, 8, 3), 0xA5, dtype=np.uint8)
+    expect = payload.tobytes()
+    charged = pool_mod._page_charged_bytes(max(int(payload.nbytes), 1))
+
+    def fallocate(fd: int, _offset: int, length: int) -> None:
+        assert length == charged
         assert pool_mod._shm_charge_lock.locked()
+        # The store must not have run. A zero page would hide an all-zero copy.
+        with mmap.mmap(fd, length) as mapped:
+            assert expect not in mapped.read(length)
         raise OSError(28, "No space left on device")
 
     _pretend_linux_tmpfs(monkeypatch, free=10**12, fallocate=fallocate)
@@ -523,12 +531,12 @@ def test_linux_fallocate_failure_is_a_crash_and_unlinks(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(shared_memory.SharedMemory, "unlink", unlink)
     with pytest.raises(pool_mod._SharedMemoryCapacityError):
-        pool_mod._create_shared_image(_image(0))
+        pool_mod._create_shared_image(payload)
     assert unlinked
 
     pool = _quiet_pool(monkeypatch)
     try:
-        result = pool.call(_image(0))
+        result = pool.call(payload)
     finally:
         pool._conn = None
         pool._proc = None
@@ -579,65 +587,173 @@ def test_linux_shm_charges_are_serialized(monkeypatch: pytest.MonkeyPatch) -> No
             shm.unlink()
 
 
-class _LateHeader:
+class _TrackedConn:
+    """Records poll, ``_read``, and ``recv``, and checks them at ``close``.
+
+    A call from any other thread stays inside the method until ``close``.
+    ``close`` then rejects that thread, including one that has not returned.
+    """
+
+    def __init__(self) -> None:
+        self.caller_ident = threading.get_ident()
+        self._guard = threading.Lock()
+        self._inside: set[int] = set()
+        self.calls: list[tuple[str, int]] = []
+        self.closed = False
+        self._release = threading.Event()
+        self._handle = 0
+
+    def _enter(self, op: str) -> None:
+        ident = threading.get_ident()
+        with self._guard:
+            self.calls.append((op, ident))
+            self._inside.add(ident)
+
+    def _leave(self) -> None:
+        with self._guard:
+            self._inside.discard(threading.get_ident())
+
+    def _wait_if_foreign(self) -> None:
+        if threading.get_ident() != self.caller_ident:
+            self._release.wait(5)
+
+    def close(self) -> None:
+        try:
+            with self._guard:
+                foreign_calls = [op for op, ident in self.calls if ident != self.caller_ident]
+                foreign_inside = self._inside - {self.caller_ident}
+            assert foreign_calls == []
+            assert foreign_inside == set()
+            self.closed = True
+        finally:
+            self._release.set()
+
+    def recv(self) -> Any:
+        self._enter("recv")
+        try:
+            self._wait_if_foreign()
+            return None
+        finally:
+            self._leave()
+
+
+class _LateHeader(_TrackedConn):
     """Header becomes readable after 0.5 s, then the payload never arrives."""
 
     def __init__(self) -> None:
+        super().__init__()
         self._header = struct.pack("!i", 16)
         self._off = 0
         self._announced = False
 
     def poll(self, timeout: float = 0.0) -> bool:
-        if not self._announced:
-            self._announced = True
-            time.sleep(min(timeout, 0.5))
-            return True
-        time.sleep(max(timeout, 0.0))
-        return False
+        self._enter("poll")
+        try:
+            self._wait_if_foreign()
+            if threading.get_ident() != self.caller_ident:
+                return False
+            if not self._announced:
+                self._announced = True
+                time.sleep(min(timeout, 0.5))
+                return True
+            time.sleep(max(timeout, 0.0))
+            return False
+        finally:
+            self._leave()
 
     def _read(self, _handle: object, nbytes: int) -> bytes:
-        chunk = self._header[self._off : self._off + nbytes]
-        self._off += len(chunk)
-        return chunk
+        self._enter("_read")
+        try:
+            self._wait_if_foreign()
+            if threading.get_ident() != self.caller_ident:
+                return b""
+            chunk = self._header[self._off : self._off + nbytes]
+            self._off += len(chunk)
+            return chunk
+        finally:
+            self._leave()
 
-    _handle = 0
 
-
-class _ChunkedFrame:
+class _ChunkedFrame(_TrackedConn):
     """One reply, delivered a byte at a time on this thread."""
 
-    def __init__(self, frame: bytes, caller: threading.Thread) -> None:
+    def __init__(self, frame: bytes) -> None:
+        super().__init__()
         self._frame = frame
         self._off = 0
-        self._caller = caller
 
     def poll(self, _timeout: float = 0.0) -> bool:
-        assert threading.current_thread() is self._caller
-        return self._off < len(self._frame)
+        self._enter("poll")
+        try:
+            self._wait_if_foreign()
+            if threading.get_ident() != self.caller_ident:
+                return False
+            return self._off < len(self._frame)
+        finally:
+            self._leave()
 
     def _read(self, _handle: object, _nbytes: int) -> bytes:
-        assert threading.current_thread() is self._caller
-        chunk = self._frame[self._off : self._off + 1]
-        self._off += len(chunk)
-        return chunk
+        self._enter("_read")
+        try:
+            self._wait_if_foreign()
+            if threading.get_ident() != self.caller_ident:
+                return b""
+            chunk = self._frame[self._off : self._off + 1]
+            self._off += len(chunk)
+            return chunk
+        finally:
+            self._leave()
 
-    _handle = 0
+
+class _InterruptConn(_TrackedConn):
+    """``poll`` raises ``KeyboardInterrupt`` on the calling thread."""
+
+    def send(self, _message: object) -> None:
+        return None
+
+    def poll(self, _timeout: float = 0.0) -> bool:
+        self._enter("poll")
+        try:
+            self._wait_if_foreign()
+            if threading.get_ident() != self.caller_ident:
+                return False
+            raise KeyboardInterrupt
+        finally:
+            self._leave()
+
+    def _read(self, _handle: object, _nbytes: int) -> bytes:
+        self._enter("_read")
+        try:
+            self._wait_if_foreign()
+            return b""
+        finally:
+            self._leave()
+
+
+def _alive_proc() -> Any:
+    return types.SimpleNamespace(is_alive=lambda: True, exitcode=None)
 
 
 def test_partial_frame_uses_one_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A late header must not grant the payload read a second full deadline."""
+    """A late header must not grant the payload read a second full deadline.
+
+    The timeout path closes this connection. Spawn is skipped so the
+    elapsed bound stays the reply budget, not a worker start.
+    """
     pool = _pool()
-    replaced: list[str] = []
-    monkeypatch.setattr(pool, "_replace_worker", lambda: replaced.append("replaced"))
+    conn = _LateHeader()
+    pool._conn = cast(Any, conn)
+    monkeypatch.setattr(pool, "_spawn_worker", lambda: None)
     try:
         started = time.perf_counter()
-        result = pool._await_reply(cast(Any, _LateHeader()), cast(Any, types.SimpleNamespace(is_alive=lambda: True, exitcode=None)), 0.8)
+        result = pool._await_reply(cast(Any, conn), cast(Any, _alive_proc()), 0.8)
         elapsed = time.perf_counter() - started
     finally:
         pool.close()
     assert result.status == "timeout"
     assert "0.8" in result.detail
-    assert replaced == ["replaced"]
+    assert conn.closed
+    assert [op for op, _ident in conn.calls] == ["poll", "_read", "poll"]
     assert elapsed > 0.7
     assert elapsed < 1.05
 
@@ -648,34 +764,30 @@ def test_reply_frame_is_read_on_the_calling_thread(monkeypatch: pytest.MonkeyPat
     pool = _pool()
     replaced: list[str] = []
     monkeypatch.setattr(pool, "_replace_worker", lambda: replaced.append("replaced"))
-    caller = threading.current_thread()
+    conn = _ChunkedFrame(frame)
     try:
-        result = pool._await_reply(cast(Any, _ChunkedFrame(frame, caller)), cast(Any, types.SimpleNamespace(is_alive=lambda: True, exitcode=None)), 2.0)
+        result = pool._await_reply(cast(Any, conn), cast(Any, _alive_proc()), 2.0)
     finally:
         pool.close()
     assert result.status == "ok"
     assert result.value == {"n": 1}
     assert replaced == []
-    assert "arbez-pool-recv" not in {thread.name for thread in threading.enumerate()}
+    assert [op for op, ident in conn.calls if ident != conn.caller_ident] == []
+    assert "recv" not in {op for op, _ident in conn.calls}
 
 
 def test_keyboard_interrupt_during_reply_replaces_the_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pool = _quiet_pool(monkeypatch)
-    replaced: list[str] = []
-    monkeypatch.setattr(pool, "_replace_worker", lambda: replaced.append("replaced"))
-    conn = pool._conn
-    assert conn is not None
-
-    def poll(_timeout: float = 0.0) -> bool:
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(conn, "poll", poll)
+    monkeypatch.setattr(pool, "_spawn_worker", lambda: None)
+    conn = _InterruptConn()
+    pool._conn = cast(Any, conn)
     try:
         with pytest.raises(KeyboardInterrupt):
             pool._call_process(_image(0), 1.0)
-        assert replaced == ["replaced"]
+        assert conn.closed
+        assert [op for op, _ident in conn.calls] == ["poll"]
     finally:
         pool._conn = None
         pool._proc = None
