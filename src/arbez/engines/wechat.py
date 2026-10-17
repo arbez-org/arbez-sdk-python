@@ -39,6 +39,7 @@ import threading
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
+from arbez.engines._pool import EnginePool, bind_diagnostics, reset_diagnostics
 from arbez.engines.base import ThreadSafety
 from arbez.engines.helpers import coerce_to_pil
 from arbez.exceptions import EngineRuntimeError, EngineUnavailable
@@ -189,6 +190,59 @@ def _load_model_detector(wechat_mod: Any) -> Any:
         ) from e
 
 
+def _detach_points(points: Any) -> Any:
+    """Copy corner arrays before they leave the worker.
+
+    The parent unlinks the input segment as soon as the reply is pickled.
+    A view into that segment would dangle. Malformed points stay as they
+    are so ``_translate`` can drop them.
+    """
+    try:
+        import numpy as np
+
+        return np.array(points, copy=True)
+    except (TypeError, ValueError):
+        return points
+
+
+def _wechat_invoke(
+    holder: WeChatEngine,
+    bgr: Any,
+    *,
+    full_frame: bool = True,
+) -> tuple[list[Any], list[Any]]:
+    """Net pass, then the no-argument full frame when that pass has no payload.
+
+    One call so both constructors share a single pool deadline. A crash
+    here kills the worker; the parent must not run the fallback itself.
+    ``full_frame=False`` is the pre-seeded detector path: that object
+    stays in the parent, and the no-argument constructor must not.
+    """
+    detector = holder._get_detector()
+    payloads, points_list = detector.detectAndDecode(bgr)
+    # Copy before the emptiness check. The 5.0.0.93 binding returns
+    # tuples, which can be walked twice; a one-shot sequence would
+    # lose its tail after any().
+    payloads = list(payloads)
+    points_list = list(points_list)
+    if full_frame and not any(payloads):
+        payloads, points_list = holder._get_full_frame_detector().detectAndDecode(bgr)
+        payloads = list(payloads)
+        points_list = list(points_list)
+    return payloads, [_detach_points(pts) for pts in points_list]
+
+
+def _wechat_worker_init() -> Any:
+    """Load the nets once in the worker. The parent keeps no detector."""
+    engine = WeChatEngine()
+    engine._get_detector()
+
+    def run(image: Any) -> tuple[list[Any], list[Any]]:
+        return _wechat_invoke(engine, image)
+
+    return run
+
+
 # ── Engine ─────────────────────────────────────────────────────────────────
 
 
@@ -269,6 +323,8 @@ class WeChatEngine:
         # return no payload (S-096).
         self._detector: Any | None = None
         self._full_frame: Any | None = None
+        # S-097: one worker per instance. None until the first scan or warmup.
+        self._pool: EnginePool | None = None
         # S-039 (v0.0.24): cache the cv2 + numpy module refs so the
         # hot path doesn't redo ``import cv2`` / ``import numpy`` on
         # every detect call. Both are idempotent + already cached by
@@ -299,10 +355,21 @@ class WeChatEngine:
         detector stays lazy; it is built only when a scan's net pass returns no payload.
 
         S-080: added the PIL prewarm to keep the warmup contract consistent across all engines.
+
+        S-097: a worker loads the nets in that process. The in-process
+        fallback still builds the detector on this object and does not
+        call ``detectAndDecode``.
         """
         from arbez.engines.helpers import prewarm_pil
+
         with self._lock:
-            self._get_detector()
+            pool = self._pool_under_lock()
+            if pool.isolation == "process":
+                pool.start()
+            # start() falls back in-process when spawn fails. Build the
+            # detector here in that case, and only then.
+            if pool.isolation == "inprocess":
+                self._get_detector()
         prewarm_pil()
 
     def close(self) -> None:
@@ -320,6 +387,10 @@ class WeChatEngine:
         with self._lock:
             self._detector = None
             self._full_frame = None
+            pool = self._pool
+            self._pool = None
+        if pool is not None:
+            pool.close()
 
     def detect_and_decode(
         self,
@@ -341,10 +412,17 @@ class WeChatEngine:
         Returns a tuple of :class:`~arbez.Detection`, all with ``symbology=Symbology.QR``, sorted by
         descending bbox area (larger codes first — there's no per-detection score from the detector,
         so area is a reasonable proxy for "salience"). Empty tuple if WeChat found nothing
-        decodable.
+        decodable. A native crash or a deadline (S-097) is also an empty tuple; ``Scanner`` records
+        it on ``Result.extras`` instead of raising.
         """
         pil_image = coerce_to_pil(image)
+        token = bind_diagnostics(pil_image)
+        try:
+            return self._detect_bound(pil_image)
+        finally:
+            reset_diagnostics(token)
 
+    def _detect_bound(self, pil_image: PILImage) -> tuple[Detection, ...]:
         # S-039 (v0.0.24): cv2 + numpy are resolved once per call via
         # ``_get_modules`` and cached on ``self``; previously they were
         # ``import``ed inline on every detect call. Idempotent + the
@@ -362,30 +440,25 @@ class WeChatEngine:
         # (benchmarked: 5.6ms -> 0.16ms on 1500x1000; 48.8ms -> 1.95ms
         # on 4032x3024).
         rgb = np_mod.asarray(pil_image, dtype=np_mod.uint8)
-        bgr = cv2_mod.cvtColor(rgb, cv2_mod.COLOR_RGB2BGR)
+        bgr = np_mod.ascontiguousarray(cv2_mod.cvtColor(rgb, cv2_mod.COLOR_RGB2BGR))
 
+        # Hold this lock from the moment the pool is taken through the
+        # call. close() takes the same lock before it drops the pool, so
+        # it waits out an in-flight call instead of closing under it.
+        # A detector placed on this instance (the length-mismatch test)
+        # cannot be pickled into a worker. Run that object here, and do
+        # not construct the no-argument detector in the parent.
+        # Production leaves _detector unset until an in-process fallback
+        # builds one inside the pool.
         with self._lock:
-            # S-012 thread-safety: serialize concurrent scans on a shared
-            # WeChatEngine. The lock covers both the lazy detector
-            # construction AND the detectAndDecode call — the cv2
-            # WeChat detector is doc'd thread-unsafe.
-            detector = self._get_detector()
-            payloads, points_list = detector.detectAndDecode(bgr)
-            # Copy before the emptiness check. The 5.0.0.93 binding returns
-            # tuples, which can be walked twice; a one-shot sequence would
-            # lose its tail after any().
-            payloads = list(payloads)
-            points_list = list(points_list)
-            # S-096: the SSD detector rescales the frame toward a 400x400
-            # input and does not fall back to the full frame when it finds
-            # nothing. A tiny clean code on a large canvas is decoded by
-            # the no-argument constructor and missed by the nets. Retry
-            # that path only when the net pass produced no payload. A
-            # constructor failure is not a miss and is not retried.
-            if not any(payloads):
-                payloads, points_list = self._get_full_frame_detector().detectAndDecode(bgr)
-                payloads = list(payloads)
-                points_list = list(points_list)
+            if self._pool is None and self._detector is not None:
+                payloads, points_list = _wechat_invoke(self, bgr, full_frame=False)
+            else:
+                pool = self._pool_under_lock()
+                outcome = pool.call(bgr)
+                if outcome.status != "ok":
+                    return ()
+                payloads, points_list = outcome.value
 
         detections: list[Detection] = []
         # H3 (S-016): strict=True catches upstream length mismatches.
@@ -445,6 +518,24 @@ class WeChatEngine:
             self._cv2 = _cv2
             self._np = _np
         return self._cv2, self._np
+
+    def _pool_under_lock(self) -> EnginePool:
+        """Build the isolation pool on first use. Caller holds ``self._lock``."""
+        if self._pool is None:
+            self._pool = EnginePool(
+                "arbez.engines.wechat:_wechat_worker_init",
+                engine="wechat",
+                inprocess_factory=self._inprocess_runner,
+            )
+        return self._pool
+
+    def _inprocess_runner(self) -> Any:
+        engine = self
+
+        def run(image: Any) -> tuple[list[Any], list[Any]]:
+            return _wechat_invoke(engine, image)
+
+        return run
 
     def _get_detector(self) -> Any:
         """Build the cv2 WeChat detector on first call.

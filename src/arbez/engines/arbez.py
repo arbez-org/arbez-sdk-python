@@ -54,6 +54,12 @@ from types import MappingProxyType
 from typing import IO, TYPE_CHECKING, Any
 
 from arbez.engines import _rtdetr, _yolo11
+from arbez.engines._pool import (
+    bind_diagnostics,
+    drop_libdmtx_pool_if_given_up,
+    libdmtx_pool,
+    reset_diagnostics,
+)
 from arbez.engines._yolox import (
     LEGACY_9_CLASS_NAMES,
     RawDetection,
@@ -67,7 +73,7 @@ from arbez.engines._yolox import (
 from arbez.engines.base import ThreadSafety
 from arbez.engines.helpers import coerce_to_pil
 from arbez.engines.zxing import symbology_for_zxing_format
-from arbez.exceptions import EngineUnavailable
+from arbez.exceptions import EngineRuntimeError, EngineUnavailable
 from arbez.types import Detection, Symbology
 
 # S-066: architecture dispatch — values come from the bundled (or
@@ -128,6 +134,19 @@ _LIBDMTX_FALLBACK_SYMBOLOGIES: frozenset[Symbology] = frozenset({
 def _should_try_libdmtx_fallback(symbology: Symbology) -> bool:
     """Whether to offer a failed zxing crop to the libdmtx decoder (S-092+)."""
     return symbology in _LIBDMTX_FALLBACK_SYMBOLOGIES
+
+
+def _is_libdmtx_decode(fn: Any) -> bool:
+    """True only for the real pylibdmtx ``decode``.
+
+    Routing tests inject fakes that must keep running in-process, with the
+    same crop and ``max_count`` / ``timeout`` arguments as before. The real
+    decoder is the one whose native code can crash the host.
+    """
+    return (
+        getattr(fn, "__module__", None) == "arbez_dmtx._libdmtx.pylibdmtx"
+        and getattr(fn, "__name__", None) == "decode"
+    )
 
 
 if TYPE_CHECKING:
@@ -700,6 +719,9 @@ class ArbezEngine:
             # it without triggering a session reload. Resetting it
             # would mean ``ArbezEngine().close().model_version`` would
             # surprise users by reloading the session.
+        # A shared libdmtx worker stays up. A pool that abandoned its
+        # worker can be dropped so the next decode may spawn again.
+        drop_libdmtx_pool_if_given_up()
 
     def detect_and_decode(
         self,
@@ -779,8 +801,14 @@ class ArbezEngine:
         if not raw_dets:
             return ()
 
-        # Stage 4: classical decoder on each crop.
-        return self._decode_detections(raw_dets, pil_image)
+        # Stage 4: classical decoder on each crop. Bind on this thread so a
+        # libdmtx fault lands on the scan that attached diagnostics to this
+        # image; the crop is a different object (S-097).
+        token = bind_diagnostics(pil_image)
+        try:
+            return self._decode_detections(raw_dets, pil_image)
+        finally:
+            reset_diagnostics(token)
 
     # ── Internal helpers ───────────────────────────────────────────────────
 
@@ -1044,6 +1072,8 @@ class ArbezEngine:
         Only invoked when zxing-cpp failed on a DATA_MATRIX-class detection.
         Crops the bbox (with pad), upscales small crops (libdmtx benefits), and
         runs libdmtx with a short timeout. Returns the payload or ``None``.
+        The real decoder runs in the isolation pool (S-097); a crash or a
+        deadline is a miss. Injected callables stay in this process.
         """
         try:
             bmin = min(det.x2 - det.x1, det.y2 - det.y1)
@@ -1061,14 +1091,28 @@ class ArbezEngine:
             if min(cw, ch) < 300:  # libdmtx decodes upscaled crops far better
                 s = 300.0 / min(cw, ch)
                 crop = crop.resize((max(1, int(cw * s)), max(1, int(ch * s))))
-            res = dmtx_decode(crop, max_count=1, timeout=300)
-            if res:
-                # str(...) because dmtx_decode is Any-typed (optional dep), so
-                # mypy can't see that .data is bytes / .decode() returns str.
-                return str(res[0].data.decode("utf-8", "replace"))
+            if not _is_libdmtx_decode(dmtx_decode):
+                res = dmtx_decode(crop, max_count=1, timeout=300)
+                if res:
+                    # str(...) because dmtx_decode is Any-typed (optional dep), so
+                    # mypy can't see that .data is bytes / .decode() returns str.
+                    return str(res[0].data.decode("utf-8", "replace"))
+                return None
+            import numpy as np
+
+            array = np.ascontiguousarray(np.asarray(crop))
+        except (EngineRuntimeError, EngineUnavailable):
+            raise
         except Exception as e:
             _log.debug("ArbezEngine: libdmtx fallback failed: %r", e)
-        return None
+            return None
+        # Outside the swallow. A crash or a deadline is a miss. An init
+        # failure, a startup deadline, and a Python error from decode
+        # still propagate, and the pool does not retry those in-process.
+        outcome = libdmtx_pool().call(array)
+        if outcome.status != "ok" or not isinstance(outcome.value, str):
+            return None
+        return outcome.value
 
     def _decode_detections(
         self, raw_dets: list[RawDetection], pil_image: PILImage,

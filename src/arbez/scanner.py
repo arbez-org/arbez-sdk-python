@@ -67,6 +67,12 @@ from arbez._engine_discovery import (
     # ``from arbez.scanner import resolve_auto_engine`` as before.
     resolve_auto_engine as resolve_auto_engine,
 )
+from arbez.engines._pool import (
+    MAX_RECALL_DEADLINE_S,
+    ScanDiagnostics,
+    attach_diagnostics,
+    detach_diagnostics,
+)
 from arbez.engines.base import Engine
 from arbez.engines.helpers import coerce_to_pil
 from arbez.exceptions import EngineRuntimeError, EngineUnavailable
@@ -237,6 +243,18 @@ def _validate_consensus_subset(
 
 
 # ── Preprocessing helpers (S-022) ──────────────────────────────────────────
+
+
+def _per_scan_image(pil_image: PILImage) -> PILImage:
+    """Distinct shell around the same pixels.
+
+    Diagnostics are remembered by object identity. Two threads scanning
+    one ``Image`` would otherwise share that slot. ``load`` materializes
+    a lazy file image so the core exists; ``_new`` does not copy the
+    buffer. Engines read the pixels and do not mutate them.
+    """
+    pil_image.load()
+    return pil_image._new(pil_image.im)
 
 
 def _auto_preprocess(pil_image: PILImage) -> tuple[PILImage, float, float]:
@@ -677,7 +695,9 @@ class Scanner:
         descending score, the **original** input image size (for
         client overlay code), and per-stage wall-clock timings in
         ``timings_ms``. When ``preprocess != "off"``, ``timings_ms``
-        includes a ``"preprocess"`` key.
+        includes a ``"preprocess"`` key. ``extras`` records engine
+        isolation (S-097): whether a native engine ran in a worker,
+        and any crash or deadline that was contained.
         """
         # Delegate to the public ``coerce_to_pil`` helper — same code
         # path the engines themselves use. Previously Scanner had a
@@ -702,6 +722,37 @@ class Scanner:
                 f"preprocess must be 'off' or 'auto'; got {preprocess!r}"
             )
 
+        # S-097: Scanner is maximum recall in this release (S-093), so the
+        # pool deadline is 10 s. Attach after preprocess: that step can
+        # replace the image. The shell is a new object, so a second scan
+        # of the caller's image does not share this slot. The engine
+        # thread binds the shell it is given.
+        pil_image = _per_scan_image(pil_image)
+        diag = ScanDiagnostics(deadline_s=MAX_RECALL_DEADLINE_S)
+        attach_diagnostics(pil_image, diag)
+        try:
+            return self._scan_with_diagnostics(
+                pil_image,
+                original_size,
+                scale_inv_x,
+                scale_inv_y,
+                preprocess,
+                preprocess_ms,
+                diag,
+            )
+        finally:
+            detach_diagnostics(pil_image)
+
+    def _scan_with_diagnostics(
+        self,
+        pil_image: PILImage,
+        original_size: tuple[int, int],
+        scale_inv_x: float,
+        scale_inv_y: float,
+        preprocess: PreprocessMode,
+        preprocess_ms: float,
+        diag: ScanDiagnostics,
+    ) -> Result:
         # Branch on consensus mode (S-032). The off-path runs a single
         # engine; the vote-path dispatches all engines in parallel and
         # votes on the merged result.
@@ -754,6 +805,7 @@ class Scanner:
             image_size=original_size,
             per_engine=per_engine,
             timings_ms=timings,
+            extras=diag.to_extras(),
         )
 
     def warmup(self) -> None:

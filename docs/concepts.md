@@ -14,7 +14,7 @@ the entire mental model:
 | **`Scanner`** | The high-level entry point. Picks an engine, runs it, wraps the result. |
 | **`Engine`** | The Protocol every engine satisfies — `detect_and_decode(image) -> tuple[Detection, ...]`. |
 | **`Detection`** | One barcode found in an image: bbox + symbology + score + payload + polygon. |
-| **`Result`** | One scan's full output: detections + input image size + per-stage timings. |
+| **`Result`** | One scan's full output: detections + input image size + per-stage timings + `extras`. |
 | **`Symbology`** | The Enum of barcode classes (`QR`, `CODE_128`, `EAN_13`, …). |
 
 Everything else (the exception hierarchy, `coerce_to_pil`, the
@@ -119,6 +119,9 @@ Result(
     per_engine={             # each engine's own raw detections, before the merge
         "arbez": (Detection(...),),
     },
+    extras={                 # isolation and contained native faults (S-097)
+        "isolation": {"wechat": "process"},
+    },
 )
 ```
 
@@ -144,6 +147,31 @@ single-engine path). `detections` is the merged, per-code view;
 engine actually found this code?" without re-running anything. On
 the multi-engine path each merged `Detection` also carries
 `extras["voted_by"]`, the engines that agreed on that code.
+
+`Result.extras` is scan-level and read-only. It is a different dict
+from `Detection.extras`. Keys are omitted when empty. `isolation` maps
+an engine name to `"process"` (a spawned worker) or `"inprocess"`.
+`isolation_reason` is set only for an in-process fallback.
+`engine_faults` lists contained crashes and deadlines; the scan still
+returns.
+
+## Native crashes stay in a worker
+
+WeChat, and the libdmtx Data Matrix fallback inside `ArbezEngine`, run
+in a `spawn` worker. The engine is loaded once there. `fork` is not
+used: forking after Apple Vision or onnxruntime is loaded segfaults
+the worker. Each call has a deadline. A direct engine call gets 2
+seconds. `Scanner.scan` gets 10 seconds, because a bare `Scanner()` is
+maximum recall. A crash or a deadline kills that worker, starts
+another, and comes back as no detection from that engine. It is not
+raised.
+
+The pool runs in the calling process when `ARBEZ_ISOLATION=off`, when
+the caller is a daemon, when Linux cannot write `/dev/shm`, or when
+the program has no `if __name__ == "__main__"` guard (`python -c`, a
+REPL). In-process mode cannot stop a native crash. The choice is
+logged once and copied onto `Result.extras`. zxing-cpp still runs in
+the caller.
 
 ## Symbology — the barcode classes
 
@@ -652,6 +680,7 @@ relevant to users:
 
 | ADR | Subject |
 |---|---|
+| S-097 | WeChat and libdmtx run in a spawned worker; crashes and deadlines land on `Result.extras` |
 | S-007 | Public `Engine` Protocol + `coerce_to_pil` — the "write your own engine" contract |
 | S-008 | Per-platform engine probing (superseded by S-093 union default in 0.2.0) |
 | S-011 | `ArbezEngine` two-stage decoding (our detector + classical decoder) |
