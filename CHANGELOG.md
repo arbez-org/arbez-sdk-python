@@ -73,9 +73,11 @@ the explicit maintainer act of tagging is the gate.
   applies when `Image.MAX_IMAGE_PIXELS` is `None`. Pillow itself only
   raises above twice that limit. WebP and ICO are rejected from the
   container header before those plugins allocate or `load()` inside
-  `Image.open`. The ICO size is the embedded PNG `IHDR`, including
-  when another chunk precedes it. An ICO whose frame size cannot be
-  read is rejected instead of opened. An oversize array shape is
+  `Image.open`. The ICO size is the last embedded PNG `IHDR` before
+  the first IDAT, fdAT, or IEND, including when another chunk or an
+  earlier `IHDR` precedes it. An ICO whose frame size cannot be
+  read, or whose chunk walk hits its cap before one of those three,
+  is rejected instead of opened. An oversize array shape is
   rejected the same way.
   When Pillow's own check raises, the error quotes that limit (twice
   the process global), not this constant.

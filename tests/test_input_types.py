@@ -1043,6 +1043,118 @@ def test_coerce_to_pil_accepts_small_ico() -> None:
     assert out.getpixel((0, 0)) == (255, 0, 0)
 
 
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    """One PNG chunk with a real CRC. No pixel buffer is required."""
+    import zlib
+
+    crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+    return len(data).to_bytes(4, "big") + tag + data + crc.to_bytes(4, "big")
+
+
+def _png_ihdr_chunk(width: int, height: int) -> bytes:
+    """IHDR for 8-bit RGB, non-interlaced."""
+    data = width.to_bytes(4, "big") + height.to_bytes(4, "big") + bytes([8, 2, 0, 0, 0])
+    return _png_chunk(b"IHDR", data)
+
+
+def _ico_around_png(png: bytes, *, width: int = 16, height: int = 16) -> bytes:
+    """ICO directory around an embedded PNG. Width and height are one byte."""
+    entry = bytes([width, height, 0, 0]) + (1).to_bytes(2, "little")
+    entry += (32).to_bytes(2, "little") + len(png).to_bytes(4, "little")
+    entry += (22).to_bytes(4, "little")
+    return b"\x00\x00\x01\x00" + (1).to_bytes(2, "little") + entry + png
+
+
+def test_coerce_to_pil_rejects_ico_whose_later_ihdr_is_over_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 1x1 IHDR does not hide a later 4000x24000 IHDR.
+
+    Pillow overwrites the PNG size on every IHDR until IDAT and
+    decodes that later size inside ``IcoImageFile._open``. The
+    fixture is headers plus a one-byte IDAT, not the solid pixel
+    buffer. ``Image.open`` must not run.
+    """
+    from arbez.engines.helpers import MAX_IMAGE_PIXELS
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_ihdr_chunk(1, 1)
+        + _png_ihdr_chunk(4000, 24_000)
+        + _png_chunk(b"IDAT", b"\x00")
+    )
+    raw = _ico_around_png(png)
+    assert len(raw) < 200
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Image.open must not run")
+
+    monkeypatch.setattr(Image, "open", _boom)
+    previous = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with pytest.raises(
+            InvalidInputError, match="decompression-bomb limit of"
+        ) as exc_info:
+            coerce_to_pil(raw)
+        message = str(exc_info.value)
+        assert "4000x24000" in message
+        assert "1x1" not in message
+        assert str(MAX_IMAGE_PIXELS) in message
+        assert exc_info.value.__cause__ is None
+    finally:
+        Image.MAX_IMAGE_PIXELS = previous
+
+
+def test_coerce_to_pil_keeps_the_last_ihdr_under_the_cap() -> None:
+    """1x1 then 8x6 is the 8x6 image Pillow loads, not the first IHDR."""
+    stored = Image.new("RGB", (8, 6), "white")
+    stored.putpixel((0, 0), (1, 2, 3))
+    stored.putpixel((7, 5), (4, 5, 6))
+    buf = io.BytesIO()
+    stored.save(buf, format="PNG")
+    raw_png = buf.getvalue()
+    assert raw_png[12:16] == b"IHDR"
+    png = raw_png[:8] + _png_ihdr_chunk(1, 1) + raw_png[8:]
+    out = coerce_to_pil(_ico_around_png(png, width=8, height=6))
+    assert out.mode == "RGB"
+    assert out.size == (8, 6)
+    assert out.size != (1, 1)
+    assert out.tobytes() == stored.tobytes()
+
+
+def test_coerce_to_pil_rejects_ico_when_png_walk_stops_early(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cap hit before IDAT does not trust an earlier small IHDR.
+
+    A chunk longer than 16 MiB, or more chunks than the walk allows,
+    can hide a later IHDR. Both are rejected before ``Image.open``.
+    The long chunk is a length field only; its body is not allocated.
+    """
+    from arbez.engines.helpers import _MAX_PNG_CHUNK_LENGTH, _MAX_PNG_CHUNKS
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Image.open must not run")
+
+    monkeypatch.setattr(Image, "open", _boom)
+    long_chunk = (_MAX_PNG_CHUNK_LENGTH + 1).to_bytes(4, "big") + b"tEXt"
+    over_length = _ico_around_png(
+        b"\x89PNG\r\n\x1a\n" + _png_ihdr_chunk(1, 1) + long_chunk
+    )
+    filler = (0).to_bytes(4, "big") + b"tEXt" + b"\x00\x00\x00\x00"
+    over_count = _ico_around_png(
+        b"\x89PNG\r\n\x1a\n"
+        + _png_ihdr_chunk(1, 1)
+        + filler * _MAX_PNG_CHUNKS
+        + _png_ihdr_chunk(4000, 24_000)
+        + _png_chunk(b"IDAT", b"\x00")
+    )
+    for raw in (over_length, over_count):
+        with pytest.raises(InvalidInputError, match="could not be read"):
+            coerce_to_pil(raw)
+
+
 def test_coerce_to_pil_quotes_stricter_pillow_bomb_limit() -> None:
     """When Pillow's global fires, the error names that limit.
 

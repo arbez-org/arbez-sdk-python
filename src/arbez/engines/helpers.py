@@ -50,11 +50,13 @@ _XMP_ORIENTATION_TEXT = re.compile(r'tiff:Orientation(="|>)([0-9])')
 _XMP_ORIENTATION_BYTES = re.compile(rb'tiff:Orientation(="|>)([0-9])')
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-# IHDR is not always the first chunk. Walk a bounded prefix so a chunk
-# in front of it cannot make the size look unreadable and fall through
-# to ``IcoImageFile._open``, which decodes the PNG.
+# Pillow overwrites the PNG size on every IHDR until the first IDAT,
+# fdAT, or IEND. The walk stops at those chunks. Hitting the chunk
+# cap or a chunk longer than 16 MiB before that is a reject: a later
+# IHDR could be the size ``IcoImageFile._open`` decodes.
 _MAX_PNG_CHUNK_LENGTH = 16 * 1024 * 1024
-_MAX_PNG_CHUNKS_BEFORE_IHDR = 32
+_MAX_PNG_CHUNKS = 32
+_PNG_SIZE_STOP = (b"IDAT", b"fdAT", b"IEND")
 
 
 # Candidate allow-list of Pillow format names arbez accepts as input.
@@ -340,27 +342,36 @@ def _webp_canvas_size(header: bytes) -> tuple[int, int] | None:
 
 
 def _png_ihdr_size(source: Any, offset: int) -> tuple[int, int] | None:
-    """Width and height from a PNG embedded at ``offset``.
+    """Width and height Pillow will decode from a PNG at ``offset``.
 
-    Walks chunks until IHDR. A one-byte chunk before IHDR hides the
-    size from a 24-byte peek, and Pillow still decodes that PNG inside
-    ``IcoImageFile._open``. ``None`` means the size could not be read.
+    ``PngImageFile._open`` overwrites the image size on every IHDR
+    until the first IDAT, fdAT, or IEND, and ``IcoImageFile`` then
+    decodes that size. The result is the last IHDR in that span.
+    ``None`` means no readable IHDR, or the walk hit its chunk cap
+    or a chunk longer than 16 MiB before one of those three. The
+    caller rejects the ICO instead of opening it.
     """
     pos = offset + 8
-    for _ in range(_MAX_PNG_CHUNKS_BEFORE_IHDR):
+    size: tuple[int, int] | None = None
+    for _ in range(_MAX_PNG_CHUNKS):
         header = _peek_source(source, pos, 8)
-        if header is None or len(header) < 8:
+        if header is None:
             return None
+        if len(header) < 8:
+            return size
         length = int.from_bytes(header[:4], "big")
-        if length > _MAX_PNG_CHUNK_LENGTH:
+        ctype = header[4:8]
+        # Stop even when this chunk is longer than the skip cap. Its
+        # payload is the pixels, and the size is already decided.
+        if ctype in _PNG_SIZE_STOP:
+            return size
+        if length > _MAX_PNG_CHUNK_LENGTH or (ctype == b"IHDR" and length < 8):
             return None
-        if header[4:8] == b"IHDR":
-            if length < 8:
-                return None
+        if ctype == b"IHDR":
             data = _peek_source(source, pos + 8, 8)
             if data is None or len(data) < 8:
                 return None
-            return (
+            size = (
                 int.from_bytes(data[:4], "big"),
                 int.from_bytes(data[4:8], "big"),
             )
@@ -759,10 +770,12 @@ def coerce_to_pil(
     WebP and ICO sizes are read from the container header before the
     plugin is constructed. Those plugins allocate or ``load()`` inside
     ``Image.open``, and Pillow's own check does not run when
-    ``Image.MAX_IMAGE_PIXELS`` is ``None``. An ICO whose embedded PNG
-    hides ``IHDR`` behind another chunk is still measured from that
-    ``IHDR``. An ICO whose frame size cannot be read is rejected
-    before ``Image.open``.
+    ``Image.MAX_IMAGE_PIXELS`` is ``None``. An ICO's embedded PNG is
+    measured from the last ``IHDR`` before the first IDAT, fdAT, or
+    IEND, which is the size Pillow decodes. A walk that hits its
+    chunk cap or a chunk longer than 16 MiB before one of those is
+    rejected, as is an ICO whose frame size cannot be read. Neither
+    case calls ``Image.open``.
 
     Branch order: PIL duck-type FIRST because the common case is
     "Scanner already coerced; engine re-coerces defensively". Hot path

@@ -676,9 +676,11 @@ the caller's current frame, so an oversize earlier TIFF frame is
 not returned for a later small one. WebP and ICO are judged from
 the container header before the plugin is constructed, because
 those plugins allocate or `load()` inside `Image.open`. The ICO
-size is the embedded PNG `IHDR`, including when another chunk
-precedes it. An ICO whose frame size cannot be read is rejected
-instead of opened. Pillow's own check only raises above twice
+size is the last embedded PNG `IHDR` before the first IDAT, fdAT,
+or IEND, which is the size Pillow decodes. An ICO whose frame size
+cannot be read, or whose chunk walk hits its cap before one of
+those, is rejected instead of opened. Pillow's own check only
+raises above twice
 that, and setting `Image.MAX_IMAGE_PIXELS = None` does not disable
 this one. When Pillow's check does raise, the message quotes the
 limit Pillow used.

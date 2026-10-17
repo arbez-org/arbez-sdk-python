@@ -139,9 +139,11 @@ engine. S-022 left it in place.
 * WebP and ICO sizes are read from the container header before
   `Image.open`. Those plugins allocate or `load()` inside `_open`,
   and Pillow's check does nothing when `Image.MAX_IMAGE_PIXELS` is
-  `None`. The ICO's embedded PNG size is its `IHDR` chunk, including
-  when a chunk precedes `IHDR`. An ICO whose frame size cannot be
-  read is rejected instead of opened. The parser does not call
+  `None`. The ICO's embedded PNG size is the last `IHDR` before the
+  first IDAT, fdAT, or IEND. Pillow overwrites the size on every
+  earlier `IHDR` and decodes that last one. An ICO whose frame size
+  cannot be read, or whose chunk walk hits its cap before one of
+  those three, is rejected instead of opened. The parser does not call
   `Image._decompression_bomb_check`. JPEG, PNG, and PPM stay lazy
   and are still checked after open.
 * When Pillow's own bomb error fires (a stricter process global, at
