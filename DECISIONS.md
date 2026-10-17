@@ -11,6 +11,101 @@ ID prefix is `S-` (for SDK).
 
 ---
 
+## S-096 — WeChatEngine loads vendored ONNX nets (2026-10-17)
+
+**Context.** `WeChatEngine` called `cv2.wechat_qrcode.WeChatQRCode()`
+with no paths. The class comment said opencv-contrib 4.6+ bundles four
+Caffe files and that constructor loads them. Both claims are false for
+the wheel this repo installs.
+
+opencv-contrib-python 5.0.0.93 is built from opencv_contrib `755e506`.
+Its constructor takes `detector_model_path` and
+`super_resolution_model_path`. Empty strings set `use_nn_detector_` and
+`use_nn_sr_` false: no SSD detector, no super-resolution net, cubic
+resize only, and the whole image is the single candidate. Decode is
+still that module's ZXing-derived decoder. OpenCV 4's four-argument
+constructor does the same when its Caffe paths are empty, and OpenCV 5
+will not load those Caffe files.
+
+The published weights are one detector and one super-resolution net.
+The Caffe originals are WeChatCV/opencv_3rdparty `a8b69ccc` (same MD5s
+as opencv/opencv_3rdparty branch `wechat_qrcode_20210119`). That tree
+has no LICENSE file. The OpenCV module that loads the models is
+Apache-2.0 and carries `Copyright (C) 2020 THL A29 Limited, a Tencent
+company.` OpenCV 5 reads ONNX conversions via `dnn::readNetFromONNX`
+inside the constructor. opencv_extra's `download_models.py` pins the
+bytes by SHA-1:
+
+* `detect.onnx` `8dff596d81e6c223f188defc2616df1c83a406ae` (985788 bytes)
+* `sr.onnx` `854b183017c2303cc429bcaf598cc7fc18e076a6` (26467 bytes)
+
+The URL in that script is a personal GitHub release
+(`omrope79/opencv-test-models` v1.1.0), not an OpenCV or Tencent
+release. The wheel does not ship either file. A missing path makes the
+Python binding raise `SystemError` rather than a normal `cv2.error`.
+
+Loading the nets is not free recall. On OpenCV 5.0.0.93 the SSD
+rescales the frame toward a 400×400 input and, when it finds nothing,
+does not try the full frame. Measured locally: a 54×54 QR at (333, 333)
+on a 1000×1000 canvas of deterministic hash noise, blurred by a radius-1
+box filter, is missed with no arguments and decoded with the two paths
+(bbox about (335, 335)–(385, 385)). The same 54×54 and an 81×81 clean QR
+on a 1600×1600 white canvas are decoded with no arguments and missed by
+the nets. `readNetFromONNX` keeps the weights: deleting the files after
+the constructor returns still decodes. Swapped paths construct and then
+return nothing.
+
+5.0.0.93 was the only 5.x release of opencv-contrib-python on PyPI on
+2026-10-17. It has cp37-abi3 wheels for the audited platforms. Its
+metadata requires `numpy>=2` on Python >=3.9. The core floor pins
+`numpy==1.24.0`. Those two pins do not resolve in one environment.
+The old `[wechat]` floor was `>=4.9`, and `constraints/floor.txt`
+pinned `4.9.0.80`.
+
+**Decision.** Vendor `detect.onnx` and `sr.onnx` under
+`src/arbez/_assets/wechat/` with a NOTICE that records the chain above.
+Pass those two filesystem paths to `WeChatQRCode`. Hold
+`importlib.resources.as_file` across the constructor, then drop it.
+Require OpenCV major >= 5 at `WeChatEngine()` and raise
+`EngineUnavailable` for an older or unparseable version. If either file
+is missing, raise `EngineUnavailable` before calling OpenCV. If the
+constructor throws, raise `EngineRuntimeError` and do not retry with no
+arguments. If the net pass returns no payload, decode the same frame
+once with the no-argument constructor. Raise the `[wechat]` extra, the
+dev extra, and the wheel-audit spec to `opencv-contrib-python>=5`, and
+declare `numpy>=2` on that extra and on the dev extra. Pin
+`opencv-contrib-python==5.0.0.93` in `constraints/floor-wechat.txt`.
+install-smoke-min applies `constraints/floor.txt` to the core install,
+proves numpy 1.24, then applies the OpenCV pin in a second install.
+The core numpy floor stays 1.24. The OpenCV pin does not go in
+`constraints/floor.txt`.
+
+**Consequences.**
+
+* `pip install 'arbez[wechat]'` no longer accepts OpenCV 4. It also
+  requires numpy 2 or newer. A bare `pip install arbez` can stay on
+  numpy 1.24.
+* install-smoke-min's one WeChat decode runs on 5.0.0.93, after the
+  core floor smoke, and must find the nets inside the built wheel.
+  The two floors are not one resolution.
+* The wheel grows by about 1 MB. The bytes are not downloaded at runtime.
+* A detector miss on a large clean frame still decodes. A blurred small
+  code the full-frame path misses now decodes.
+* An image where the nets return one code and the full-frame path would
+  have returned a different extra code keeps only the net result. A
+  1600×1600 frame with both a medium and a tiny code did not show that
+  split: both constructors returned only the medium code.
+* OpenCV logs a PriorBox shape-clamp warning while the detector runs.
+  That is the dynamic-size path in this wheel, not a failed load. The
+  SDK does not change the process-wide OpenCV log level.
+* `detectAndDecode` can still abort the interpreter. Loading the nets
+  does not remove that. The pytest native-abort retry already on main
+  is unchanged. It covers the suite, not the install-smoke steps.
+* S-008's rejection of a custom ONNX harness still stands. This decision
+  uses OpenCV's own loader. It does not expose `backend=`.
+
+---
+
 ## S-095 — zxing-cpp floor raised to 3.1.1 (2026-10-15)
 
 **Context.** The advertised floor was `zxing-cpp>=3.0` (S-034, then the

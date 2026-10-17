@@ -1,0 +1,47 @@
+detect.onnx and sr.onnx — WeChat QR detector and super-resolution nets
+
+These two files are the ONNX form of the WeChat QRCode models that
+OpenCV's wechat_qrcode module loads. The arbez authors did not train
+them. The SDK vendors the bytes so a scan does not download them.
+
+
+Original weights
+----------------
+Caffe pair published for the OpenCV wechat_qrcode module, commit
+a8b69ccc738421293254aec5ddb38bd523503252 of
+https://github.com/WeChatCV/opencv_3rdparty
+
+    detect.caffemodel   MD5 238e2b2d6f3c18d6c3a30de0c31e23cf
+    detect.prototxt     MD5 6fb4976b32695f9f5c6305c19f12537d
+    sr.caffemodel       MD5 cbfcd60361a73beb8c583eea7e8e6664
+    sr.prototxt         MD5 69db99927a70df953b471daaba03fbef
+
+That tree contains the four files and a README. It does not contain
+a LICENSE file. The OpenCV module that loads the models states:
+
+    Copyright (C) 2020 THL A29 Limited, a Tencent company.
+    Tencent is pleased to support the open source community by making
+    WeChat QRCode available.
+
+That module is part of OpenCV (Apache License 2.0,
+https://opencv.org/license/).
+
+
+ONNX conversion pinned by OpenCV
+--------------------------------
+opencv_extra's testdata/dnn/download_models.py on the 5.x line names
+these files wechat_2021-01/detect.onnx and wechat_2021-01/sr.onnx and
+checks SHA-1 of the raw bytes:
+
+    detect.onnx   SHA-1 8dff596d81e6c223f188defc2616df1c83a406ae
+    sr.onnx       SHA-1 854b183017c2303cc429bcaf598cc7fc18e076a6
+
+The bytes were taken from the URL that script pins, the v1.1.0 release
+of https://github.com/omrope79/opencv-test-models. That release is a
+personal GitHub release, not an OpenCV or Tencent organization
+release. Each file's ONNX producer field is "caffe" and its embedded
+path is dnn-models/dnn/wechat_2021-01/<name>.onnx.
+
+OpenCV 5 reads the files with cv::dnn::readNetFromONNX inside the
+WeChatQRCode constructor. OpenCV 4 cannot. tests/ lock SHA-256 of
+these exact bytes.

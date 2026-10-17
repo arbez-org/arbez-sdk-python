@@ -86,7 +86,10 @@ NATIVE_DEPS: dict[str, str] = {
     "arbez-dmtx": ">=0.0.1",
     # consensus extras (every user with `arbez[consensus]` gets these
     # on top of the defaults — apple-vision is Darwin-only by marker)
-    "opencv-contrib-python": ">=4.9",
+    # S-096: the [wechat] extra requires OpenCV 5 so the vendored ONNX
+    # nets load. 4.9 still has wheels; auditing >=4.9 would not prove
+    # the new floor installs as a wheel.
+    "opencv-contrib-python": ">=5",
     # CUDA extra (Linux x86_64 + Windows x86_64 only — see DEP_PLATFORMS)
     "onnxruntime-gpu": ">=1.18",
     # NOTE: pyobjc-framework-Vision is intentionally NOT in this list —

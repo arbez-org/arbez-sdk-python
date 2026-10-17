@@ -34,7 +34,7 @@ Installing an extra engine adds it to the default `Scanner()` union
 
 ```bash
 pip install 'arbez[apple-vision]'  # macOS only
-pip install 'arbez[wechat]'        # QR-only, best on small / damaged
+pip install 'arbez[wechat]'        # QR-only, OpenCV 5, numpy>=2, vendored QR nets
 pip install 'arbez[all]'           # everything including [heic] + [avif]
 ```
 

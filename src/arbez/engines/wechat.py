@@ -1,16 +1,19 @@
 """WeChat consensus engine — wraps OpenCV's WeChat QR detector.
 
-Tencent open-sourced the WeChat QR detection + decoding pipeline in 2020;
-it's now part of the OpenCV "contrib" modules and ships inside
-``opencv-contrib-python``. The model files needed by older versions are
-no longer required: OpenCV 4.6+ bundles them into the wheel and the
-no-args constructor "just works".
+Tencent open-sourced the WeChat QR detection and decoding pipeline in
+2020. It lives in the OpenCV contrib modules. OpenCV 5 loads two ONNX
+nets, a detector and a super-resolution model. This package vendors
+those files (see ``src/arbez/_assets/wechat/NOTICE``) and passes them
+to ``WeChatQRCode``. The no-argument constructor does not load them:
+with empty paths the module turns both nets off, treats the whole frame
+as one candidate, and resizes with cubic interpolation.
 
-Compared to ZXing this engine is **QR-only** — no 1D barcodes, no
-Aztec, no Data Matrix. The trade-off is that on hard / tiny / damaged
-QR codes WeChat is often the only engine that can recover the payload.
-In the multi-engine consensus (arbez + Apple Vision + WeChat + ZXing),
-the WeChat engine contributes recovery of QRs the other engines miss.
+The engine is **QR-only** — no 1D barcodes, no Aztec, no Data Matrix.
+The nets are what recover a small or blurred QR that the full-frame
+decode misses. A tiny code in a very large frame can also fall through
+the detector's input scale, so a scan that returns no payload is decoded
+once more with the no-argument constructor. In the multi-engine
+consensus the WeChat engine contributes that QR recovery.
 
 Public surface:
 
@@ -22,10 +25,12 @@ Public surface:
     ...     # d.symbology is always Symbology.QR for this engine
     ...     print(d.payload, d.bbox_xyxy)
 
-Importing this module pays the ``cv2`` C-extension load. The engine is
-lazy-loaded by ``Scanner`` on first construction so default
-``pip install arbez`` users (who don't install the ``[wechat]`` extra)
-never pay the opencv import cost.
+Importing this module does not load ``cv2``. ``WeChatEngine()`` does:
+it checks that ``cv2.wechat_qrcode`` exists, that OpenCV is 5 or newer,
+and that the vendored nets are in the package. Building the detector
+stays lazy until the first scan or :meth:`WeChatEngine.warmup`.
+``Scanner`` imports this module only when the WeChat engine takes part
+in the scan, so a bare ``pip install arbez`` never pays the OpenCV import.
 """
 from __future__ import annotations
 
@@ -71,10 +76,10 @@ def _probe_opencv_or_raise() -> None:
        contrib). Recoverable with a one-liner install fix; the error
        message names it explicitly.
 
-    The probe only does ``__import__`` + an ``hasattr``; no detector
-    construction, no model-file load. The heavy 50 ms detector
-    instantiation (`WeChatQRCode()`) stays lazy on first scan or
-    explicit :meth:`WeChatEngine.warmup`.
+    The probe does ``__import__``, an ``hasattr`` check, an OpenCV major
+    parse, and an ``is_file`` check on the vendored nets. It does not
+    construct ``WeChatQRCode`` and it does not read the net bytes. That
+    load stays lazy on first scan or explicit :meth:`WeChatEngine.warmup`.
     """
     try:
         import cv2
@@ -94,6 +99,95 @@ def _probe_opencv_or_raise() -> None:
             "`pip uninstall opencv-python && pip install 'arbez[wechat]'`)."
         )
 
+    version = getattr(cv2, "__version__", None)
+    major = _opencv_major(version)
+    if major is None or major < _MIN_OPENCV_MAJOR:
+        raise EngineUnavailable(
+            "WeChatEngine requires OpenCV "
+            f"{_MIN_OPENCV_MAJOR} or newer (installed {version!r}). "
+            "The vendored detect.onnx and sr.onnx nets load only through "
+            "that constructor. Install with `pip install 'arbez[wechat]'`."
+        )
+
+    detect, sr = _wechat_model_files()
+    if not detect.is_file() or not sr.is_file():
+        raise EngineUnavailable(
+            "WeChatEngine: vendored WeChat nets are missing "
+            f"({_DETECT_RESOURCE}, {_SR_RESOURCE}). Reinstall arbez. "
+            "The [wechat] extra does not download these files."
+        )
+
+
+# OpenCV 5 is the first release whose WeChatQRCode constructor takes the
+# two ONNX paths. OpenCV 4 takes four Caffe paths and will not load these
+# files. 5.0.0.93 is the only 5.x wheel on PyPI (S-096).
+_MIN_OPENCV_MAJOR = 5
+_DETECT_RESOURCE = "_assets/wechat/detect.onnx"
+_SR_RESOURCE = "_assets/wechat/sr.onnx"
+
+
+def _opencv_major(version: object) -> int | None:
+    """Return the leading numeric component of an OpenCV version string.
+
+    ``cv2.__version__`` is ``"5.0.0"`` on the 5.0.0.93 wheel and
+    ``"4.10.0"`` on the 4.10 line. Only the first dot-separated field
+    is the major. A missing or non-numeric field fails closed so the
+    caller does not guess a constructor.
+    """
+    if not isinstance(version, str):
+        return None
+    head = version.split(".", 1)[0]
+    if not head.isdigit():
+        return None
+    return int(head)
+
+
+def _wechat_model_files() -> tuple[Any, Any]:
+    """Return the vendored detector and super-resolution resources.
+
+    ``importlib.resources`` works for an editable install and for a
+    wheel. The values are traversables, not filesystem paths: OpenCV
+    has to be handed a real path inside :func:`as_file` at the moment
+    ``readNetFromONNX`` runs.
+    """
+    from importlib.resources import files
+
+    root = files("arbez")
+    return root.joinpath(_DETECT_RESOURCE), root.joinpath(_SR_RESOURCE)
+
+
+def _load_model_detector(wechat_mod: Any) -> Any:
+    """Construct ``WeChatQRCode`` on the two vendored ONNX nets.
+
+    ``readNetFromONNX`` reads the files inside the constructor, so the
+    ``as_file`` context has to cover that call and can end as soon as
+    it returns. A missing path is ``EngineUnavailable`` before OpenCV
+    is called: the binding turns a failed ``CV_Assert`` into
+    ``SystemError``. A constructor failure is ``EngineRuntimeError``.
+    It is not retried with the no-argument constructor, because that
+    would silently drop the nets.
+    """
+    detect, sr = _wechat_model_files()
+    if not detect.is_file() or not sr.is_file():
+        raise EngineUnavailable(
+            "WeChatEngine: vendored WeChat nets are missing "
+            f"({_DETECT_RESOURCE}, {_SR_RESOURCE}). Reinstall arbez. "
+            "The [wechat] extra does not download these files."
+        )
+    try:
+        from importlib.resources import as_file
+
+        with as_file(detect) as detect_path, as_file(sr) as sr_path:
+            # The path must still exist while this line runs.
+            return wechat_mod.WeChatQRCode(str(detect_path), str(sr_path))
+    except EngineUnavailable:
+        raise
+    except Exception as e:
+        raise EngineRuntimeError(
+            "WeChatEngine: OpenCV could not load the vendored "
+            "detect.onnx and sr.onnx nets."
+        ) from e
+
 
 # ── Engine ─────────────────────────────────────────────────────────────────
 
@@ -101,10 +195,11 @@ def _probe_opencv_or_raise() -> None:
 class WeChatEngine:
     """WeChat QR consensus engine.
 
-    No constructor parameters — WeChat is QR-only with no format filter,
-    and ``opencv-contrib-python`` bundles the required Caffe model files
-    in the wheel from 4.6 onwards. The wrapper instance is cheap to
-    construct and safe to reuse across many ``detect_and_decode`` calls.
+    No constructor parameters — WeChat is QR-only with no format filter.
+    The detector and super-resolution nets are the vendored ONNX files,
+    not weights baked into the OpenCV wheel. The wrapper instance is
+    cheap to construct and safe to reuse across many
+    ``detect_and_decode`` calls.
 
     Thread-safety (S-012)
     ---------------------
@@ -155,20 +250,25 @@ class WeChatEngine:
         # ``cv2.wechat_qrcode`` at construction so callers using a
         # fallback engine chain catch ``EngineUnavailable`` cleanly
         # here, rather than a generic ``ImportError`` deep inside
-        # the first ``detect_and_decode``. The probe only does
-        # ``__import__`` + an ``hasattr`` check — no detector
-        # construction, no Caffe model-file loads. The heavy ~50 ms
-        # detector instantiation stays lazy on first scan or
-        # explicit :meth:`warmup`.
+        # the first ``detect_and_decode``. The probe checks the
+        # import, the submodule, the OpenCV major, and that the
+        # vendored nets are present. It does not construct the
+        # detector or read the net bytes. That load stays lazy on
+        # first scan or explicit :meth:`warmup`.
         _probe_opencv_or_raise()
 
         # Lazy: don't instantiate the cv2 detector until first scan, so
         # ``WeChatEngine()`` is cheap. The init-time probe above has
-        # already proven cv2 is importable and the WeChat submodule
-        # exists; the lazy imports in ``_get_modules`` and
+        # already proven cv2 is importable, the WeChat submodule
+        # exists, OpenCV is 5 or newer, and the vendored nets are
+        # present. The lazy imports in ``_get_modules`` and
         # ``_get_detector`` keep their own try/except guards as
         # defense-in-depth against sys.modules mutation mid-process.
+        # ``_detector`` is the ONNX-backed instance. ``_full_frame``
+        # is the no-argument instance, built only after the nets
+        # return no payload (S-096).
         self._detector: Any | None = None
+        self._full_frame: Any | None = None
         # S-039 (v0.0.24): cache the cv2 + numpy module refs so the
         # hot path doesn't redo ``import cv2`` / ``import numpy`` on
         # every detect call. Both are idempotent + already cached by
@@ -190,13 +290,13 @@ class WeChatEngine:
     # ── Public API ─────────────────────────────────────────────────────────
 
     def warmup(self) -> None:
-        """Pre-load the cv2 WeChat detector + its 4 model files (S-016) + PIL plugin registry (S-080).
+        """Pre-load the cv2 WeChat detector and its two ONNX nets (S-016) plus the PIL plugin registry (S-080).
 
-        Heavy (~50 ms detector + ~190 ms PIL.Image.init() one-shot) — triggers the ``import cv2`` +
-        the ``WeChatQRCode()`` constructor (which reads the bundled Caffe model files from the
-        opencv-contrib wheel) + warms PIL's plugin discovery so the first ``detect_and_decode`` runs
-        at steady state. Used by :meth:`Scanner.warmup` to move the one-time cost off the hot path.
-        Idempotent: subsequent calls are no-ops (the detector instance is cached on ``self``).
+        Triggers ``WeChatQRCode(detect.onnx, sr.onnx)``, which is where OpenCV reads the vendored nets,
+        and warms PIL's plugin discovery so the first ``detect_and_decode`` runs at steady state. Used
+        by :meth:`Scanner.warmup` to move that one-time cost off the hot path. Idempotent: subsequent
+        calls are no-ops (the detector instance is cached on ``self``). The no-argument fallback
+        detector stays lazy; it is built only when a scan's net pass returns no payload.
 
         S-080: added the PIL prewarm to keep the warmup contract consistent across all engines.
         """
@@ -208,10 +308,9 @@ class WeChatEngine:
     def close(self) -> None:
         """Release the cv2 WeChat detector (S-042).
 
-        The ``WeChatQRCode`` detector holds ~80 MB of Caffe model files loaded into memory. Dropping
-        the Python reference lets cv2's C++ destructor run, releasing the native memory. The cached
-        ``cv2`` / ``numpy`` module refs stay (they're free to keep — Python's import system caches
-        them globally anyway).
+        The ``WeChatQRCode`` detector holds the loaded ONNX nets. Dropping the Python reference lets
+        cv2's C++ destructor run, releasing that native memory. The cached ``cv2`` / ``numpy`` module
+        refs stay (they're free to keep — Python's import system caches them globally anyway).
 
         Idempotent. After ``close()`` the engine can be reused — ``detect_and_decode`` lazy-reinit's
         the detector on next call. Per S-038's per-thread thread_safety recommendation, in a
@@ -220,6 +319,7 @@ class WeChatEngine:
         """
         with self._lock:
             self._detector = None
+            self._full_frame = None
 
     def detect_and_decode(
         self,
@@ -271,6 +371,21 @@ class WeChatEngine:
             # WeChat detector is doc'd thread-unsafe.
             detector = self._get_detector()
             payloads, points_list = detector.detectAndDecode(bgr)
+            # Copy before the emptiness check. The 5.0.0.93 binding returns
+            # tuples, which can be walked twice; a one-shot sequence would
+            # lose its tail after any().
+            payloads = list(payloads)
+            points_list = list(points_list)
+            # S-096: the SSD detector rescales the frame toward a 400x400
+            # input and does not fall back to the full frame when it finds
+            # nothing. A tiny clean code on a large canvas is decoded by
+            # the no-argument constructor and missed by the nets. Retry
+            # that path only when the net pass produced no payload. A
+            # constructor failure is not a miss and is not retried.
+            if not any(payloads):
+                payloads, points_list = self._get_full_frame_detector().detectAndDecode(bgr)
+                payloads = list(payloads)
+                points_list = list(points_list)
 
         detections: list[Detection] = []
         # H3 (S-016): strict=True catches upstream length mismatches.
@@ -358,10 +473,32 @@ class WeChatEngine:
                     "plain `opencv-python` — the WeChat detector lives in contrib)."
                 )
 
-            # No-args constructor works on opencv-contrib-python >= 4.6:
-            # the four model files are bundled inside the wheel.
-            self._detector = wechat_mod.WeChatQRCode()
+            self._detector = _load_model_detector(wechat_mod)
         return self._detector
+
+    def _get_full_frame_detector(self) -> Any:
+        """Build the no-argument WeChat detector on first miss.
+
+        Called from inside ``self._lock`` after the ONNX-backed detector returned no payload. Empty
+        paths are what turn both nets off in OpenCV 5. This is not a fallback for a failed load.
+        """
+        if self._full_frame is None:
+            try:
+                import cv2
+            except ImportError as e:
+                raise EngineUnavailable(
+                    "WeChatEngine requires opencv-contrib-python. Install with "
+                    "`pip install 'arbez[wechat]'`."
+                ) from e
+            wechat_mod = getattr(cv2, "wechat_qrcode", None)
+            if wechat_mod is None:
+                raise EngineRuntimeError(
+                    "The installed OpenCV does not include the WeChat QR module. "
+                    "Make sure `opencv-contrib-python` is installed (NOT the "
+                    "plain `opencv-python` — the WeChat detector lives in contrib)."
+                )
+            self._full_frame = wechat_mod.WeChatQRCode()
+        return self._full_frame
 
     @staticmethod
     def _translate(payload: str, points: Any) -> Detection | None:

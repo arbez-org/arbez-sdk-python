@@ -16,6 +16,15 @@ This product includes software developed by third parties:
   YOLOX-s architecture. See ``src/arbez/_assets/NOTICE`` for full
   model attribution + version / provenance.
 
+* WeChat QRCode detector and super-resolution nets
+  (``src/arbez/_assets/wechat/detect.onnx`` and ``sr.onnx``).
+  Copyright (C) 2020 THL A29 Limited, a Tencent company.
+  Original Caffe weights:
+  https://github.com/WeChatCV/opencv_3rdparty/tree/a8b69ccc738421293254aec5ddb38bd523503252
+  That tree ships no LICENSE file. The OpenCV module that loads the
+  models is Apache-2.0. See ``src/arbez/_assets/wechat/NOTICE`` for
+  the ONNX conversion pin and the SHA-1 the bytes were checked against.
+
 
 Runtime dependencies installed via pip remain governed by their own
 licenses (see each package on PyPI). The arbez SDK does not bundle

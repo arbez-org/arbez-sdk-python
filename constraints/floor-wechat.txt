@@ -1,0 +1,14 @@
+# WeChat / OpenCV floor (S-096). Not part of constraints/floor.txt.
+#
+# opencv-contrib-python 5.0.0.93 requires numpy>=2 on Python >=3.9.
+# constraints/floor.txt pins numpy==1.24.0 for the core install.
+# Those two pins do not resolve in one environment. install-smoke-min
+# applies floor.txt to the core and ZXing install, runs that smoke,
+# then applies this file to a second install of the [wechat] extra.
+# Pip upgrades numpy only as far as OpenCV requires and leaves the
+# other core floors in place.
+#
+# Dependabot ignores dependency-name opencv-contrib-python (S-085).
+# Do not move this pin back into constraints/floor.txt.
+
+opencv-contrib-python==5.0.0.93

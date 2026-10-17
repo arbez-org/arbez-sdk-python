@@ -50,6 +50,19 @@ the explicit maintainer act of tagging is the gate.
 
 ## Unreleased
 
+### Changed
+
+* **WeChatEngine loads the vendored WeChat QR nets (S-096).**
+  `detect.onnx` and `sr.onnx` ship in the package and are passed to
+  OpenCV's `WeChatQRCode`. The no-argument constructor does not load
+  those nets. A scan that returns no payload is decoded once more
+  without them, because a tiny code in a large frame can fall through
+  the detector. The `[wechat]` extra and the dev extra require
+  `opencv-contrib-python` 5 (pin `5.0.0.93`) and numpy 2 or newer.
+  OpenCV 4 no longer satisfies the extra. The core numpy floor stays
+  1.24. That pin and the OpenCV pin are installed separately, because
+  OpenCV 5.0.0.93 does not resolve against numpy 1.24.
+
 ## 0.2.1 — 2026-10-16
 
 ### Changed

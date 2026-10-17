@@ -428,9 +428,10 @@ class WeChatEngine:
     def detect_and_decode(self, image) -> tuple[Detection, ...]: ...
 ```
 
-Wraps OpenCV-contrib's WeChat QR detector. **QR-only.** Best recall
-on tiny / damaged QRs; slowest of the three. Returns `score=1.0` per
-decode. Requires `[wechat]` extra.
+Wraps OpenCV-contrib's WeChat QR detector. **QR-only.** Loads the
+vendored `detect.onnx` and `sr.onnx` nets, then decodes the full frame
+when those nets return no payload. Returns `score=1.0` per decode.
+Requires the `[wechat]` extra (`opencv-contrib-python>=5`).
 
 ### `arbez.engines.apple_vision.AppleVisionEngine`
 
