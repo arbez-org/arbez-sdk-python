@@ -142,7 +142,7 @@ Knobs:
 | `consensus` | `1` | Min unique engines that must agree on a bbox cluster. `1` = union (max recall), `len(engines)` = unanimous. Greater than the number of participating engines raises `ValueError`. |
 | `iou_threshold` | `0.5` | Bbox IoU >= this groups detections from different engines as the same physical barcode. |
 | `engines` | `None` (all installed) | Subset of engines that participate. Validated eagerly. |
-| `symbologies` | `None` (no filter) | Allow-list, enforced after the vote on the decoding engine's symbology (S-099). Also restricts zxing and Apple Vision requests. |
+| `symbologies` | `None` (no filter) | Allow-list, enforced after the vote on the decoding engine's symbology (S-099). A kept cluster is labelled with that symbology when a payload is present. Also restricts zxing and Apple Vision requests. |
 | `micro_qr` | `False` | Opt in to Micro QR. |
 | `rmqr` | `False` | Opt in to rMQR. Reported as `qr`. |
 

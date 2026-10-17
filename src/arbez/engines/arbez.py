@@ -416,11 +416,11 @@ class ArbezEngine:
         from arbez.consensus import _coerce_symbology_allowlist
 
         allow = _coerce_symbology_allowlist(symbologies)
-        if allow is not None and micro_qr:
-            allow = allow | frozenset((Symbology.MICRO_QR,))
+        # micro_qr / rmqr only change the zxing request below.
+        # barcode_formats_for already appends them. Scanner unions
+        # MICRO_QR into the allow-list before it builds this engine,
+        # and nothing here reads the two flags again.
         self._symbology_allow: frozenset[Symbology] | None = allow
-        self._micro_qr = micro_qr
-        self._rmqr = rmqr
         # Strip symbologies zxing cannot request (OTHER_1D) instead of
         # failing the engine. An empty request is the match-nothing
         # sentinel, not "all formats".
@@ -1267,14 +1267,17 @@ class ArbezEngine:
                 # format — and overrides the detector's classification. The detector
                 # both localizes AND guesses a class, and that guess is often wrong
                 # on square 2D codes (e.g. Data Matrix filed as "QR"). libdmtx
-                # decodes Data Matrix only; zxing reports the parsed format. When
-                # nothing decoded (or the format is one the SDK doesn't model), keep
-                # the detector's class as the best available label.
+                # decodes Data Matrix only; zxing reports the parsed format.
+                # An unmapped or dropped zxing format is not a decode. Keeping
+                # its text under the detector class published MicroPDF417 as QR.
                 if decode_stage == "libdmtx":
                     symbology = Symbology.DATA_MATRIX
                 elif decoded_sym is not None:
                     symbology = decoded_sym
                 else:
+                    if payload is not None:
+                        payload = None
+                        decode_stage = None
                     symbology = detector_symbology
 
                 polygon: tuple[tuple[float, float], ...] = (
@@ -1366,8 +1369,8 @@ class ArbezEngine:
         ``"medium"`` / ``"large"`` / ``"fallback"`` identifying which
         strategy produced the payload (or ``None`` if everything
         failed), and ``decoded_symbology`` (S-094) is the symbology
-        zxing-cpp parsed for the winning read (or ``None`` if nothing
-        decoded / the format is unmodeled).
+        zxing-cpp parsed for the winning read, or ``None`` when nothing
+        the SDK models decoded. Unmapped formats are skipped.
 
         ``np_image`` is the source image as an HxWx3 uint8 RGB numpy
         array (S-035 perf path). When non-None, crops are taken as
@@ -1461,21 +1464,35 @@ class ArbezEngine:
         return None, None, None
 
     @staticmethod
+    def _accepted_crop_read(result: Any) -> tuple[str, Symbology] | None:
+        """Text and symbology for one zxing result, or None to skip it.
+
+        Unmapped formats and the drop set are not a decode. Returning
+        the text with no symbology let the detector class adopt it
+        (MicroPDF417 labelled QR).
+        """
+        if not result.valid:
+            return None
+        decoded = symbology_for_zxing_format(result.format)
+        if decoded is None:
+            return None
+        return str(result.text), decoded
+
+    @staticmethod
     def _zxing_read_first_valid(
         zxing: Any,
         image: Any,
         formats: Any = None,
-    ) -> tuple[str, Symbology | None] | tuple[None, None]:
+    ) -> tuple[str, Symbology] | tuple[None, None]:
         """Run zxing on the image; return ``(payload, decoded_symbology)``.
 
         ``image`` may be a PIL.Image or a numpy ndarray (HxWx3 uint8 RGB) — zxing-cpp's Python
         bindings accept both (S-035 perf path).
 
         ``decoded_symbology`` (S-094) is the symbology zxing-cpp actually parsed —
-        ECC-validated, hence authoritative — mapped to :class:`Symbology`, or ``None``
-        when the format isn't one the SDK models (the caller keeps its detector label).
-        Returns ``(None, None)`` on any decode failure (zxing exception, no codes found,
-        or all results were invalid).
+        ECC-validated, hence authoritative — mapped to :class:`Symbology`.
+        Returns ``(None, None)`` when nothing the SDK models decoded
+        (zxing exception, no codes, invalid results, or an unmapped format).
         """
         # None means "caller did not choose a set" — use the safe
         # default (Model 2, no Micro QR, no rMQR). The match-nothing
@@ -1487,8 +1504,9 @@ class ArbezEngine:
             return None, None
         try:
             for r in zxing.read_barcodes(image, formats=formats):
-                if r.valid:
-                    return str(r.text), symbology_for_zxing_format(r.format)
+                accepted = ArbezEngine._accepted_crop_read(r)
+                if accepted is not None:
+                    return accepted
         except Exception as e:
             _log.debug("ArbezEngine: zxing read failed: %r", e)
         return None, None
@@ -1502,7 +1520,7 @@ class ArbezEngine:
         img_w: int | None = None,
         img_h: int | None = None,
         formats: Any = None,
-    ) -> tuple[str, Symbology | None] | tuple[None, None]:
+    ) -> tuple[str, Symbology] | tuple[None, None]:
         """Full-image zxing read with position-match filter (S-033).
 
         ``image`` may be a PIL.Image or a numpy ndarray (HxWx3 uint8
@@ -1510,11 +1528,10 @@ class ArbezEngine:
         ``img_h`` (S-035 perf path — saves a PIL attribute lookup
         per call).
 
-        Returns ``(payload, decoded_symbology)`` for the first valid result
-        whose decoded center is inside the detection bbox (``decoded_symbology``
-        per S-094 — the zxing-parsed format, or ``None`` if unmodeled).
-        ``(None, None)`` if no decoded position matches - this avoids attaching
-        the wrong barcode's payload to the current detection on multi-code images.
+        Returns ``(payload, decoded_symbology)`` for the first modeled result
+        whose decoded center is inside the detection bbox.
+        ``(None, None)`` if no such position matches. Unmapped formats are
+        skipped so their text cannot be attached under the detector class.
         """
         if formats is None:
             formats = barcode_formats_for(None)
@@ -1526,7 +1543,8 @@ class ArbezEngine:
             _log.debug("ArbezEngine: full-image fallback failed: %r", e)
             return None, None
         for r in results:
-            if not r.valid:
+            accepted = ArbezEngine._accepted_crop_read(r)
+            if accepted is None:
                 continue
             try:
                 pos = r.position
@@ -1535,5 +1553,5 @@ class ArbezEngine:
             except AttributeError:
                 continue  # zxing result without Position info — skip
             if det.x1 <= cx <= det.x2 and det.y1 <= cy <= det.y2:
-                return str(r.text), symbology_for_zxing_format(r.format)
+                return accepted
         return None, None

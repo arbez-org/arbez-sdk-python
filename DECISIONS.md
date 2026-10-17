@@ -52,15 +52,37 @@ request are stripped; an empty intersection is an empty format set,
 which short-circuits to no reads. It is not `None` (that means all).
 
 The allow-list is enforced after consensus on the symbology of the
-member that supplied the winning payload — the same selection as the
-payload vote. If nobody decoded, the voted label is used, so an
-undecoded QR box survives a QR allow-list and an undecoded Code 128
-does not. The merged `Detection.symbology` is not relabelled.
-`per_engine` stays raw. A single-engine `Scanner` filters
+member that supplied the winning payload. That member is the most
+common canonical payload, then the highest score, then the symbology
+value, then the canonical string. Equal scores do not follow
+`as_completed` order: ZXing and WeChat both report 1.0, and a QR
+allow-list would otherwise keep or drop the cluster depending on
+which thread finished first. If nobody decoded, the voted label is
+used, so an undecoded QR box survives a QR allow-list and an
+undecoded Code 128 does not. When a payload is present, the merged
+`Detection.symbology` is that winning decoder's symbology. Callers
+that branch on the label then see the symbology that produced the
+text. `per_engine` stays raw: it is the per-voter diagnostic, and
+filtering it would hide the overlap that the allow-list dropped.
+`agreed_payloads` on a kept detection omits raw strings whose member
+symbology is outside the list. A single-engine `Scanner` filters
 `Detection.symbology`, which is already decoder-authoritative. A
-prebuilt `engine=` instance is not rebuilt; `scan` still filters.
-`run_consensus` / `run_consensus_detailed` gain a keyword-only
-`symbologies` argument, default `None`.
+prebuilt `engine=` instance is not rebuilt with `symbologies`,
+`micro_qr`, or `rmqr`. After `close()`, that instance is
+reconstructed by name without those flags; a string name still
+receives them. `scan` still filters. `run_consensus` /
+`run_consensus_detailed` gain a keyword-only `symbologies` argument,
+default `None`.
+
+An unmapped zxing format, including the drop set (`MicroPDF417`,
+`DXFilmEdge`), is not a decode. The crop reader does not return its
+text, and the detector class is used only when nothing was decoded.
+`Code39Ext` and `Code39Std` map to `Symbology.CODE_39`. A `Code39`
+request returns `Code39Ext` for Full ASCII; leaving that tag unmapped
+published the text under the detector class. `PZN` and `Code32` stay
+unmapped. Apple Vision materializes `formats` once. A one-shot
+iterable must not be validated into an empty set, and an empty name
+list is never passed to `setSymbologies_`.
 
 libdmtx runs only for `DATA_MATRIX` and `AZTEC`, and only when the
 allow-list is unset or contains `DATA_MATRIX`.

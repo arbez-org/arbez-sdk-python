@@ -491,8 +491,11 @@ class Scanner:
         (S-099). ``None`` (default) does not filter. Mapped onto zxing
         formats and Apple Vision's request, then enforced after consensus
         on the decoding engine's symbology — not the voted cluster label.
-        A prebuilt ``engine=`` instance is not rebuilt; ``scan`` still
-        filters its results. Keyword-only.
+        A prebuilt ``engine=`` instance is not rebuilt with these
+        flags. ``scan`` still filters its results. After ``close()``,
+        a user-supplied engine is reconstructed by name without
+        ``symbologies`` / ``micro_qr`` / ``rmqr``; a string name
+        keeps those flags. Keyword-only.
     micro_qr:
         Also request Micro QR. With an allow-list, ``MICRO_QR`` is
         unioned in. Keyword-only. Default ``False``.
@@ -598,6 +601,9 @@ class Scanner:
         self._symbology_allow: frozenset[Symbology] | None = allow
         self._micro_qr = micro_qr
         self._rmqr = rmqr
+        # A user-supplied instance is not rebuilt with the flags above.
+        # String names stay False and keep receiving them (S-099).
+        self._user_supplied_engine = False
 
         # ── Single-engine path: ``engine=`` was given ────────────────────
         if engine is not None:
@@ -626,6 +632,7 @@ class Scanner:
                     )
                 self._engine_name = getattr(engine, "name", type(engine).__name__)
                 self._engine = engine
+                self._user_supplied_engine = True
                 _log.debug(
                     "Scanner: accepted user-supplied engine instance %r (name=%r)",
                     engine,
@@ -1088,12 +1095,18 @@ class Scanner:
             # Re-check inside the lock — another thread may have raced
             # us to the assignment while we were waiting.
             if self._engine is None:
-                self._engine = _resolve_engine(
-                    self._engine_name,
-                    symbologies=self._symbology_allow,
-                    micro_qr=self._micro_qr,
-                    rmqr=self._rmqr,
-                )
+                if self._user_supplied_engine:
+                    # close() dropped the caller's instance. Rebuilding
+                    # it with Scanner's opt-in flags would change the
+                    # decode set. A string name still receives them.
+                    self._engine = _resolve_engine(self._engine_name)
+                else:
+                    self._engine = _resolve_engine(
+                        self._engine_name,
+                        symbologies=self._symbology_allow,
+                        micro_qr=self._micro_qr,
+                        rmqr=self._rmqr,
+                    )
             return self._engine
 
     def _resolve_consensus_engine_names(self) -> tuple[str, ...]:

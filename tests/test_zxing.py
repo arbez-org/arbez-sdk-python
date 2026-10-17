@@ -504,7 +504,7 @@ def test_s099_forward_map_is_model2_and_inverse_keeps_family_label() -> None:
     """
     import zxingcpp
 
-    from arbez.engines.zxing import _get_tables
+    from arbez.engines.zxing import _get_tables, symbology_for_zxing_format
 
     forward, inverse, _other, drop = _get_tables()
     bf = zxingcpp.BarcodeFormat
@@ -514,6 +514,13 @@ def test_s099_forward_map_is_model2_and_inverse_keeps_family_label() -> None:
     assert inverse[bf.RMQRCode] is Symbology.QR
     assert bf.RMQRCode not in drop
     assert bf.QRCode not in set(forward.values())
+    # Code 39 Extended is what a Code39 request returns for Full ASCII.
+    # It must not stay unmapped: the crop reader would otherwise drop
+    # the format and the detector class would adopt the text.
+    assert inverse[bf.Code39Ext] is Symbology.CODE_39
+    assert inverse[bf.Code39Std] is Symbology.CODE_39
+    assert symbology_for_zxing_format(bf.MicroPDF417) is None
+    assert symbology_for_zxing_format(bf.PZN) is None
 
 
 def test_generated_micro_qr_is_opt_in() -> None:
@@ -557,6 +564,50 @@ def test_crop_reader_uses_model2_defaults(monkeypatch: pytest.MonkeyPatch) -> No
     assert bf.QRCode not in members
     assert bf.MicroQRCode not in members
     assert bf.RMQRCode not in members
+
+
+def test_crop_reader_skips_unmapped_formats() -> None:
+    """An unmapped or dropped zxing format is not a decode.
+
+    MicroPDF417 and PZN must not come back as text for the detector
+    class to relabel. Code 39 Extended is mapped, so it is kept.
+    """
+    import zxingcpp
+    from PIL import Image
+
+    from arbez.engines.arbez import ArbezEngine
+    from arbez.engines.zxing import barcode_formats_for
+
+    bf = zxingcpp.BarcodeFormat
+
+    class _Result:
+        def __init__(self, text: str, fmt: object) -> None:
+            self.text = text
+            self.format = fmt
+            self.valid = True
+
+    class _ZXing:
+        def __init__(self, results: list[_Result]) -> None:
+            self._results = results
+
+        def read_barcodes(self, image: object, formats: object = None) -> list[_Result]:
+            del image, formats
+            return self._results
+
+    image = Image.new("RGB", (8, 8), "white")
+    formats = barcode_formats_for(None)
+    skipped = ArbezEngine._zxing_read_first_valid(
+        _ZXing([_Result("MP", bf.MicroPDF417), _Result("PZ", bf.PZN)]),
+        image,
+        formats,
+    )
+    assert skipped == (None, None)
+    kept = ArbezEngine._zxing_read_first_valid(
+        _ZXing([_Result("MP", bf.MicroPDF417), _Result("EXT", bf.Code39Ext)]),
+        image,
+        formats,
+    )
+    assert kept == ("EXT", Symbology.CODE_39)
 
 
 def test_opt_in_flags_appear_in_repr() -> None:

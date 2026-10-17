@@ -74,11 +74,18 @@ the explicit maintainer act of tagging is the gate.
   request, then drops a consensus cluster whose decoding engine
   symbology is outside the set. The voted label is not used for that
   check: an undecoded detector box can label a cluster `qr` while the
-  payload came from another symbology. libdmtx no longer runs on QR or
-  Micro QR proposals. `formats=[]` on `ZXingEngine` and
-  `AppleVisionEngine` matches nothing. Migration: pass `micro_qr=True`
-  to keep the old Micro QR behaviour; pass `symbologies={"qr"}` for a
-  QR-only scan instead of filtering the merged `qr` label yourself.
+  payload came from another symbology. When a payload is present, the
+  merged symbology is the decoding engine's, and `agreed_payloads`
+  omits strings from symbologies outside the allow-list. `per_engine`
+  stays raw. Equal decoder scores break by symbology value, not by
+  which engine finished first. An unmapped zxing format is not
+  published under the detector class. Code 39 Extended is reported as
+  `code_39`. libdmtx no longer runs on QR or Micro QR proposals.
+  `formats=[]` on `ZXingEngine` and `AppleVisionEngine` matches
+  nothing. A prebuilt `engine=` is not rebuilt with Scanner opt-in
+  flags after `close()`. Migration: pass `micro_qr=True` to keep the
+  old Micro QR behaviour; pass `symbologies={"qr"}` for a QR-only
+  scan instead of filtering the merged `qr` label yourself.
 * **Direct WeChat calls use the 2 s deadline (S-097).** `Scanner.scan`
   asks for 10 s, which covers the WeChat full-frame fallback (p95 about
   1.95 s). A direct `WeChatEngine.detect_and_decode` that exceeds 2 s

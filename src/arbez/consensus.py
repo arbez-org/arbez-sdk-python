@@ -18,12 +18,11 @@ For each detection group (overlapping bboxes from different engines):
   for "all-agree" mode.
 * **bbox** — per-coord median across group members. Robust against
   one engine reporting a slightly off bbox.
-* **symbology** — most common Symbology in the group; ties go to the
-  symbology of the highest-scored member among the top-count
-  candidates (stable secondary tiebreak by symbology value).
-* **payload** — most common non-None payload; ties go to the
-  highest-scored detection's payload. ``None`` if no engine decoded
-  the crop.
+* **symbology** — the winning decoder's symbology when a payload is
+  present; otherwise the most common symbology (score, then value).
+* **payload** — most common canonical payload among decoded members.
+  Ties break by score, then symbology value, then the canonical
+  string. Not by group order. ``None`` if no engine decoded.
 * **score** — mean of group members' scores.
 * **engine** — fixed string ``"consensus"`` on the output Detection.
 * **extras** carries ``voted_by`` (tuple of engine names that
@@ -42,7 +41,10 @@ Stability contract (S-032, locked from v0.0.18)
   min_votes, iou_threshold)``. S-099 adds an optional keyword-only
   ``symbologies`` allow-list (default ``None``, previous behaviour).
   The filter runs after the vote and uses the decoding engine's
-  symbology, not the voted cluster label. ``per_engine`` stays raw.
+  symbology, not the voted cluster label. A kept detection is
+  labelled with that same symbology when a payload is present.
+  ``per_engine`` stays raw. ``agreed_payloads`` drops strings whose
+  member symbology is outside the allow-list.
 * Output ``engine`` field is always ``"consensus"`` (not the source
   engine's name).
 * ``extras`` keys ``voted_by``, ``vote_count``, ``agreed_payloads``
@@ -156,9 +158,11 @@ def run_consensus_detailed(
         symbologies: optional allow-list applied after the vote, on
             the symbology of the engine that supplied the winning
             payload (S-099). ``None`` (default) keeps every cluster
-            that passes ``min_votes``. ``per_engine`` is not filtered.
-            A bare string is a ``TypeError``; an empty iterable is a
-            ``ValueError``.
+            that passes ``min_votes``. The merged detection uses that
+            same symbology when a payload is present. ``per_engine``
+            is not filtered. ``agreed_payloads`` omits raw strings
+            from symbologies outside the list. A bare string is a
+            ``TypeError``; an empty iterable is a ``ValueError``.
 
     Returns:
         A :class:`ConsensusResult`: ``.detections`` is the merged
@@ -295,10 +299,11 @@ def run_consensus_detailed(
         if len(unique_engines) >= min_votes:
             # S-099: the voted label can be an undecoded detector box
             # while the payload came from another symbology. Filter on
-            # the decoder, and leave per_engine unfiltered above.
+            # the decoder. per_engine above stays raw; agreed_payloads
+            # inside the aggregate drops disallowed symbologies.
             if allow is not None and _decoding_symbology(group) not in allow:
                 continue
-            accepted.append(_aggregate_group(group))
+            accepted.append(_aggregate_group(group, allow=allow))
 
     # Engine Protocol contract: sort by descending score.
     accepted.sort(key=lambda d: d.score, reverse=True)
@@ -379,12 +384,12 @@ def _voted_symbology(group: list[tuple[str, Detection]]) -> Symbology:
 def _winning_decoder(group: list[tuple[str, Detection]]) -> Detection | None:
     """Detection that supplied the winning payload, or None if none decoded.
 
-    Same selection as the consensus payload (S-077, issue #12): most
-    common canonical payload, tie broken by the highest-scored decoded
-    member, then by canonical value. ``max(group, key=score)`` is the
-    first maximal member, matching the historical ``best_det`` path.
+    Most common canonical payload, then highest score, then symbology
+    value, then the canonical string. Score ties must not follow
+    ``as_completed`` order: ZXing and WeChat both report 1.0, and a
+    QR-only allow-list would otherwise keep or drop the cluster
+    depending on which thread finished first (S-099).
     """
-    _best_name, best_det = max(group, key=lambda nd: nd[1].score)
     decoded: list[tuple[Detection, str]] = []
     for _, det in group:
         if det.payload is None:
@@ -395,21 +400,16 @@ def _winning_decoder(group: list[tuple[str, Detection]]) -> Detection | None:
         decoded.append((det, canon))
     if not decoded:
         return None
-    payload_counts: Counter[str] = Counter(canon for _, canon in decoded)
-    top_canon, top_n = payload_counts.most_common(1)[0]
-    best_canon = (
-        canonicalize_payload(best_det.payload, best_det.symbology)
-        if best_det.payload is not None
-        else None
-    )
-    if best_canon is not None and payload_counts[best_canon] == top_n:
-        return best_det
-    candidates = [det for det, canon in decoded if canon == top_canon]
-    if not candidates:
-        return None
+    counts: Counter[str] = Counter(canon for _, canon in decoded)
+    top_n = max(counts.values())
+    candidates = [det for det, canon in decoded if counts[canon] == top_n]
     return max(
         candidates,
-        key=lambda det: (det.score, canonicalize_payload(det.payload, det.symbology)),
+        key=lambda det: (
+            det.score,
+            det.symbology.value,
+            canonicalize_payload(det.payload, det.symbology) or "",
+        ),
     )
 
 
@@ -426,7 +426,11 @@ def _decoding_symbology(group: list[tuple[str, Detection]]) -> Symbology:
     return _voted_symbology(group)
 
 
-def _aggregate_group(group: list[tuple[str, Detection]]) -> Detection:
+def _aggregate_group(
+    group: list[tuple[str, Detection]],
+    *,
+    allow: frozenset[Symbology] | None = None,
+) -> Detection:
     """Merge a group of overlapping detections (from different engines) into a single consensus
     Detection.
 
@@ -436,17 +440,12 @@ def _aggregate_group(group: list[tuple[str, Detection]]) -> Detection:
     * **bbox**: per-coord median across cluster members (robust to
       one engine reporting a slightly off bbox).
     * **score**: arithmetic mean of cluster members' scores.
-    * **symbology**: most-common-value voting; tiebreak to the
-      symbology of the highest-scored member among top-count
-      candidates, with a stable secondary tiebreak by symbology
-      value (same S-077 determinism pattern as payload).
-    * **payload**: most-common-value voting over non-None payloads;
-      tiebreak to the highest-scored member's payload IF non-None,
-      otherwise to the highest-scored member whose payload IS
-      non-None (S-077 fix: this deterministic tiebreak replaced
-      a Counter-first-encountered fallback that inherited Stage 1
-      ``as_completed`` non-determinism when ``best_det.payload``
-      happened to be ``None``).
+    * **symbology**: the winning decoder's symbology when a payload
+      is present, so a Data Matrix payload is not published as QR.
+      Undecoded clusters keep the voted label (S-099).
+    * **payload**: most common canonical payload; tiebreak by score,
+      then symbology value, then canonical string (S-077 / S-099).
+      Equal scores do not follow ``as_completed`` order.
     * **polygon**: highest-scored member's polygon (medians don't
       generalize cleanly to rotated quads).
     * **engine**: hardcoded ``"consensus"``.
@@ -464,25 +463,29 @@ def _aggregate_group(group: list[tuple[str, Detection]]) -> Detection:
     medians = [statistics.median(d.bbox_xyxy[i] for _, d in group) for i in range(4)]
     bbox = (float(medians[0]), float(medians[1]), float(medians[2]), float(medians[3]))
 
-    # Highest-scored member — drives tiebreaks for symbology/payload
-    # and provides the polygon (median polygons doesn't generalize
-    # cleanly to rotated quads).
+    # Polygon stays with the first highest-scored member. Payload and
+    # the published symbology use the winning decoder, which tie-breaks
+    # equal scores by symbology value (S-099).
     _best_name, best_det = max(group, key=lambda nd: nd[1].score)
 
-    # Voted label stays the cluster's symbology. The allow-list uses
-    # _decoding_symbology instead, so these two can differ (S-099).
-    symbology = _voted_symbology(group)
+    symbology = _decoding_symbology(group)
     winner = _winning_decoder(group)
     payload = winner.payload if winner is not None else None
 
-    # issue #12: agreed_payloads dedups on the canonical form. Kept
-    # here (not only inside _winning_decoder) so the extras entry is
-    # built from the same raw strings as before.
-    raw_and_canon: list[tuple[str, str]] = [
-        (d.payload, c)
-        for _, d in group
-        if d.payload is not None and (c := canonicalize_payload(d.payload, d.symbology)) is not None
-    ]
+    # issue #12: agreed_payloads dedups on the canonical form.
+    # Members outside the allow-list are omitted so a kept QR
+    # detection does not publish a Data Matrix string (S-099).
+    # per_engine stays raw; this extras field does not.
+    raw_and_canon: list[tuple[str, str]] = []
+    for _, det in group:
+        if det.payload is None:
+            continue
+        if allow is not None and det.symbology not in allow:
+            continue
+        canon = canonicalize_payload(det.payload, det.symbology)
+        if canon is None:
+            continue
+        raw_and_canon.append((det.payload, canon))
 
     score = float(statistics.mean(d.score for _, d in group))
 

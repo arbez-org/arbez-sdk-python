@@ -210,6 +210,16 @@ def _build_format_table() -> tuple[
         if alias is not None:
             zxing_to_arbez[alias] = Symbology.QR
 
+    # A Code39 request still returns Code39Ext for Full ASCII. Leaving
+    # that tag unmapped made the crop reader publish the text under
+    # the detector class. Code39Std is the specific standard tag;
+    # current builds return Code39, and the alias keeps a specific
+    # tag from being dropped. PZN and Code32 stay unmapped.
+    for code39_alias in ("Code39Ext", "Code39Std"):
+        alias = _opt(code39_alias)
+        if alias is not None:
+            zxing_to_arbez[alias] = Symbology.CODE_39
+
     # 1D codes ZXing recognizes that we still don't have a dedicated
     # enum for — surface as OTHER_1D rather than dropping them.
     # S-076 (2026-05-17): Codabar + ITF removed from this bucket;
@@ -279,10 +289,9 @@ def symbology_for_zxing_format(fmt: Any) -> Symbology | None:
     symbology and overrides the detector's classification.
 
     Returns ``None`` when the format isn't one the SDK models (an unmapped
-    matrix / specialty code). Unlike :meth:`ZXingEngine._translate` — which
-    *drops* such results — a caller that already has a detection (ArbezEngine's
-    detector supplied a label) should keep its own symbology in that case
-    rather than discard the detection.
+    matrix / specialty code, or the drop set). :class:`ArbezEngine` treats
+    that as no decode: it does not publish the text under the detector
+    class. :meth:`ZXingEngine._translate` drops the same results.
     """
     _, zxing_to_arbez, other_1d, _drop = _get_tables()
     if fmt in zxing_to_arbez:

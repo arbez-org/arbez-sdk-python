@@ -563,6 +563,71 @@ def test_apple_request_formats_exclude_micro_qr_by_default() -> None:
     assert with_micro == frozenset({Symbology.QR, Symbology.MICRO_QR})
 
 
+def test_prebuilt_engine_rebuild_ignores_scanner_flags() -> None:
+    """close() must not rebuild a user engine with Scanner opt-in flags.
+
+    A string name still rebuilds with those flags.
+    """
+    from arbez import Symbology
+    from arbez.engines.zxing import ZXingEngine
+
+    supplied = ZXingEngine()
+    scanner = Scanner(
+        engine=supplied,
+        symbologies={Symbology.QR},
+        micro_qr=True,
+        rmqr=True,
+    )
+    assert scanner._get_engine() is supplied
+    scanner.close()
+    rebuilt = scanner._get_engine()
+    assert isinstance(rebuilt, ZXingEngine)
+    assert rebuilt is not supplied
+    assert rebuilt._micro_qr is False
+    assert rebuilt._rmqr is False
+    assert rebuilt._formats is None
+
+    named = Scanner(engine="zxing", micro_qr=True, rmqr=True)
+    first = named._get_engine()
+    assert isinstance(first, ZXingEngine)
+    assert first._micro_qr is True
+    assert first._rmqr is True
+    named.close()
+    second = named._get_engine()
+    assert isinstance(second, ZXingEngine)
+    assert second is not first
+    assert second._micro_qr is True
+    assert second._rmqr is True
+
+
+def test_apple_formats_one_shot_iterable_is_kept() -> None:
+    """Validation must not exhaust a generator before it is stored."""
+    pytest.importorskip("Vision")
+    from arbez import Symbology
+    from arbez.engines.apple_vision import AppleVisionEngine
+
+    engine = AppleVisionEngine(formats=(sym for sym in (Symbology.QR,)))
+    assert engine._formats == frozenset({Symbology.QR})
+
+
+def test_scanner_apple_empty_request_matches_nothing(qr_image: PILImage) -> None:
+    """MaxiCode is not a Vision symbology, so the request is empty.
+
+    Empty must stay empty. ``formats or None`` would ask Vision for
+    every symbology, and the post-scan allow-list would hide the QR.
+    """
+    pytest.importorskip("Vision")
+    from arbez import Symbology
+    from arbez.engines.apple_vision import AppleVisionEngine
+
+    scanner = Scanner(engine="apple_vision", symbologies={Symbology.MAXICODE})
+    engine = scanner._get_engine()
+    assert isinstance(engine, AppleVisionEngine)
+    assert engine._formats == frozenset()
+    assert engine._formats is not None
+    assert engine.detect_and_decode(qr_image) == ()
+
+
 def test_apple_empty_formats_match_nothing(qr_image: PILImage) -> None:
     pytest.importorskip("Vision")
     from arbez import Symbology

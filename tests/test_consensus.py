@@ -788,9 +788,10 @@ def test_run_consensus_engine_failure_isolated() -> None:
 def test_allow_list_uses_decoding_symbology_not_voted_label() -> None:
     """T4: an undecoded QR box overlapping a Data Matrix read.
 
-    The merged label stays QR (the detector's vote). A QR allow-list
-    must drop the cluster because the payload came from a Data Matrix
-    decode. Filtering on the voted label would keep it.
+    A QR allow-list must drop the cluster because the payload came from
+    a Data Matrix decode. Filtering on the voted label would keep it.
+    The published symbology is the decoder's, so a kept cluster is
+    Data Matrix rather than the voted QR.
     """
     box = (10.0, 10.0, 80.0, 80.0)
     arbez = _StubEngine(
@@ -812,7 +813,8 @@ def test_allow_list_uses_decoding_symbology_not_voted_label() -> None:
 
     kept = run_consensus(img, engines, min_votes=1, iou_threshold=0.5)
     assert len(kept) == 1
-    assert kept[0].symbology is Symbology.QR
+    # The published label is the decoder's, not the voted QR box.
+    assert kept[0].symbology is Symbology.DATA_MATRIX
     assert kept[0].payload == "DM-PAYLOAD"
 
     dropped = run_consensus(
@@ -841,8 +843,7 @@ def test_allow_list_uses_decoding_symbology_not_voted_label() -> None:
     )
     assert len(by_decoder) == 1
     assert by_decoder[0].payload == "DM-PAYLOAD"
-    # The filter does not relabel. The voted symbology stays QR.
-    assert by_decoder[0].symbology is Symbology.QR
+    assert by_decoder[0].symbology is Symbology.DATA_MATRIX
 
     both = run_consensus(
         img,
@@ -910,6 +911,68 @@ def test_allow_list_leaves_per_engine_raw() -> None:
     assert len(detailed.per_engine["arbez"]) == 1
     assert len(detailed.per_engine["apple"]) == 1
     assert detailed.per_engine["apple"][0].payload == "DM"
+
+
+def test_winning_decoder_score_tie_breaks_on_symbology_value() -> None:
+    """Equal scores must not follow group order.
+
+    ZXing and WeChat both report 1.0. ``qr`` sorts after ``data_matrix``,
+    so the QR read wins either order and a QR allow-list stays stable.
+    """
+    from arbez.consensus import _aggregate_group, _winning_decoder
+
+    box = (0.0, 0.0, 40.0, 40.0)
+    qr = _make_det(box, symbology=Symbology.QR, score=1.0, payload="SAME", engine="wechat")
+    dm = _make_det(
+        box,
+        symbology=Symbology.DATA_MATRIX,
+        score=1.0,
+        payload="SAME",
+        engine="zxing",
+    )
+    assert _winning_decoder([("zxing", dm), ("wechat", qr)]) is qr
+    assert _winning_decoder([("wechat", qr), ("zxing", dm)]) is qr
+    forward = _aggregate_group([("zxing", dm), ("wechat", qr)])
+    reverse = _aggregate_group([("wechat", qr), ("zxing", dm)])
+    assert forward.symbology is Symbology.QR
+    assert reverse.symbology is Symbology.QR
+    assert forward.payload == "SAME"
+    assert reverse.payload == "SAME"
+
+
+def test_agreed_payloads_omits_disallowed_symbology() -> None:
+    """A kept detection must not carry a foreign payload in extras.
+
+    ``per_engine`` stays raw. ``agreed_payloads`` does not.
+    """
+    from arbez.consensus import _aggregate_group
+
+    group = [
+        ("zxing", _make_det(_BOX, symbology=Symbology.QR, score=1.0, payload="QR-TEXT")),
+        (
+            "apple",
+            _make_det(
+                _BOX,
+                symbology=Symbology.DATA_MATRIX,
+                score=0.4,
+                payload="DM-TEXT",
+            ),
+        ),
+    ]
+    out = _aggregate_group(group, allow=frozenset({Symbology.QR}))
+    assert out.symbology is Symbology.QR
+    assert out.payload == "QR-TEXT"
+    assert _agreed(out) == ("QR-TEXT",)
+
+    img = Image.new("RGB", (80, 80), "white")
+    voters: dict[str, Engine] = {
+        "zxing": _StubEngine((group[0][1],)),
+        "apple": _StubEngine((group[1][1],)),
+    }
+    detailed = run_consensus_detailed(img, voters, min_votes=1, symbologies={Symbology.QR})
+    assert len(detailed.detections) == 1
+    assert _agreed(detailed.detections[0]) == ("QR-TEXT",)
+    assert detailed.per_engine["apple"][0].payload == "DM-TEXT"
 
 
 def test_symbologies_reject_bare_string_and_empty() -> None:

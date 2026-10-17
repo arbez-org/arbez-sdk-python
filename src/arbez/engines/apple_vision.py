@@ -327,8 +327,12 @@ class AppleVisionEngine:
             from.
         """
         if formats is not None:
+            # Materialize once. A one-shot iterable is exhausted by
+            # validation, and the stored empty set is Vision's "all"
+            # if it later reaches setSymbologies_([]) (S-099).
+            requested = tuple(formats)
             arbez_to_names = _arbez_to_vision_names()
-            unsupported = [s for s in formats if s not in arbez_to_names or not arbez_to_names[s]]
+            unsupported = [s for s in requested if s not in arbez_to_names or not arbez_to_names[s]]
             if unsupported:
                 # Build a hint dynamically from which symbologies the
                 # user actually tripped over — pre-S-039 the message
@@ -353,7 +357,7 @@ class AppleVisionEngine:
                     else ("the listed symbologies are not requestable as Vision detection formats.")
                 )
                 raise ValueError(f"AppleVisionEngine: {unsupported} not requestable. {hint}")
-            self._formats: frozenset[Symbology] | None = frozenset(formats)
+            self._formats: frozenset[Symbology] | None = frozenset(requested)
         else:
             self._formats = None
 
@@ -623,8 +627,10 @@ class AppleVisionEngine:
                 names.extend(arbez_to_names[sym])
             # The Vision constants in the Python binding ARE the
             # string values themselves — pass them directly. No
-            # need to look up the symbol by name.
-            req.setSymbologies_(names)
+            # need to look up the symbol by name. An empty list
+            # means every symbology; never pass that.
+            if names:
+                req.setSymbologies_(names)
         return req
 
     def _get_vision_module(self) -> Any:
