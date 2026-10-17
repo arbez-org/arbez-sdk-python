@@ -149,8 +149,10 @@ print(result.timings_ms)
 # {'coerce': 3.1, 'consensus': 42.7, 'engine.arbez': 38.4, 'engine.zxing': 12.0}
 # Scanner(engine="zxing"):
 # {'coerce': 3.1, 'engine': 12.0, 'engine.zxing': 12.0}
+# a ZXing miss recovered by clahe also has 'ladder.clahe'
 print(result.extras["stage_hit"])
 # ('arbez', 'zxing')  # engines that returned a non-empty payload, in engine-set order
+# ('zxing', 'clahe')  # plus the rung, when the hit was not the base read
 ```
 
 `"coerce"` is input load (decode, EXIF orientation, the pixel-limit
@@ -158,6 +160,10 @@ check, RGB conversion). `"engine"` is only the single-engine path.
 `"consensus"` is the multi-engine wall clock, including the merge.
 `"engine.<name>"` is that engine's own `detect_and_decode`.
 `preprocess="auto"` is deprecated and does not add a timing key.
+A whole-frame ZXing miss that a later rung decodes adds
+`ladder.<rung>` (`clahe`, `up`, `gh`, or `adclose`): that rung's time
+only. `extras["stage_hit"]` appends the same name. A first-read hit
+and a total miss do not.
 
 Use this in your own code paths to track per-stage cost without
 running an external profiler. It's how the benchmark sections compute

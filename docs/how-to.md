@@ -226,8 +226,10 @@ print(f"{len(result)} detections")
 `timings_ms` is a per-stage wall-clock dict. Keys you may see:
 `"engine"` (the single-engine path, e.g. `Scanner(engine="zxing")`),
 `"consensus"` (the multi-engine path — the bare-`Scanner()` union
-shown above, or any `consensus=N`), `"preprocess"` (when
-`preprocess="auto"` kicks in).
+shown above, or any `consensus=N`), `"engine.<name>"`, and
+`"ladder.<rung>"` (`clahe`, `up`, `gh`, or `adclose`) when a
+whole-frame ZXing miss was recovered by that rung. `stage_hit`
+appends the same name. `preprocess="auto"` does not add a key.
 
 ## Benchmark with the built-in corpus
 
