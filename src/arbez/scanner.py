@@ -245,6 +245,16 @@ def _validate_consensus_subset(
 # ── Preprocessing helpers (S-022) ──────────────────────────────────────────
 
 
+def _per_scan_image(pil_image: PILImage) -> PILImage:
+    """Distinct shell around the same pixels.
+
+    Diagnostics are remembered by object identity. Two threads scanning
+    one ``Image`` would otherwise share that slot. ``_new`` does not
+    copy the buffer; engines read the pixels and do not mutate them.
+    """
+    return pil_image._new(pil_image.im)
+
+
 def _auto_preprocess(pil_image: PILImage) -> tuple[PILImage, float, float]:
     """``preprocess="auto"`` implementation.
 
@@ -712,7 +722,10 @@ class Scanner:
 
         # S-097: Scanner is maximum recall in this release (S-093), so the
         # pool deadline is 10 s. Attach after preprocess: that step can
-        # replace the image, and the engine thread looks this object up.
+        # replace the image. The shell is a new object, so a second scan
+        # of the caller's image does not share this slot. The engine
+        # thread binds the shell it is given.
+        pil_image = _per_scan_image(pil_image)
         diag = ScanDiagnostics(deadline_s=MAX_RECALL_DEADLINE_S)
         attach_diagnostics(pil_image, diag)
         try:

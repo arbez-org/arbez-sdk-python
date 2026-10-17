@@ -12,6 +12,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import types
 from multiprocessing import shared_memory
@@ -178,6 +179,67 @@ def test_hang_hits_the_deadline_and_the_next_call_works() -> None:
         assert elapsed < 15.0
         after = pool.call(_image(0))
         assert after.status == "ok"
+    finally:
+        pool.close()
+
+    class _HangEngine:
+        name = "fake"
+
+        def detect_and_decode(self, image: object) -> tuple[()]:
+            token = bind_diagnostics(image)
+            held = _pool()
+            try:
+                outcome = held.call(_image(2), deadline=1.0)
+                assert outcome.status == "timeout"
+                return ()
+            finally:
+                held.close()
+                reset_diagnostics(token)
+
+    result = Scanner(engine=_HangEngine()).scan(Image.new("RGB", (8, 8), "white"))
+    faults = result.extras["engine_faults"]
+    assert isinstance(faults, tuple)
+    fault = faults[0]
+    assert isinstance(fault, dict)
+    assert fault["kind"] == "timeout"
+
+
+def test_attach_shared_memory_omits_an_unsupported_track_keyword(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """3.10 through 3.12 SharedMemory rejects track=. Attach must still open."""
+    import arbez.engines._pool as pool_mod
+
+    class BareMemory:
+        def __init__(
+            self,
+            name: str | None = None,
+            create: bool = False,
+            size: int = 0,
+        ) -> None:
+            self._name = name
+            self.name = name
+
+    monkeypatch.setattr(pool_mod.shared_memory, "SharedMemory", BareMemory)  # type: ignore[attr-defined]
+    unregistered: list[tuple[str, str]] = []
+
+    def unregister(name: str, rtype: str) -> None:
+        unregistered.append((name, rtype))
+
+    monkeypatch.setattr(pool_mod.resource_tracker, "unregister", unregister)  # type: ignore[attr-defined]
+    opened = pool_mod._attach_shared_memory("seg-name")
+    assert isinstance(opened, BareMemory)
+    assert opened.name == "seg-name"
+    assert unregistered == [("seg-name", "shared_memory")]
+
+
+def test_non_finite_deadline_is_a_timeout_before_a_worker_starts() -> None:
+    pool = _pool()
+    try:
+        result = pool.call(_image(0), deadline=float("nan"))
+        assert result.status == "timeout"
+        assert "nan" in result.detail
+        assert pool._proc is None
     finally:
         pool.close()
 
@@ -486,5 +548,100 @@ def test_libdmtx_pool_roundtrip_and_blank_crop_uses_it() -> None:
         pool = libdmtx_pool_if_any()
         assert pool is not None
         assert pool.isolation == "process"
+    finally:
+        close_libdmtx_pool()
+
+
+def test_concurrent_scans_of_one_image_keep_separate_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two threads, one PIL object. Each result keeps the notes from its own scan."""
+    monkeypatch.setenv("ARBEZ_ISOLATION", "off")
+    image = Image.new("RGB", (8, 8), "white")
+    started = threading.Barrier(2)
+
+    class _NoteEngine:
+        name = "fake"
+
+        def detect_and_decode(self, seen: object) -> tuple[()]:
+            started.wait(5)
+            token = bind_diagnostics(seen)
+            pool = _pool()
+            try:
+                assert pool.call(_image(0)).status == "ok"
+                return ()
+            finally:
+                pool.close()
+                reset_diagnostics(token)
+
+    results: list[Any] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            results.append(Scanner(engine=_NoteEngine()).scan(image))
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run), threading.Thread(target=run)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert errors == []
+    assert len(results) == 2
+    for result in results:
+        isolation = result.extras["isolation"]
+        assert isinstance(isolation, dict)
+        assert isolation["fake"] == "inprocess"
+
+
+def test_libdmtx_startup_error_propagates_and_a_timeout_is_a_miss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from arbez_dmtx import decode
+
+    from arbez.engines._pool import PoolResult
+    from arbez.engines._yolox import RawDetection
+    from arbez.engines.arbez import ArbezEngine
+    from arbez.exceptions import EngineRuntimeError
+
+    image = Image.new("RGB", (40, 40), "white")
+    det = RawDetection(0.0, 0.0, 40.0, 40.0, 0.9, 2)
+
+    class _Boom:
+        def call(self, _image_arg: object) -> PoolResult:
+            raise EngineRuntimeError("worker was not ready within 120s")
+
+    monkeypatch.setattr("arbez.engines.arbez.libdmtx_pool", lambda: _Boom())
+    with pytest.raises(EngineRuntimeError, match="not ready"):
+        ArbezEngine._dmtx_decode_one(decode, image, det)
+
+    class _TimedOut:
+        def call(self, _image_arg: object) -> PoolResult:
+            return PoolResult(
+                status="timeout",
+                value=None,
+                detail="deadline 2.0s exceeded",
+                isolation="process",
+            )
+
+    monkeypatch.setattr("arbez.engines.arbez.libdmtx_pool", lambda: _TimedOut())
+    assert ArbezEngine._dmtx_decode_one(decode, image, det) is None
+
+
+def test_engine_close_drops_only_a_libdmtx_pool_that_gave_up() -> None:
+    from arbez.engines._pool import libdmtx_pool
+    from arbez.engines.arbez import ArbezEngine
+
+    close_libdmtx_pool()
+    try:
+        healthy = libdmtx_pool()
+        assert healthy.gave_up is False
+        ArbezEngine().close()
+        assert libdmtx_pool_if_any() is healthy
+        healthy._trip_inprocess("spawn failed: test")
+        ArbezEngine().close()
+        assert libdmtx_pool_if_any() is None
     finally:
         close_libdmtx_pool()

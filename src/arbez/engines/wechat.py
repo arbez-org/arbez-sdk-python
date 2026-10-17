@@ -205,11 +205,18 @@ def _detach_points(points: Any) -> Any:
         return points
 
 
-def _wechat_invoke(holder: WeChatEngine, bgr: Any) -> tuple[list[Any], list[Any]]:
+def _wechat_invoke(
+    holder: WeChatEngine,
+    bgr: Any,
+    *,
+    full_frame: bool = True,
+) -> tuple[list[Any], list[Any]]:
     """Net pass, then the no-argument full frame when that pass has no payload.
 
     One call so both constructors share a single pool deadline. A crash
     here kills the worker; the parent must not run the fallback itself.
+    ``full_frame=False`` is the pre-seeded detector path: that object
+    stays in the parent, and the no-argument constructor must not.
     """
     detector = holder._get_detector()
     payloads, points_list = detector.detectAndDecode(bgr)
@@ -218,7 +225,7 @@ def _wechat_invoke(holder: WeChatEngine, bgr: Any) -> tuple[list[Any], list[Any]
     # lose its tail after any().
     payloads = list(payloads)
     points_list = list(points_list)
-    if not any(payloads):
+    if full_frame and not any(payloads):
         payloads, points_list = holder._get_full_frame_detector().detectAndDecode(bgr)
         payloads = list(payloads)
         points_list = list(points_list)
@@ -355,11 +362,13 @@ class WeChatEngine:
         """
         from arbez.engines.helpers import prewarm_pil
 
-        pool = self._ensure_pool()
-        if pool.isolation == "process":
-            pool.start()
-        else:
-            with self._lock:
+        with self._lock:
+            pool = self._pool_under_lock()
+            if pool.isolation == "process":
+                pool.start()
+            # start() falls back in-process when spawn fails. Build the
+            # detector here in that case, and only then.
+            if pool.isolation == "inprocess":
                 self._get_detector()
         prewarm_pil()
 
@@ -433,22 +442,23 @@ class WeChatEngine:
         rgb = np_mod.asarray(pil_image, dtype=np_mod.uint8)
         bgr = np_mod.ascontiguousarray(cv2_mod.cvtColor(rgb, cv2_mod.COLOR_RGB2BGR))
 
+        # Hold this lock from the moment the pool is taken through the
+        # call. close() takes the same lock before it drops the pool, so
+        # it waits out an in-flight call instead of closing under it.
         # A detector placed on this instance (the length-mismatch test)
-        # cannot be pickled into a worker. Run it here so the parent still
-        # checks the payload/points contract. Production leaves _detector
-        # unset until an in-process fallback builds one inside the pool.
-        if self._pool is None and self._detector is not None:
-            payloads, points_list = _wechat_invoke(self, bgr)
-        else:
-            pool = self._ensure_pool()
-            with self._lock:
-                # S-012: one worker per instance, and the in-process detector
-                # is still not thread-safe. The pool lock serializes the
-                # worker; this lock keeps close() from dropping it mid-call.
+        # cannot be pickled into a worker. Run that object here, and do
+        # not construct the no-argument detector in the parent.
+        # Production leaves _detector unset until an in-process fallback
+        # builds one inside the pool.
+        with self._lock:
+            if self._pool is None and self._detector is not None:
+                payloads, points_list = _wechat_invoke(self, bgr, full_frame=False)
+            else:
+                pool = self._pool_under_lock()
                 outcome = pool.call(bgr)
-            if outcome.status != "ok":
-                return ()
-            payloads, points_list = outcome.value
+                if outcome.status != "ok":
+                    return ()
+                payloads, points_list = outcome.value
 
         detections: list[Detection] = []
         # H3 (S-016): strict=True catches upstream length mismatches.
@@ -509,16 +519,15 @@ class WeChatEngine:
             self._np = _np
         return self._cv2, self._np
 
-    def _ensure_pool(self) -> EnginePool:
-        """Build the isolation pool on first use. One worker per engine."""
-        with self._lock:
-            if self._pool is None:
-                self._pool = EnginePool(
-                    "arbez.engines.wechat:_wechat_worker_init",
-                    engine="wechat",
-                    inprocess_factory=self._inprocess_runner,
-                )
-            return self._pool
+    def _pool_under_lock(self) -> EnginePool:
+        """Build the isolation pool on first use. Caller holds ``self._lock``."""
+        if self._pool is None:
+            self._pool = EnginePool(
+                "arbez.engines.wechat:_wechat_worker_init",
+                engine="wechat",
+                inprocess_factory=self._inprocess_runner,
+            )
+        return self._pool
 
     def _inprocess_runner(self) -> Any:
         engine = self

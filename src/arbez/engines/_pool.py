@@ -20,13 +20,14 @@ import contextvars
 import functools
 import importlib
 import logging
+import math
 import multiprocessing as mp
 import os
 import sys
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 from typing import TYPE_CHECKING, Any, cast
 from weakref import WeakSet
 
@@ -63,8 +64,8 @@ class ScanDiagnostics:
     """Per-scan notes the engine thread can see.
 
     Consensus runs engines on a thread pool, and that pool does not copy
-    context variables. The scanner keys this object by the image's ``id``
-    so the engine thread can bind it when ``detect_and_decode`` starts.
+    context variables. Each scan attaches this object to its own image
+    shell, and the engine thread binds that same shell.
     """
 
     deadline_s: float
@@ -272,24 +273,76 @@ def _send_tagged(conn: Connection, kind: str, exc: BaseException) -> None:
 
 
 def _attach_shared_memory(name: str) -> shared_memory.SharedMemory:
-    # track=False: a daemon worker must not spawn the resource tracker,
-    # and that tracker would unlink the parent's segment if the worker died.
-    # The keyword is 3.13+. The cast keeps the 3.12 mypy target quiet.
-    ctor = cast(Any, shared_memory.SharedMemory)
-    shm = ctor(name=name, track=False)
-    return cast(shared_memory.SharedMemory, shm)
+    """Open the parent's segment in this process without owning it.
+
+    ``track=False`` exists on 3.13+. Older interpreters reject the keyword,
+    so those open the name and unregister it. The child must not be the
+    owner: a tracked death unlinks the parent's mapping.
+    """
+    try:
+        # The cast keeps the 3.12 mypy target quiet about the 3.13 keyword.
+        ctor = cast(Any, shared_memory.SharedMemory)
+        opened = cast(shared_memory.SharedMemory, ctor(name=name, track=False))
+    except TypeError:
+        opened = shared_memory.SharedMemory(name=name)
+        _forget_child_tracker(opened)
+    return opened
+
+
+def _forget_child_tracker(shm: shared_memory.SharedMemory) -> None:
+    """Drop this process's tracker entry. The parent still unlinks."""
+    raw = getattr(shm, "_name", None)
+    if not isinstance(raw, str):
+        return
+    with contextlib.suppress(Exception):
+        resource_tracker.unregister(raw, "shared_memory")
 
 
 def _release_shared_memory(shm: shared_memory.SharedMemory) -> None:
     try:
         shm.close()
     except BufferError:
-        buf = cast(Any, shm)._buf
+        buf = getattr(shm, "_buf", None)
         if buf is not None:
-            buf.release()
-        shm.close()
+            with contextlib.suppress(Exception):
+                buf.release()
+        with contextlib.suppress(Exception):
+            shm.close()
+    except Exception:
+        _log.debug("engine pool shared memory close failed", exc_info=True)
+    # Unlink even when close failed. The name is the parent's to drop.
     with contextlib.suppress(FileNotFoundError):
         shm.unlink()
+
+
+def _posix_shm_free_bytes() -> int | None:
+    """Free bytes on the Linux tmpfs that backs POSIX shm, else ``None``.
+
+    A write into a mapping larger than that tmpfs SIGBUS-kills the parent.
+    The signal cannot be caught, and a hard kill cannot unlink the segment
+    in-process, so the caller refuses the frame instead of mapping it.
+    """
+    if sys.platform != "linux":
+        return None
+    path = "/dev/shm"
+    if not os.path.isdir(path):
+        return None
+    try:
+        stats = os.statvfs(path)
+    except OSError:
+        return None
+    return int(stats.f_bavail) * int(stats.f_frsize)
+
+
+class _SharedMemoryCapacityError(Exception):
+    """The frame does not fit in the POSIX shm backing store."""
+
+    def __init__(self, need: int, free: int) -> None:
+        super().__init__(
+            f"shared memory backing store has {free} bytes free, frame needs {need}"
+        )
+        self.need = need
+        self.free = free
 
 
 def _create_shared_image(
@@ -301,11 +354,19 @@ def _create_shared_image(
     shape = tuple(int(dim) for dim in array.shape)
     nbytes = int(array.nbytes)
     # SharedMemory rejects size 0. An empty frame still has to round-trip.
-    shm = shared_memory.SharedMemory(create=True, size=max(nbytes, 1))
-    if nbytes:
-        view = np.ndarray(shape, dtype=array.dtype, buffer=shm.buf)
-        view[...] = array
-        del view
+    need = max(nbytes, 1)
+    free = _posix_shm_free_bytes()
+    if free is not None and need > free:
+        raise _SharedMemoryCapacityError(need, free)
+    shm = shared_memory.SharedMemory(create=True, size=need)
+    try:
+        if nbytes:
+            view = np.ndarray(shape, dtype=array.dtype, buffer=shm.buf)
+            view[...] = array
+            del view
+    except BaseException:
+        _release_shared_memory(shm)
+        raise
     return shm, shape, str(array.dtype.str)
 
 
@@ -387,6 +448,9 @@ class EnginePool:
         self._inprocess_factory = inprocess_factory
         self._block_reason = isolation_block_reason()
         self._force_inprocess = self._block_reason is not None
+        # Set only after a spawn or a kill we already attempted gives up.
+        # The initial in-process reasons are not that, and stay for the process.
+        self._gave_up = False
         self.last_deadline_s = self._deadline
         self._closed = False
         self._ready = False
@@ -416,6 +480,17 @@ class EnginePool:
         """True after :meth:`close`."""
         return self._closed
 
+    @property
+    def gave_up(self) -> bool:
+        """True after this pool abandoned a worker it had tried to run.
+
+        A pool that started in-process (``ARBEZ_ISOLATION=off``, a daemon,
+        no ``/dev/shm``, no ``__main__`` guard) has not given up. ``close``
+        of a shared engine can drop a pool that has, and the next decode
+        can try to spawn again.
+        """
+        return self._gave_up
+
     def start(self) -> None:
         """Load the engine in the worker. In-process, load it here instead."""
         with self._lock:
@@ -424,7 +499,12 @@ class EnginePool:
             if self.isolation == "inprocess":
                 self._load_inprocess()
                 return
-            self._ensure_worker()
+            try:
+                self._ensure_worker()
+            except _PoolUnavailable:
+                # Spawn failed. Same fallback a later call() would take,
+                # so warmup does not abort the host.
+                self._load_inprocess()
 
     def call(self, image: npt.NDArray[Any], deadline: float | None = None) -> PoolResult:
         """Run one image. ``deadline`` wins, else the bound scan, else 2 s."""
@@ -494,39 +574,95 @@ class EnginePool:
 
     def _trip_inprocess(self, reason: str) -> None:
         self._force_inprocess = True
+        self._gave_up = True
         self._block_reason = reason
         _log_choice("inprocess", reason)
 
     def _call_process(self, image: npt.NDArray[Any], deadline: float) -> PoolResult:
+        # A NaN or infinite deadline makes poll raise or wait forever.
+        # Reject it before the frame is sent, and before a worker is started.
+        if not math.isfinite(deadline) or deadline < 0:
+            return self._timeout_result(deadline)
         self._ensure_worker()
         conn = self._conn
         proc = self._proc
         if conn is None or proc is None:
             raise EngineRuntimeError(f"engine {self.engine} worker is not running")
-        shm, shape, dtype_str = _create_shared_image(image)
+        shm: shared_memory.SharedMemory | None = None
+        # True once a message might be queued. Any exit from that wait
+        # has to replace the worker, or the next call reads this reply.
+        inflight = False
         try:
+            try:
+                shm, shape, dtype_str = _create_shared_image(image)
+            except _SharedMemoryCapacityError as exc:
+                return PoolResult(
+                    status="crash",
+                    value=None,
+                    detail=str(exc),
+                    isolation="process",
+                )
+            inflight = True
             try:
                 conn.send((shm.name, shape, dtype_str))
             except (OSError, BrokenPipeError):
                 return self._crashed(proc)
-            if not conn.poll(deadline):
-                if not proc.is_alive():
-                    return self._crashed(proc)
+            return self._await_reply(conn, proc, deadline)
+        except KeyboardInterrupt:
+            if inflight:
                 self._replace_worker()
-                return PoolResult(
-                    status="timeout",
-                    value=None,
-                    detail=f"deadline {deadline}s exceeded",
-                    isolation="process",
-                )
-            try:
-                reply: Any = conn.recv()
-            except (EOFError, OSError):
-                return self._crashed(proc)
-            return self._interpret(reply, proc)
+            raise
         finally:
-            # Unlink after the reply or after kill+join. The worker only closes.
-            _release_shared_memory(shm)
+            # Create sits inside this finally so a MemoryError or an
+            # interrupt still unlinks. The worker only closes.
+            if shm is not None:
+                _release_shared_memory(shm)
+
+    def _timeout_result(self, deadline: float) -> PoolResult:
+        return PoolResult(
+            status="timeout",
+            value=None,
+            detail=f"deadline {deadline}s exceeded",
+            isolation="process",
+        )
+
+    def _await_reply(self, conn: Connection, proc: mp.Process, deadline: float) -> PoolResult:
+        """Wait for one reply. A transport failure replaces the worker."""
+        try:
+            readable = conn.poll(deadline)
+        except Exception:
+            return self._crashed(proc)
+        if not readable:
+            if not proc.is_alive():
+                return self._crashed(proc)
+            self._replace_worker()
+            return self._timeout_result(deadline)
+        # poll is true when the pipe is readable, including a partial
+        # pickle. recv on this thread would then block past the deadline.
+        box: dict[str, Any] = {}
+
+        def _read() -> None:
+            try:
+                box["reply"] = conn.recv()
+            except BaseException as exc:
+                box["exc"] = exc
+
+        reader = threading.Thread(target=_read, name="arbez-pool-recv", daemon=True)
+        reader.start()
+        reader.join(deadline)
+        if reader.is_alive():
+            # Closing the worker end unblocks recv. Join before the
+            # replacement reuses nothing of this pipe.
+            self._kill_process(proc)
+            reader.join(5)
+            self._replace_worker()
+            return self._timeout_result(deadline)
+        exc = box.get("exc")
+        if isinstance(exc, KeyboardInterrupt):
+            raise exc
+        if exc is not None:
+            return self._crashed(proc)
+        return self._interpret(box.get("reply"), proc)
 
     def _interpret(self, reply: Any, proc: mp.Process) -> PoolResult:
         if not isinstance(reply, tuple) or not reply:
@@ -538,8 +674,18 @@ class EnginePool:
         if kind == "error":
             exc = reply[1] if len(reply) > 1 else None
             text = reply[2] if len(reply) > 2 and reply[2] is not None else "engine failed"
-            if isinstance(exc, BaseException):
+            # SystemExit and other BaseExceptions must not leave this
+            # process. A normal engine exception still propagates, and
+            # that worker is still waiting for the next image.
+            if isinstance(exc, Exception):
                 raise exc
+            if isinstance(exc, BaseException):
+                return PoolResult(
+                    status="crash",
+                    value=None,
+                    detail=str(text),
+                    isolation="process",
+                )
             raise EngineRuntimeError(str(text))
         return self._crashed(proc)
 
@@ -553,24 +699,32 @@ class EnginePool:
         )
 
     def _replace_worker(self) -> None:
-        """Kill the current worker and start the next one before returning."""
+        """Kill the current worker and start the next one.
+
+        Ready is the next call's wait. This call already missed its
+        deadline or lost the worker, and startup can take the whole
+        model-load budget.
+        """
         self._kill_worker()
+        if self._gave_up:
+            return
         try:
-            self._ensure_worker()
+            self._spawn_worker()
         except _PoolUnavailable:
             return
         except Exception:
             _log.warning("engine %s worker respawn failed", self.engine, exc_info=True)
 
     def _ensure_worker(self) -> None:
-        if (
-            self._proc is not None
-            and self._proc.is_alive()
-            and self._ready
-            and self._conn is not None
-        ):
+        if self._proc is not None and self._proc.is_alive() and self._conn is not None:
+            if not self._ready:
+                self._finish_ready()
             return
         self._kill_worker()
+        self._spawn_worker()
+        self._finish_ready()
+
+    def _spawn_worker(self) -> None:
         ctx = _spawn_context()
         parent, child = ctx.Pipe(duplex=True)
         proc: mp.Process = ctx.Process(
@@ -590,8 +744,14 @@ class EnginePool:
         self._proc = proc
         self._conn = parent
         self._ready = False
+
+    def _finish_ready(self) -> None:
+        conn = self._conn
+        proc = self._proc
+        if conn is None or proc is None:
+            raise EngineRuntimeError(f"engine {self.engine} worker is not running")
         try:
-            self._wait_ready(parent, proc)
+            self._wait_ready(conn, proc)
         except BaseException:
             # A worker that dies while loading must not fall back in-process:
             # the same native fault would hit the parent.
@@ -623,8 +783,12 @@ class EnginePool:
             text = (
                 message[2] if len(message) > 2 and message[2] is not None else "worker init failed"
             )
-            if isinstance(init_exc, BaseException):
+            if isinstance(init_exc, Exception):
                 raise init_exc
+            # SystemExit from the worker must not exit the parent. The
+            # load still failed, and the caller must not retry in-process.
+            if isinstance(init_exc, BaseException):
+                raise EngineRuntimeError(str(text)) from init_exc
             raise EngineRuntimeError(str(text))
         raise EngineRuntimeError(f"engine {self.engine} worker sent {message!r} during init")
 
@@ -666,7 +830,10 @@ class EnginePool:
             proc.kill()
         proc.join(5)
         if proc.is_alive():
+            # The process is still running and we will not keep sending
+            # it work. Later decodes run in-process until close drops us.
             _log.warning("engine %s worker did not exit after kill", self.engine)
+            self._trip_inprocess("worker did not exit after kill")
 
 
 def _close_live_pools() -> None:
@@ -724,6 +891,22 @@ def libdmtx_pool_if_any() -> EnginePool | None:
         if pool is None or pool.closed:
             return None
         return pool
+
+
+def drop_libdmtx_pool_if_given_up() -> None:
+    """Forget a libdmtx pool that abandoned its worker.
+
+    A pool that still has a live worker stays, so one engine's ``close``
+    does not stop a decode another engine is using. The next real decode
+    constructs a new pool and can spawn again.
+    """
+    global _libdmtx_pool
+    with _libdmtx_guard:
+        pool = _libdmtx_pool
+        if pool is None or not pool.gave_up:
+            return
+        _libdmtx_pool = None
+    pool.close()
 
 
 def close_libdmtx_pool() -> None:
