@@ -63,5 +63,9 @@ arbez-dmtx==0.0.1  ; (sys_platform == 'darwin' and platform_machine == 'arm64') 
 pyobjc-framework-Vision==10.0  ; platform_system == 'Darwin'
 pyobjc-framework-Quartz==10.0  ; platform_system == 'Darwin'
 
-# ── arbez[wechat] extra (not yet exercised by smoke; pin for parity) ──
-opencv-contrib-python==4.9.0.80
+# ── arbez[wechat] extra (S-096) ──
+# The OpenCV pin is not in this file. opencv-contrib-python 5.0.0.93
+# requires numpy>=2 on Python >=3.9, which cannot be resolved together
+# with numpy==1.24.0 above. The pin lives in constraints/floor-wechat.txt.
+# install-smoke-min applies that file in a second install, after the
+# core floor smoke, then calls WeChatEngine().detect_and_decode() once.

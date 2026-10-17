@@ -14,6 +14,9 @@ requires-python = ">=3.10,<3.15"
 # Apache-2.0 commitment (S-054, 2026-05-15). Covers SDK code AND the
 # bundled object-detection model at src/arbez/_assets/arbez_yolox_s.onnx
 # (which is also Apache-2.0 — see src/arbez/_assets/NOTICE).
+# The WeChat QR nets under src/arbez/_assets/wechat/ are vendored
+# separately. Their attribution is src/arbez/_assets/wechat/NOTICE
+# (S-096). That upstream tree ships no LICENSE file.
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [{name = "The arbez authors", email = "13718822+tke1973@users.noreply.github.com"}]
@@ -163,8 +166,14 @@ apple-vision = [
     # pattern as [zxing] post-S-034.
 ]
 wechat = [
-    # opencv-contrib-python ships the WeChat QR detector model files
-    "opencv-contrib-python>=4.9",
+    # S-096: OpenCV 5 loads the vendored detect.onnx and sr.onnx nets.
+    # OpenCV 4's constructor takes Caffe paths and cannot load them.
+    # 5.0.0.93 is the only 5.x wheel on PyPI. Its pin is
+    # constraints/floor-wechat.txt, not constraints/floor.txt: that
+    # release requires numpy>=2 on Python >=3.9, and the core floor
+    # pins numpy==1.24.0. The two pins do not resolve together.
+    "opencv-contrib-python>=5",
+    "numpy>=2",
 ]
 zxing = [
     # S-034 (v0.0.20): zxing-cpp is now a core dependency — included in
@@ -235,7 +244,8 @@ dev = [
     # Tests need real engines + synthetic-fixture generators. Pure-Python only
     # so CI doesn't need system libs (no ghostscript, libdmtx, etc.).
     "zxing-cpp>=3.1.1",  # matches the floor in the [zxing] extra above
-    "opencv-contrib-python>=4.9",  # matches the floor in the [wechat] extra above
+    "opencv-contrib-python>=5",  # matches the floor in the [wechat] extra above
+    "numpy>=2",  # opencv-contrib-python 5.0.0.93 requires it; core floor stays 1.24
     # Apple Vision deps are Darwin-only by marker. On Linux/Windows CI
     # cells these silently no-op, so the Apple Vision tests skip via
     # ``pytest.importorskip("Vision")``.
@@ -272,18 +282,25 @@ include = ["arbez*"]
 # up as Any in user code, defeating our strict-mypy posture.
 #
 # Also bundle the YOLOX-s weights (S-029) — ~36 MB ONNX file
-# loaded by ArbezEngine() when no model_path is supplied.
+# loaded by ArbezEngine() when no model_path is supplied — and the
+# WeChat QR ONNX pair (S-096), about 1 MB together.
 #
 # Pin the exact filename (not a ``*.onnx`` glob): a glob can sweep an
 # unrelated ``.onnx`` left in a stale ``build/`` staging dir into the
-# wheel. Only the one tracked asset ships.
+# wheel. Only the tracked assets ship.
 #
-# Plus the model-specific LICENSE + NOTICE next to the .onnx (S-054):
-# Apache-2.0 covers both code and weights; the in-tree LICENSE +
-# NOTICE files ride along in the wheel so downstream users always
-# have the model's license + attribution at hand without having
-# to consult the source repo.
-"arbez" = ["py.typed", "_assets/arbez_yolox_s.onnx", "_assets/LICENSE", "_assets/NOTICE"]
+# Plus the model-specific LICENSE + NOTICE next to the YOLOX file
+# (S-054), and the WeChat NOTICE next to those two nets: attribution
+# rides along in the wheel.
+"arbez" = [
+    "py.typed",
+    "_assets/arbez_yolox_s.onnx",
+    "_assets/LICENSE",
+    "_assets/NOTICE",
+    "_assets/wechat/detect.onnx",
+    "_assets/wechat/sr.onnx",
+    "_assets/wechat/NOTICE",
+]
 
 [tool.ruff]
 line-length = 100

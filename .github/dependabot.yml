@@ -48,7 +48,8 @@ updates:
     # exact deps that have FLOOR pins. New deps added to floor.txt MUST
     # also be added here — otherwise dependabot will try to bump the
     # floor again and an earlier dependabot misfire (2026-05-18) will
-    # repeat. Lockstep with constraints/floor.txt.
+    # repeat. Lockstep with constraints/floor.txt and
+    # constraints/floor-wechat.txt.
     ignore:
       - dependency-name: "numpy"
       - dependency-name: "pillow"
@@ -57,7 +58,7 @@ updates:
       - dependency-name: "arbez-dmtx"  # S-092 floor pin (constraints/floor.txt)
       - dependency-name: "pyobjc-framework-Vision"
       - dependency-name: "pyobjc-framework-Quartz"
-      - dependency-name: "opencv-contrib-python"
+      - dependency-name: "opencv-contrib-python"  # S-096 pin (constraints/floor-wechat.txt)
     # Default reviewer: the maintainer. (Adding a placeholder; can be
     # updated when the team grows.)
     reviewers:

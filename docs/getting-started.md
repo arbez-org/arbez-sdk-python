@@ -21,7 +21,7 @@ What you get:
 |---|---|
 | `pip install arbez` | **arbez** (default, YOLOX-s + zxing) + **zxing** (classical); on macOS also **Apple Vision** (ANE-accelerated — its pyobjc deps are core deps auto-pulled via a Darwin marker) |
 | `pip install 'arbez[apple-vision]'` | No-op back-compat alias — Apple Vision already ships with the base install on macOS |
-| `pip install 'arbez[wechat]'` | Above + WeChat (QR-only, opencv-contrib) |
+| `pip install 'arbez[wechat]'` | Above + WeChat (QR-only, opencv-contrib >= 5) |
 | `pip install 'arbez[consensus]'` | All four engines, so `Scanner()` unions them all |
 | `pip install 'arbez[all]'` | Everything except dev tooling |
 

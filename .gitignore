@@ -40,10 +40,14 @@ htmlcov/
 .DS_Store
 
 # Model artefacts (downloaded to a user cache, never committed)
-# Exception: the bundled YOLOX-s model weights ship in the wheel.
-# Anything ELSE matching the patterns below stays ignored.
+# Exception: the bundled YOLOX-s weights, and the WeChat QR ONNX pair
+# (S-096), ship in the wheel. The second negation is required because
+# `*` does not match `/`, so the YOLOX exception does not cover
+# `src/arbez/_assets/wechat/`. Anything ELSE matching the patterns
+# below stays ignored.
 *.onnx
 !src/arbez/_assets/*.onnx
+!src/arbez/_assets/wechat/*.onnx
 *.mlpackage/
 *.mlmodel
 *.tflite

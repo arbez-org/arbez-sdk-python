@@ -277,23 +277,38 @@ jobs:
           # what catches the case where our advertised floor doesn't
           # ship a wheel for this cell — that's itself a real-user
           # failure mode, not a CI-config bug).
-          # Install BOTH consensus extras so every engine's floor is
-          # exercised in one job — previous WeChat floor bug would
-          # have hid behind a [zxing]-only install.
+          # [wechat] stays out of this install. opencv-contrib-python
+          # 5.0.0.93 requires numpy>=2 on Python >=3.9 (S-096), and
+          # constraints/floor.txt pins numpy==1.24.0. Those pins do not
+          # resolve together. The WeChat floor is a second install,
+          # after the core smoke below.
           /tmp/floorvenv/bin/python -m pip install \
               --only-binary=:all: \
               --constraint constraints/floor.txt \
-              "${WHEEL}[zxing,wechat]" qrcode
+              "${WHEEL}[zxing]" qrcode
+          /tmp/floorvenv/bin/python -c "import numpy; assert numpy.__version__ == '1.24.0', numpy.__version__"
       - name: Verify ZXing 5-liner against the floor stack
         run: /tmp/floorvenv/bin/python examples/five_liner_smoke.py
-      - name: Verify WeChat engine works against the floor stack
+      - name: Install the WeChat OpenCV floor (numpy>=2; separate constraint file)
+        run: |
+          WHEEL=$(ls dist/arbez-*.whl | head -1)
+          /tmp/floorvenv/bin/python -m pip install \
+              --only-binary=:all: \
+              --constraint constraints/floor-wechat.txt \
+              "${WHEEL}[wechat]"
+      - name: Verify WeChat engine works against the OpenCV floor
         # Inline rather than a separate script — we want the floor
         # check to exercise WeChatEngine().detect_and_decode() ONCE,
-        # not become a parallel five_liner.
+        # not become a parallel five_liner. The core numpy pin was
+        # already proved above; this step proves the OpenCV pin.
         run: |
           /tmp/floorvenv/bin/python -c "
           import qrcode
+          from importlib.metadata import version
+          import numpy
           from arbez.engines.wechat import WeChatEngine
+          assert version('opencv-contrib-python') == '5.0.0.93'
+          assert int(numpy.__version__.split('.', 1)[0]) >= 2
           qr = qrcode.QRCode(version=2, box_size=10, border=4)
           qr.add_data('https://arbez.org/wechat-floor-smoke')
           qr.make(fit=True)

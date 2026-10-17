@@ -62,7 +62,7 @@ their results. Pass `engine=` when you want exactly one:
 
 ```python
 Scanner(engine="zxing")          # broadest symbology coverage
-Scanner(engine="wechat")         # QR-only, best on tiny / damaged
+Scanner(engine="wechat")         # QR-only; vendored detector + super-resolution nets
 Scanner(engine="apple_vision")   # macOS-only, real confidence scores
 Scanner(engine="arbez")          # single-engine arbez (first-party YOLOX-s + zxing decoder)
 Scanner(engines=["arbez", "zxing"])  # union over just this subset
@@ -74,7 +74,7 @@ When to override:
 | Engine | Pick when |
 |---|---|
 | `zxing` | You want reproducibility across hosts (auto-pick can shift between platforms); you need a non-QR symbology (Code 128, EAN-13, etc.); you're benchmarking. |
-| `wechat` | You're scanning small / blurry / partially-occluded QRs and recall matters more than throughput. QR-only. |
+| `wechat` | You're scanning small or blurry QRs and recall matters more than throughput. QR-only. Needs OpenCV 5. |
 | `apple_vision` | You're on macOS and want real per-detection confidence scores OR ANE-accelerated throughput. |
 | `arbez` | You want the first-party model. The bundled weights are a 14-class YOLOX-s detector (mAP@50 = 0.833 on QR, 0.370 overall, full 14-symbology coverage). Inspect `engine.model_version` to see which weights are loaded. To swap in your own RT-DETR-v2 or YOLO11-s, use `ArbezEngine(arch=..., model_path=...)` per [BYO weights](bring-your-own-weights.md). |
 | `consensus=N` | You want to filter the multi-engine union down to codes engines agree on. `consensus=N` keeps only codes >= N installed engines saw; merged result has median bbox + majority payload. See ["Multi-engine consensus voting"](#multi-engine-consensus-voting). |
