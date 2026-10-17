@@ -425,7 +425,9 @@ def _map_shared_image(
     try:
         _reserve_linux_pages(shm, reserve)
         if nbytes:
-            view = np.ndarray(shape, dtype=array.dtype, buffer=shm.buf)
+            # numpy 2.2 types this constructor as Any. Strict mypy then
+            # rejects the bare name on the 3.10 CI image.
+            view: Any = np.ndarray(shape, dtype=array.dtype, buffer=shm.buf)
             view[...] = array
             del view
     except BaseException:
