@@ -52,7 +52,12 @@ jobs:
       # makes the directory a proper package and the corpus + parametrize
       # blocks were written with explicit ``set[str]`` annotations etc.
       - run: mypy src/arbez/ tools/ tests/
-      - run: pytest -q tests/
+      # cv2.WeChatQRCode.detectAndDecode sometimes aborts the interpreter
+      # (exit 134) on a tree that passes in a fresh process. Retry only
+      # that death. The step passes only when pytest itself exits 0.
+      # Three crashes still fail the job. Do not exit 0 after a persistent
+      # abort — that was closed PR #10, and a broken WeChat would go green.
+      - run: python tools/ci/pytest_native_retry.py
 
   # ── Job 2 — wheel-matrix audit (the S-006 contract) ────────────────────
   # Doesn't actually install on every platform — it asks pip "would you
