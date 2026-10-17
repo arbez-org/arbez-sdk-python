@@ -23,7 +23,7 @@ import pytest
 from PIL import Image
 from PIL.Image import Image as PILImage
 
-from arbez import Detection, Symbology
+from arbez import Detection, Scanner, Symbology
 from arbez.engines.wechat import WeChatEngine
 from arbez.exceptions import EngineRuntimeError
 from tests._engine_availability import WECHAT_AVAILABLE
@@ -38,6 +38,17 @@ pytestmark = pytest.mark.skipif(
     not WECHAT_AVAILABLE,
     reason="WeChatEngine requires opencv-contrib (cv2.wechat_qrcode)",
 )
+
+
+@pytest.fixture
+def wechat_inprocess(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the patched ``WeChatQRCode`` in this process.
+
+    A spawned worker imports OpenCV fresh and never sees the monkeypatch.
+    These tests assert constructor arguments on that class, so they opt
+    out of the pool and run the same ``_wechat_invoke`` path in-process.
+    """
+    monkeypatch.setenv("ARBEZ_ISOLATION", "off")
 
 
 def test_wechat_decodes_qr(qr_image: PILImage, qr_payload: str) -> None:
@@ -82,8 +93,7 @@ def test_wechat_ignores_non_qr_symbologies(code128_image: PILImage) -> None:
     engine = WeChatEngine()
     detections = engine.detect_and_decode(code128_image)
     assert detections == (), (
-        "expected WeChat to find nothing in a Code 128 image, "
-        f"got {detections!r}"
+        f"expected WeChat to find nothing in a Code 128 image, got {detections!r}"
     )
 
 
@@ -126,8 +136,11 @@ def test_wechat_detects_multiple_qrs_largest_first(qr_payload: str) -> None:
     small = _qr("https://arbez.org/small", box_size=4)
     large = _qr("https://arbez.org/large", box_size=12)
 
-    canvas = Image.new("RGB", (large.size[0] + small.size[0] + 60, max(large.size[1], small.size[1]) + 40),
-                       color=(255, 255, 255))
+    canvas = Image.new(
+        "RGB",
+        (large.size[0] + small.size[0] + 60, max(large.size[1], small.size[1]) + 40),
+        color=(255, 255, 255),
+    )
     canvas.paste(large, (20, 20))
     canvas.paste(small, (large.size[0] + 40, 20))
 
@@ -138,13 +151,11 @@ def test_wechat_detects_multiple_qrs_largest_first(qr_payload: str) -> None:
     )
 
     # The largest-area Detection should be first (descending-area sort).
-    first_area = (
-        (detections[0].bbox_xyxy[2] - detections[0].bbox_xyxy[0])
-        * (detections[0].bbox_xyxy[3] - detections[0].bbox_xyxy[1])
+    first_area = (detections[0].bbox_xyxy[2] - detections[0].bbox_xyxy[0]) * (
+        detections[0].bbox_xyxy[3] - detections[0].bbox_xyxy[1]
     )
-    last_area = (
-        (detections[-1].bbox_xyxy[2] - detections[-1].bbox_xyxy[0])
-        * (detections[-1].bbox_xyxy[3] - detections[-1].bbox_xyxy[1])
+    last_area = (detections[-1].bbox_xyxy[2] - detections[-1].bbox_xyxy[0]) * (
+        detections[-1].bbox_xyxy[3] - detections[-1].bbox_xyxy[1]
     )
     assert first_area >= last_area
     assert detections[0].payload == "https://arbez.org/large"
@@ -175,11 +186,15 @@ def _box_blur(arr: npt.NDArray[np.uint8], radius: int) -> npt.NDArray[np.uint8]:
     padded = np.pad(arr, ((radius, radius), (radius, radius), (0, 0)), mode="edge")
     # cumsum promotes the uint32 pad; keep that result in one expression so
     # the name is not first inferred as uint32 and then reassigned.
-    integral = np.pad(
-        padded.astype(np.uint32),
-        ((1, 0), (1, 0), (0, 0)),
-        mode="constant",
-    ).cumsum(axis=0).cumsum(axis=1)
+    integral = (
+        np.pad(
+            padded.astype(np.uint32),
+            ((1, 0), (1, 0), (0, 0)),
+            mode="constant",
+        )
+        .cumsum(axis=0)
+        .cumsum(axis=1)
+    )
     height, width = arr.shape[:2]
     y = np.arange(height)[:, None]
     x = np.arange(width)[None, :]
@@ -203,6 +218,7 @@ def _hash_noise(height: int, width: int, amplitude: int) -> npt.NDArray[np.uint8
     return cast(npt.NDArray[np.uint8], np.stack([plane, plane, plane], axis=-1))
 
 
+@pytest.mark.usefixtures("wechat_inprocess")
 def test_wechat_constructor_receives_vendored_onnx_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     """The first constructor call is the two vendored paths, and they exist then."""
     import cv2
@@ -223,6 +239,7 @@ def test_wechat_constructor_receives_vendored_onnx_paths(monkeypatch: pytest.Mon
     assert Path(sr).name == "sr.onnx"
 
 
+@pytest.mark.usefixtures("wechat_inprocess")
 def test_failed_net_load_is_not_retried_without_the_nets(monkeypatch: pytest.MonkeyPatch) -> None:
     """A constructor error must not fall through to the no-argument detector."""
     import cv2
@@ -243,6 +260,7 @@ def test_failed_net_load_is_not_retried_without_the_nets(monkeypatch: pytest.Mon
     assert len(calls[0]) == 2
 
 
+@pytest.mark.usefixtures("wechat_inprocess")
 def test_empty_net_pass_falls_back_to_the_full_frame(
     monkeypatch: pytest.MonkeyPatch,
     blank_image: PILImage,
@@ -275,6 +293,7 @@ def test_empty_net_pass_falls_back_to_the_full_frame(
     assert engine._full_frame is None
 
 
+@pytest.mark.usefixtures("wechat_inprocess")
 def test_net_hit_does_not_also_run_the_full_frame(
     monkeypatch: pytest.MonkeyPatch,
     blank_image: PILImage,
@@ -297,6 +316,7 @@ def test_net_hit_does_not_also_run_the_full_frame(
     assert calls == [2]
 
 
+@pytest.mark.usefixtures("wechat_inprocess")
 def test_forward_error_is_not_turned_into_a_full_frame_decode(
     monkeypatch: pytest.MonkeyPatch,
     blank_image: PILImage,
@@ -377,3 +397,32 @@ def test_clean_tiny_qr_on_a_large_canvas_still_decodes() -> None:
 
     detections = WeChatEngine().detect_and_decode(Image.fromarray(canvas, "RGB"))
     assert [d.payload for d in detections] == [_RECALL_PAYLOAD]
+
+
+def test_scanner_wechat_runs_in_a_worker_with_the_ten_second_deadline(
+    blank_image: PILImage,
+) -> None:
+    """Scanner is maximum recall, so the WeChat worker's deadline is 10 s."""
+    engine = WeChatEngine()
+    try:
+        result = Scanner(engine=engine).scan(blank_image)
+        isolation = result.extras["isolation"]
+        assert isinstance(isolation, dict)
+        assert isolation["wechat"] == "process"
+        assert engine._pool is not None
+        assert engine._pool.isolation == "process"
+        assert engine._pool.last_deadline_s == 10.0
+    finally:
+        engine.close()
+
+
+def test_direct_wechat_call_uses_the_two_second_deadline(blank_image: PILImage) -> None:
+    """A direct detect uses the pool default. Scanner is the 10 s path."""
+    engine = WeChatEngine()
+    try:
+        assert engine.detect_and_decode(blank_image) == ()
+        assert engine._pool is not None
+        assert engine._pool.isolation == "process"
+        assert engine._pool.last_deadline_s == 2.0
+    finally:
+        engine.close()

@@ -208,8 +208,8 @@ class Detection:
 class Result:
     """Top-level scan result for a single input image.
 
-    Carries the list of detections plus the input dimensions (for client overlay code) and per-
-    engine timings (for debug + benchmarking).
+    Carries the list of detections plus the input dimensions (for client overlay code), per-
+    engine timings (for debug + benchmarking), and scan-level ``extras`` (S-097).
     """
 
     detections: tuple[Detection, ...]
@@ -261,6 +261,22 @@ class Result:
     benchmarking and per-stage latency monitoring.
     """
 
+    extras: Mapping[str, object] = field(default_factory=dict)
+    """Scan-level metadata that is not a detection (S-097).
+
+    Read-only post-construction, same wrap as ``timings_ms``. Keys are
+    omitted when they have nothing to say. Current keys:
+
+    * ``"isolation"`` — ``{engine_name: "process" | "inprocess"}``.
+      ``"process"`` means a spawned worker. ``"inprocess"`` means the
+      engine ran in the caller because a pool could not.
+    * ``"isolation_reason"`` — present only for an in-process fallback
+      (``ARBEZ_ISOLATION=off``, a daemonic caller, no ``/dev/shm`` on
+      Linux, or no ``__main__`` guard).
+    * ``"engine_faults"`` — tuple of ``{"engine", "kind", "detail"}``.
+      ``kind`` is ``"crash"`` or ``"timeout"``. The scan does not raise.
+    """
+
     def __post_init__(self) -> None:
         # S-016: frozen Result with mutable timings_ms was an
         # inconsistency. Same pattern as Detection.extras.
@@ -274,6 +290,9 @@ class Result:
                 {name: tuple(dets) for name, dets in self.per_engine.items()}
             )
             object.__setattr__(self, "per_engine", frozen_pe)
+        # S-097: same read-only contract as timings_ms. Shallow wrap.
+        if not isinstance(self.extras, MappingProxyType):
+            object.__setattr__(self, "extras", MappingProxyType(dict(self.extras)))
 
     def __len__(self) -> int:  # convenience: ``len(result)`` for # of detections
         return len(self.detections)

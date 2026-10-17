@@ -137,6 +137,35 @@ tripped the engine but isn't your bug. If the re-saved version also
 fails, please [file an issue](https://github.com/arbez-org/arbez-sdk-python/issues)
 with the image attached if possible.
 
+## The scan came back empty and the process stayed up
+
+WeChat and the libdmtx fallback used to be able to abort or hang the
+host. They now run in a worker. A native crash or a deadline kills
+that worker and the engine contributes no detection. Nothing is
+raised. Read `result.extras`:
+
+```python
+result.extras.get("engine_faults")
+# ({"engine": "wechat", "kind": "crash", "detail": "exit -10"},)
+
+result.extras.get("isolation")
+# {"wechat": "process"}
+```
+
+`kind` is `"crash"` or `"timeout"`. A direct
+`WeChatEngine.detect_and_decode` allows 2 seconds. `Scanner.scan`
+allows 10 seconds. A WeChat full-frame fallback can sit near 2
+seconds, so a direct call can come back empty on a frame that
+`Scanner` still reads. Scan with `Scanner` before treating the image
+as unreadable.
+
+`extras["isolation_reason"]` is set when the engine had to run in the
+calling process. That happens for `ARBEZ_ISOLATION=off`, a daemonic
+caller, Linux with no writable `/dev/shm`, or a program started
+without an `if __name__ == "__main__"` guard. In-process mode cannot
+cancel a native hang or catch a native crash. zxing-cpp is not in
+this worker yet; a hang there still blocks the caller.
+
 ## `cuda_is_available()` returns `False` but I have a GPU
 
 Walk this checklist:
