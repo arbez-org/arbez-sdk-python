@@ -272,7 +272,7 @@ The full output of one `Scanner.scan()` call. Immutable.
 | `image_size` | `(width, height)` int | Input image dimensions in pixels, after EXIF orientation. This is the frame detection coordinates use. |
 | `per_engine` | `Mapping[str, tuple[Detection, ...]]` | Each engine's **own raw detections** — what it independently saw, before the merge — keyed by engine name. Always populated for every engine that ran (on the single-engine path, the one engine's key). Use it to see which engine contributed what, independent of the consensus merge. Read-only `MappingProxyType` view. |
 | `timings_ms` | `dict[str, float]` | Per-stage wall-clock. Keys: `"coerce"` (every scan), `"engine"` (the single-engine path), `"consensus"` (the multi-engine path — bare `Scanner()` or `consensus=N`), `"engine.<name>"` (that engine's own `detect_and_decode` time). Read-only `MappingProxyType` view. |
-| `extras` | `Mapping[str, object]` | Scan-level metadata. `"stage_hit"` is a `tuple[str, ...]` of engine names that returned a decoded payload, in engine-set order, or `()` when nothing decoded. Read-only `MappingProxyType` view. |
+| `extras` | `Mapping[str, object]` | Scan-level metadata. `"stage_hit"` is a `tuple[str, ...]` of engine names that returned a non-empty payload, in engine-set order, or `()` when nothing decoded. `None` and `""` are not hits. Read-only `MappingProxyType` view. |
 
 `len(result)` returns `len(result.detections)`.
 
@@ -659,13 +659,20 @@ Accepted input types:
 Always returns RGB mode. No-op fast path: an RGB PIL image with no
 EXIF orientation (or orientation 1) passes through without a buffer
 copy. Any other orientation tag is applied first (orientations 2–8);
-the tag is then cleared so a second call does not rotate again.
+the tag is then cleared so a second call does not rotate again. An
+already-open TIFF is oriented from a private copy of its bytes:
+Pillow applies that tag inside `load()`, in place, and `Image.copy()`
+loads. A closed TIFF raises `InvalidInputError`.
 Images whose width × height exceeds 89,478,485 pixels (Pillow's
-default `Image.MAX_IMAGE_PIXELS`) raise `InvalidInputError` before
-the pixels are decoded. Pillow's own check only raises above twice
-that, and setting `Image.MAX_IMAGE_PIXELS = None` does not disable
-this one. Bad inputs wrap into `InvalidInputError`; the original
-error chains via `__cause__` when there is one.
+default `Image.MAX_IMAGE_PIXELS`, 256 MiB of 24-bit RGB) raise
+`InvalidInputError` before the pixels are decoded. WebP and ICO are
+judged from the container header before the plugin is constructed,
+because those plugins allocate or `load()` inside `Image.open`.
+Pillow's own check only raises above twice that, and setting
+`Image.MAX_IMAGE_PIXELS = None` does not disable this one. When
+Pillow's check does raise, the message quotes the limit Pillow used.
+Bad inputs wrap into `InvalidInputError`; the original error chains
+via `__cause__` when there is one.
 
 HEIC / AVIF support is opt-in via extras (`pillow-heif` /
 `pillow-avif-plugin`). The plugins are registered with Pillow on the

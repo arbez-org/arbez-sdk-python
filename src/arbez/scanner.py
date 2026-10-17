@@ -439,32 +439,19 @@ class _TimedEngine:
         self,
         image: (PILImage | npt.NDArray[Any] | str | Path | bytes | bytearray | IO[bytes]),
     ) -> tuple[Detection, ...]:
-        """Call the wrapped engine and store elapsed milliseconds."""
+        """Call the wrapped engine and store elapsed milliseconds.
+
+        A raised call records nothing. The vote treats that engine as
+        empty, and a single-engine scan never builds a Result, so a
+        time for a call that did not return would exist only when more
+        than one engine is configured.
+        """
         t0 = time.perf_counter()
-        try:
-            return self._inner.detect_and_decode(image)
-        finally:
-            elapsed_ms = (time.perf_counter() - t0) * 1_000.0
-            with self._lock:
-                self._sink[self._key] = elapsed_ms
-
-
-def _stage_hit(
-    per_engine: dict[str, tuple[Detection, ...]],
-    order: tuple[str, ...],
-) -> tuple[str, ...]:
-    """Engine names in ``order`` that returned a decoded payload.
-
-    The parallel vote records per-engine results in completion order,
-    which is not stable across runs. ``order`` is the Scanner's engine
-    set, which is.
-    """
-    hits: list[str] = []
-    for name in order:
-        detections = per_engine.get(name, ())
-        if any(detection.payload is not None for detection in detections):
-            hits.append(name)
-    return tuple(hits)
+        detections = self._inner.detect_and_decode(image)
+        elapsed_ms = (time.perf_counter() - t0) * 1_000.0
+        with self._lock:
+            self._sink[self._key] = elapsed_ms
+        return detections
 
 
 # ── Scanner ────────────────────────────────────────────────────────────────
@@ -878,10 +865,10 @@ class Scanner:
         # engine; the vote-path dispatches all engines in parallel and
         # votes on the merged result. Per-engine times are recorded by
         # ``_TimedEngine`` because the vote does not return them (S-101).
-        t0 = time.perf_counter()
         per_engine: dict[str, tuple[Detection, ...]]
         per_engine_ms: dict[str, float] = {}
         if self._is_consensus:
+            t0 = time.perf_counter()
             from arbez.consensus import run_consensus_detailed
 
             engines = self._get_consensus_engines()
@@ -910,7 +897,10 @@ class Scanner:
                 "consensus": (time.perf_counter() - t0) * 1_000.0,
             }
         else:
+            # Clock the decode only. The first ``_get_engine`` may
+            # construct the engine; that cost belongs to warmup.
             engine = self._get_engine()
+            t0 = time.perf_counter()
             detections = engine.detect_and_decode(pil_image)
             engine_ms = (time.perf_counter() - t0) * 1_000.0
             # Single-engine detections are already decoder-authoritative
@@ -936,8 +926,16 @@ class Scanner:
             if key in per_engine_ms:
                 timings[key] = per_engine_ms[key]
 
+        # Engine-set order, not the vote's completion order. An empty
+        # string is not a decode: WeChat and Apple Vision already drop
+        # those, and ``payload is not None`` would count them.
+        stage_hit = tuple(
+            name
+            for name in order
+            if any(detection.payload for detection in per_engine.get(name, ()))
+        )
         extras = diag.to_extras()
-        extras["stage_hit"] = _stage_hit(per_engine, order)
+        extras["stage_hit"] = stage_hit
         return Result(
             detections=detections,
             image_size=original_size,

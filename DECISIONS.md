@@ -20,8 +20,9 @@ coordinates were not the frame a viewer sees. Pillow does not apply
 that tag in `Image.open`.
 
 The same function trusted Pillow's decompression-bomb check.
-`Image.MAX_IMAGE_PIXELS` defaults to 89,478,485 (about a gigabyte of
-24-bit pixels). Pillow only warns above that and raises
+`Image.MAX_IMAGE_PIXELS` defaults to 89,478,485. That many 24-bit
+pixels is 256 MiB, a quarter gigabyte, not a gigabyte. Pillow only
+warns above that and raises
 `DecompressionBombError` above twice that, and any other library can
 set the global to `None` and turn the check off. A header that claims
 a huge size is enough; the pixels do not have to be present.
@@ -65,10 +66,11 @@ engine. S-022 left it in place.
   written.
 * `Result.extras` is a read-only mapping, same freezing rule as
   `timings_ms` (S-016). `extras["stage_hit"]` is the tuple of engine
-  names that returned at least one decoded payload, in the Scanner's
-  engine order. Completion order is not stable under the parallel
-  vote. The tuple is empty when nothing decoded. Today the entries
-  are engine names. The mapping is open for later stage names.
+  names that returned at least one non-empty payload, in the Scanner's
+  engine order. `None` and `""` are not hits. Completion order is not
+  stable under the parallel vote. The tuple is empty when nothing
+  decoded. Today the entries are engine names. The mapping is open
+  for later stage names.
 * `preprocess="auto"` emits `DeprecationWarning` and behaves as
   `"off"`. The literal stays in `PreprocessMode` until removal in
   0.4.0 so existing callers still type-check. The private downscale
@@ -113,6 +115,23 @@ engine. S-022 left it in place.
   checks that distinguish `"engine"` from `"consensus"` still hold.
 * `preprocess="auto"` no longer changes a bbox. Code that depended on
   the 2000 px downscale needs to resize before `scan`.
+* An already-open TIFF is oriented from a private reopen. Pillow
+  applies the tag inside `load()`, in place, and `Image.copy()`
+  loads, so the caller's image is not loaded. A closed TIFF raises
+  `InvalidInputError`: `getexif()` asserts on a null file pointer
+  (`AttributeError` under `-O`) while `mode` is still RGB.
+* WebP and ICO sizes are read from the container header before
+  `Image.open`. Those plugins allocate or `load()` inside `_open`,
+  and Pillow's check does nothing when `Image.MAX_IMAGE_PIXELS` is
+  `None`. The parser does not call `Image._decompression_bomb_check`.
+  JPEG, PNG, and PPM stay lazy and are still checked after open.
+* When Pillow's own bomb error fires (a stricter process global, at
+  twice that global), the wrapped `InvalidInputError` quotes that
+  limit. The inlined constant is quoted only when our check fired.
+* `stage_hit` ignores `None` and `""`. `"engine.<name>"` is recorded
+  only when `detect_and_decode` returns. The single-engine clock
+  starts after the engine object exists, so the first scan's lazy
+  construction is not part of that key.
 
 ---
 

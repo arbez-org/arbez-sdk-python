@@ -71,8 +71,11 @@ the explicit maintainer act of tagging is the gate.
   `InvalidInputError` and names the size and the limit. The check uses
   the container header, before the pixels are decoded, and it still
   applies when `Image.MAX_IMAGE_PIXELS` is `None`. Pillow itself only
-  raises above twice that limit. An oversize array shape is rejected
-  the same way.
+  raises above twice that limit. WebP and ICO are rejected from the
+  container header before those plugins allocate or `load()` inside
+  `Image.open`. An oversize array shape is rejected the same way.
+  When Pillow's own check raises, the error quotes that limit (twice
+  the process global), not this constant.
 
 ### Deprecated
 
@@ -116,18 +119,25 @@ the explicit maintainer act of tagging is the gate.
   transposes orientations 2–8 and clears the tag, so a second coerce
   does not rotate again. `Result.image_size` and detection coordinates
   are that oriented frame. A missing tag, or orientation 1, is
-  unchanged, including the no-copy path for an RGB PIL image.
+  unchanged, including the no-copy path for an RGB PIL image. An
+  already-open TIFF is oriented from a private copy of its bytes, so
+  the caller's image is not loaded. A closed TIFF raises
+  `InvalidInputError`.
 
 * **Per-stage and per-engine timings (S-101).** `Result.timings_ms`
   now includes `"coerce"` on every scan and `"engine.<name>"` for each
   engine that ran. `"engine"` (single-engine total) and `"consensus"`
   (multi-engine wall clock) are unchanged. On the parallel path each
   `"engine.<name>"` is that engine's own time, not a slice of
-  `"consensus"`.
+  `"consensus"`. The key is written only when `detect_and_decode`
+  returns. On the single-engine path the clock starts after the
+  engine object exists, so the first scan's lazy construction is not
+  included.
 
 * **`Result.extras["stage_hit"]` (S-101).** Tuple of engine names that
-  returned a decoded payload, in engine-set order, or `()` when
-  nothing decoded. `extras` is read-only, same as `timings_ms`.
+  returned a non-empty payload, in engine-set order, or `()` when
+  nothing decoded. `None` and `""` are not hits. `extras` is
+  read-only, same as `timings_ms`.
 
 * **WeChatEngine loads the vendored WeChat QR nets (S-096).**
   `detect.onnx` and `sr.onnx` ship in the package and are passed to

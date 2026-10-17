@@ -11,9 +11,12 @@ HEIC / AVIF via optional extras); existing accepted types stay accepted.
 
 from __future__ import annotations
 
+import contextlib
 import functools
+import io
 import logging
-import warnings
+import math
+import re
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
@@ -25,12 +28,17 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-# Pillow's ``Image.MAX_IMAGE_PIXELS`` default: about a gigabyte of
-# 24-bit pixels. Inlined on purpose (S-101). Writing ``None`` to that
-# global turns Pillow's check off, and Pillow only *raises* above
-# twice this value (it warns above the value itself). The guard below
-# raises above this value, on the header, before pixels are decoded.
+# Pillow's ``Image.MAX_IMAGE_PIXELS`` default. 89,478,485 pixels of
+# 24-bit RGB is 256 MiB, a quarter gigabyte. Inlined on purpose
+# (S-101): writing ``None`` to that global turns Pillow's check off,
+# and Pillow only *raises* above twice this value (it warns above the
+# value itself). The guard below raises above this value.
 MAX_IMAGE_PIXELS: int = 1024 * 1024 * 1024 // 4 // 3
+
+# Pillow's bomb error says "exceeds limit of N pixels". N is the
+# threshold that actually fired (twice the process global), which is
+# not always this module's constant.
+_PILLOW_BOMB_LIMIT = re.compile(r"limit of (\d+) pixels")
 
 # TIFF/EXIF Orientation. Not ``PIL.ExifTags.Base``: the tag number is
 # the stable contract, and the enum is only a convenience.
@@ -200,6 +208,20 @@ def _reject_zero_dims(image: PILImage) -> PILImage:
     return image
 
 
+def _fired_bomb_limit(exc: BaseException) -> str:
+    """Return the pixel limit named by Pillow's bomb error.
+
+    Our own check quotes :data:`MAX_IMAGE_PIXELS`. Pillow's
+    ``DecompressionBombError`` fires at twice the process-global
+    setting, which a caller can set lower. The wrapper has to cite
+    the limit that raised, not the inlined constant.
+    """
+    match = _PILLOW_BOMB_LIMIT.search(str(exc))
+    if match is not None:
+        return match.group(1)
+    return str(MAX_IMAGE_PIXELS)
+
+
 def _reject_too_many_pixels(width: int, height: int, *, where: str) -> None:
     """Raise when ``width * height`` is over the decompression-bomb limit.
 
@@ -233,15 +255,161 @@ def _reject_array_too_many_pixels(image: object) -> None:
     _reject_too_many_pixels(width, height, where=f"{type(image).__name__} array")
 
 
-def _apply_exif_orientation(image: PILImage) -> PILImage:
-    """Return ``image`` transposed to its EXIF display orientation.
+def _image_is_closed(image: PILImage) -> bool:
+    """True when ``close()`` has replaced the core with Pillow's deferred error.
 
-    No copy when the orientation tag is missing or 1, and the caller's
-    image is not mutated. Orientations 2 through 8 are the ones Pillow
-    knows how to apply. A tag that cannot be read is left as stored:
-    rejecting the scan would drop photos whose pixels still decode.
+    ``mode`` stays RGB after ``close()``, so a mode check cannot tell a
+    dead image from a live one.
+    """
+    return type(getattr(image, "_im", None)).__name__ == "DeferredError"
+
+
+def _peek_source(source: Any, offset: int, n: int) -> bytes | None:
+    """Read ``n`` bytes at ``offset`` and leave a stream where it was.
+
+    ``None`` means the source could not be peeked. Callers then let
+    ``Image.open`` try, which still runs the post-open pixel check for
+    formats that do not allocate inside ``_open``.
+    """
+    if isinstance(source, (bytes, bytearray)):
+        if offset < 0:
+            return None
+        return bytes(source[offset : offset + n])
+    if isinstance(source, (str, Path)):
+        try:
+            with open(source, "rb") as handle:
+                handle.seek(offset)
+                return handle.read(n)
+        except OSError:
+            return None
+    read = getattr(source, "read", None)
+    seek = getattr(source, "seek", None)
+    tell = getattr(source, "tell", None)
+    if not (callable(read) and callable(seek) and callable(tell)):
+        return None
+    try:
+        pos = tell()
+    except (OSError, AttributeError):
+        return None
+    data: bytes | None
+    try:
+        seek(offset)
+        chunk = read(n)
+        data = bytes(chunk) if isinstance(chunk, (bytes, bytearray)) else None
+    except (OSError, AttributeError, TypeError):
+        data = None
+    finally:
+        with contextlib.suppress(OSError, AttributeError):
+            seek(pos)
+    return data
+
+
+def _webp_canvas_size(header: bytes) -> tuple[int, int] | None:
+    """Canvas size from a WebP header, or ``None`` if it is not WebP.
+
+    Same offsets Pillow reads before constructing ``WebPAnimDecoder``.
+    The decoder allocates that canvas inside ``_open``.
+    """
+    if len(header) < 30 or not header.startswith(b"RIFF") or header[8:12] != b"WEBP":
+        return None
+    chunk = header[12:16]
+    if chunk == b"VP8 " and header[23:26] == b"\x9d\x01\x2a":
+        width = int.from_bytes(header[26:28], "little") & 0x3FFF
+        height = int.from_bytes(header[28:30], "little") & 0x3FFF
+        return width, height
+    if chunk == b"VP8X":
+        width = int.from_bytes(header[24:27], "little") + 1
+        height = int.from_bytes(header[27:30], "little") + 1
+        return width, height
+    if chunk == b"VP8L" and header[20] == 0x2F:
+        bits = int.from_bytes(header[21:25], "little")
+        return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+    return None
+
+
+def _ico_frame_size(source: Any) -> tuple[int, int] | None:
+    """Pixel size of the frame Pillow would ``load()`` from an ICO.
+
+    The directory entry is at most 256 px. The embedded PNG or DIB
+    header is the size ``IcoImageFile._open`` decodes, and that
+    ``load()`` runs before ``Image.open`` returns.
+    """
+    header = _peek_source(source, 0, 6)
+    if header is None or len(header) < 6 or header[:4] != b"\x00\x00\x01\x00":
+        return None
+    count = int.from_bytes(header[4:6], "little")
+    if count < 1:
+        return None
+    directory = _peek_source(source, 6, count * 16)
+    if directory is None or len(directory) < 16:
+        return None
+    # Pillow sorts by color depth, then by area descending (stable),
+    # and loads entry 0. A different entry is not decoded.
+    entries: list[tuple[int, int, int]] = []
+    for start in range(0, len(directory) - 15, 16):
+        entry = directory[start : start + 16]
+        width = entry[0] or 256
+        height = entry[1] or 256
+        nb_color = entry[2]
+        bpp = int.from_bytes(entry[6:8], "little")
+        color_depth = bpp or (nb_color != 0 and math.ceil(math.log(nb_color, 2))) or 256
+        offset = int.from_bytes(entry[12:16], "little")
+        entries.append((width * height, int(color_depth), offset))
+    entries.sort(key=lambda item: item[1])
+    entries.sort(key=lambda item: item[0], reverse=True)
+    frame = _peek_source(source, entries[0][2], 24)
+    if frame is None or len(frame) < 8:
+        return None
+    if frame[:8] == b"\x89PNG\r\n\x1a\n" and len(frame) >= 24 and frame[12:16] == b"IHDR":
+        return (
+            int.from_bytes(frame[16:20], "big"),
+            int.from_bytes(frame[20:24], "big"),
+        )
+    header_size = int.from_bytes(frame[:4], "little")
+    if header_size == 12 and len(frame) >= 8:
+        return (
+            int.from_bytes(frame[4:6], "little"),
+            int.from_bytes(frame[6:8], "little"),
+        )
+    if header_size in (40, 52, 56, 64, 108, 124) and len(frame) >= 12:
+        width = int.from_bytes(frame[4:8], "little")
+        raw_height = int.from_bytes(frame[8:12], "little")
+        # Top-down DIB stores height as a negative int32. Pillow then
+        # uses ``2**32 - raw``.
+        height = (1 << 32) - raw_height if raw_height >> 24 == 0xFF else raw_height
+        return width, height
+    return None
+
+
+def _reject_allocating_container(source: Any, *, where: str) -> None:
+    """Reject WebP and ICO from header sizes before ``Image.open``.
+
+    Those plugins allocate or ``load()`` inside ``_open``. Pillow's
+    check raises only above twice ``Image.MAX_IMAGE_PIXELS``, and
+    does nothing when that global is ``None``. A header this parser
+    cannot read falls through; JPEG, PNG, and PPM are still checked
+    after ``Image.open`` returns.
+    """
+    head = _peek_source(source, 0, 30)
+    if not head:
+        return
+    if head.startswith(b"RIFF") and len(head) >= 12 and head[8:12] == b"WEBP":
+        size = _webp_canvas_size(head)
+        if size is not None:
+            _reject_too_many_pixels(size[0], size[1], where=where)
+        return
+    if head[:4] == b"\x00\x00\x01\x00":
+        size = _ico_frame_size(source)
+        if size is not None:
+            _reject_too_many_pixels(size[0], size[1], where=where)
+
+
+def _transpose_exif(image: PILImage) -> PILImage:
+    """Apply orientations 2-8. Missing or unreadable tags stay as stored.
+
     ``ImageOps.exif_transpose`` clears the tag, so a second call does
-    not rotate again.
+    not rotate again. This loads ``image``. TIFF callers that do not
+    own the object must not use it: the TIFF loader transposes in place.
     """
     from PIL import ImageOps
 
@@ -249,6 +417,14 @@ def _apply_exif_orientation(image: PILImage) -> PILImage:
         raw = image.getexif().get(_EXIF_ORIENTATION_TAG, 1)
         orientation = 1 if raw is None else int(raw)
     except (OSError, ValueError, TypeError, KeyError):
+        _log.debug("exif orientation unreadable; leaving pixels as stored", exc_info=True)
+        return image
+    except (AssertionError, AttributeError) as e:
+        # Closed TIFF: ``getexif`` asserts ``fp`` (AttributeError
+        # under -O). ``mode`` is still RGB, so a missing-tag return
+        # would hand the engine a dead image.
+        if _image_is_closed(image):
+            raise InvalidInputError("PIL image is closed and cannot be decoded") from e
         _log.debug("exif orientation unreadable; leaving pixels as stored", exc_info=True)
         return image
     if orientation not in range(2, 9):
@@ -263,23 +439,107 @@ def _apply_exif_orientation(image: PILImage) -> PILImage:
     return transposed
 
 
+def _tiff_orientation(image: PILImage) -> int:
+    """Root IFD orientation, without ``load()`` or ``getexif()``.
+
+    ``getexif`` on a TIFF seeks the caller's file pointer. The root
+    tag is already in ``tag_v2`` from ``_open``, which is the value
+    Pillow's own setup uses.
+    """
+    tag_v2 = getattr(image, "tag_v2", None)
+    if tag_v2 is None:
+        return 1
+    raw = tag_v2.get(_EXIF_ORIENTATION_TAG, 1)
+    try:
+        return 1 if raw is None else int(raw)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _reopen_unloaded(image: PILImage) -> PILImage | None:
+    """A new loader for ``image``'s bytes, or ``None`` if they can't be reread.
+
+    Does not ``load()`` the object the caller passed. The file position
+    is restored when the bytes come from its stream.
+    """
+    from PIL import Image as _Image
+
+    filename = getattr(image, "filename", "") or ""
+    if isinstance(filename, (str, Path)) and filename:
+        try:
+            return _Image.open(filename, formats=_supported_input_formats())
+        except (OSError, ValueError):
+            return None
+    fp = getattr(image, "fp", None)
+    seek = getattr(fp, "seek", None)
+    read = getattr(fp, "read", None)
+    tell = getattr(fp, "tell", None)
+    if fp is None or not (callable(seek) and callable(read) and callable(tell)):
+        return None
+    try:
+        pos = tell()
+        seek(0)
+        try:
+            data = read()
+        finally:
+            seek(pos)
+    except (OSError, AttributeError, TypeError):
+        return None
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        return None
+    try:
+        return _Image.open(io.BytesIO(bytes(data)), formats=_supported_input_formats())
+    except (OSError, ValueError):
+        return None
+
+
+def _apply_exif_orientation(image: PILImage, *, owned: bool = False) -> PILImage:
+    """Return ``image`` transposed to its EXIF display orientation.
+
+    No copy when the orientation tag is missing or 1. Orientations 2
+    through 8 are the ones Pillow knows how to apply. A tag that cannot
+    be read is left as stored: rejecting the scan would drop photos
+    whose pixels still decode.
+
+    ``owned`` is for an image this function just opened. Pillow's TIFF
+    loader applies orientation inside ``load()``, in place, and
+    ``Image.copy()`` loads, so an image the caller still holds is
+    reopened instead of loaded.
+    """
+    if owned or getattr(image, "format", None) != "TIFF":
+        return _transpose_exif(image)
+    if _image_is_closed(image):
+        raise InvalidInputError("PIL image is closed and cannot be decoded")
+    if _tiff_orientation(image) not in range(2, 9):
+        return image
+    private = _reopen_unloaded(image)
+    if private is None:
+        _log.debug("tiff orientation left as stored; image bytes could not be reread")
+        return image
+    # ``private`` is ours. Transpose may load it in place; the caller
+    # never sees that object.
+    return _transpose_exif(private)
+
+
 def _open_rgb(source: Any, *, where: str) -> PILImage:
     """Decode ``source`` to RGB, applying the pixel limit and EXIF first.
 
-    Pillow warns (and does not raise) for sizes between
-    ``MAX_IMAGE_PIXELS`` and twice that. That warning is swallowed
-    here because this function raises ``InvalidInputError`` for the
-    same images, before ``convert`` allocates the pixel buffer.
+    WebP and ICO are limited from the header before ``Image.open``,
+    because those plugins allocate or ``load()`` inside ``_open``.
+    Pillow warns (and does not raise) for other formats between
+    ``MAX_IMAGE_PIXELS`` and twice that; the post-open check raises
+    for the same images. The warning filter is not touched: it is
+    process-global, and a scan is allowed to run on two threads.
     ``convert`` runs inside the ``with`` so a lazy image is loaded
     before the file handle closes.
     """
     from PIL import Image as _Image
 
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=_Image.DecompressionBombWarning)
-        with _Image.open(source, formats=_supported_input_formats()) as src:
-            _reject_too_many_pixels(src.width, src.height, where=where)
-            return _apply_exif_orientation(src).convert("RGB")
+    _reject_allocating_container(source, where=where)
+    with _Image.open(source, formats=_supported_input_formats()) as src:
+        _reject_too_many_pixels(src.width, src.height, where=where)
+        # ``src`` is a private open. TIFF may transpose it in place.
+        return _apply_exif_orientation(src, owned=True).convert("RGB")
 
 
 def coerce_to_pil(
@@ -331,7 +591,15 @@ def coerce_to_pil(
     an already-open PIL image. The result is the display orientation.
     ``Result.image_size`` and detection coordinates use that frame.
     A missing tag, or orientation 1, does not copy. The tag is cleared
-    so a second ``coerce_to_pil`` does not rotate again.
+    so a second ``coerce_to_pil`` does not rotate again. An already-open
+    TIFF is oriented from a private reopen: Pillow applies the tag
+    inside ``load()``, in place. A closed TIFF raises
+    ``InvalidInputError`` (``mode`` is still RGB after ``close()``).
+
+    WebP and ICO sizes are read from the container header before the
+    plugin is constructed. Those plugins allocate or ``load()`` inside
+    ``Image.open``, and Pillow's own check does not run when
+    ``Image.MAX_IMAGE_PIXELS`` is ``None``.
 
     Branch order: PIL duck-type FIRST because the common case is
     "Scanner already coerced; engine re-coerces defensively". Hot path
@@ -369,6 +637,17 @@ def coerce_to_pil(
         try:
             oriented = _apply_exif_orientation(image)
             coerced = oriented if oriented.mode == "RGB" else oriented.convert("RGB")
+        except InvalidInputError:
+            raise
+        except _Image.DecompressionBombError as e:
+            # TIFF ``load_prepare`` raises this from the process-global
+            # limit, which can be stricter than the inlined constant.
+            # The bytes path wraps the same error; this branch has to
+            # as well, and it has to name the limit that fired.
+            raise InvalidInputError(
+                "PIL image exceeds the decompression-bomb limit of "
+                f"{_fired_bomb_limit(e)} pixels: {e}"
+            ) from e
         except (ValueError, OSError) as e:
             # Defensive: a PIL image that fails mode access / convert()
             # — e.g. a closed file handle, a torn-down lazy image —
@@ -402,7 +681,7 @@ def coerce_to_pil(
             # are rejected in ``_open_rgb`` before this clause.
             raise InvalidInputError(
                 f"Image at {str(image)!r} exceeds the decompression-bomb "
-                f"limit of {MAX_IMAGE_PIXELS} pixels: {e}"
+                f"limit of {_fired_bomb_limit(e)} pixels: {e}"
             ) from e
         except (UnidentifiedImageError, OSError) as e:
             # PIL can't decode the file — corrupt, wrong format, zero
@@ -432,7 +711,7 @@ def coerce_to_pil(
             raise InvalidInputError(
                 f"Cannot decode {len(image)}-byte buffer as an image: "
                 f"exceeds the decompression-bomb limit of "
-                f"{MAX_IMAGE_PIXELS} pixels: {e}"
+                f"{_fired_bomb_limit(e)} pixels: {e}"
             ) from e
         except (UnidentifiedImageError, OSError, ValueError) as e:
             raise InvalidInputError(
@@ -464,7 +743,7 @@ def coerce_to_pil(
             raise InvalidInputError(
                 f"Cannot decode file-like ({type(image).__name__}) as an image: "
                 f"exceeds the decompression-bomb limit of "
-                f"{MAX_IMAGE_PIXELS} pixels: {e}"
+                f"{_fired_bomb_limit(e)} pixels: {e}"
             ) from e
         except (UnidentifiedImageError, OSError, ValueError) as e:
             raise InvalidInputError(

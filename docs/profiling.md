@@ -150,7 +150,7 @@ print(result.timings_ms)
 # Scanner(engine="zxing"):
 # {'coerce': 3.1, 'engine': 12.0, 'engine.zxing': 12.0}
 print(result.extras["stage_hit"])
-# ('arbez', 'zxing')  # engines that returned a decoded payload, in engine-set order
+# ('arbez', 'zxing')  # engines that returned a non-empty payload, in engine-set order
 ```
 
 `"coerce"` is input load (decode, EXIF orientation, the pixel-limit

@@ -401,24 +401,32 @@ def _reference_oriented(raw: bytes) -> PILImage:
         return transposed.convert("RGB")
 
 
-@pytest.mark.parametrize("orientation", [2, 3, 6, 8])
+@pytest.mark.parametrize("orientation", [1, 2, 3, 4, 5, 6, 7, 8])
 def test_coerce_to_pil_applies_exif_orientation(orientation: int) -> None:
     """Stored pixels are transposed to the EXIF display orientation.
 
-    Orientation 6 and 8 swap the axes. 2 and 3 keep the size and change
-    pixels. A second coerce must not rotate again.
+    Orientation 1 matches the stored image. 5, 6, 7, and 8 swap the
+    axes. 2, 3, and 4 keep the size and change pixels. A second coerce
+    must not rotate again.
     """
     raw = _png_with_orientation(orientation)
     with Image.open(io.BytesIO(raw)) as src:
         assert src.getexif().get(_EXIF_ORIENTATION) == orientation
+        src.load()
         stored_size = src.size
+        stored_bytes = src.tobytes()
     out = coerce_to_pil(raw)
-    ref = _reference_oriented(raw)
     assert out.mode == "RGB"
-    assert out.size == ref.size
-    assert out.tobytes() == ref.tobytes()
-    if orientation in (6, 8):
-        assert out.size != stored_size
+    if orientation == 1:
+        assert out.size == stored_size
+        assert out.tobytes() == stored_bytes
+    else:
+        ref = _reference_oriented(raw)
+        assert out.size == ref.size
+        assert out.tobytes() == ref.tobytes()
+        assert out.tobytes() != stored_bytes
+        if orientation in (5, 6, 7, 8):
+            assert out.size != stored_size
     again = coerce_to_pil(out)
     assert again is out
 
@@ -450,6 +458,62 @@ def test_coerce_to_pil_applies_exif_on_open_pil_without_mutating_it() -> None:
         assert src.size == (40, 20)
     assert out.size == (20, 40)
     assert out is not src
+
+
+def _tiff_with_orientation(
+    orientation: int, size: tuple[int, int] = (40, 20)
+) -> bytes:
+    """Asymmetric TIFF. Pixels stay as drawn; the tag asks to display them."""
+    img = Image.new("RGB", size, "white")
+    img.putpixel((0, 0), (255, 0, 0))
+    img.putpixel((size[0] - 1, 0), (0, 255, 0))
+    img.putpixel((0, size[1] - 1), (0, 0, 255))
+    exif = img.getexif()
+    exif[_EXIF_ORIENTATION] = orientation
+    buf = io.BytesIO()
+    img.save(buf, format="TIFF", exif=exif)
+    return buf.getvalue()
+
+
+def test_coerce_to_pil_does_not_load_callers_tiff() -> None:
+    """An unloaded TIFF keeps its tag and is not loaded.
+
+    Pillow applies orientation inside TIFF ``load()``, in place, and
+    ``Image.copy()`` loads. The caller's core staying unloaded is what
+    shows the stored pixels were not rewritten. The returned image is
+    still the oriented frame.
+    """
+    from PIL.TiffImagePlugin import TiffImageFile
+
+    raw = _tiff_with_orientation(6)
+    src = Image.open(io.BytesIO(raw))
+    assert isinstance(src, TiffImageFile)
+    try:
+        assert src.tag_v2.get(_EXIF_ORIENTATION) == 6
+        assert getattr(src, "_im", None) is None
+        stored_size = src.size
+        out = coerce_to_pil(src)
+        assert src.tag_v2.get(_EXIF_ORIENTATION) == 6
+        assert getattr(src, "_im", None) is None
+        assert src.size == stored_size
+    finally:
+        src.close()
+    ref = _reference_oriented(raw)
+    assert out.size == ref.size
+    assert out.tobytes() == ref.tobytes()
+    assert out is not src
+
+
+def test_coerce_to_pil_rejects_closed_tiff() -> None:
+    """A closed TIFF is not returned as a live RGB image.
+
+    ``getexif`` on it raises, and ``mode`` is still RGB, so treating
+    the error as a missing tag would hand the engine a dead image.
+    """
+    src = Image.open(io.BytesIO(_tiff_with_orientation(6)))
+    src.close()
+    with pytest.raises(InvalidInputError, match="closed"):
+        coerce_to_pil(src)
 
 
 def test_scanner_scan_reports_exif_oriented_size_and_decodes(qr_payload: str) -> None:
@@ -539,6 +603,100 @@ def test_coerce_to_pil_wraps_pillow_decompression_bomb(
     cause = exc_info.value.__cause__
     assert cause is not None
     assert type(cause).__name__ == "DecompressionBombError"
+
+
+def _webp_vp8x(width: int, height: int) -> bytes:
+    """VP8X header only. The canvas size is what the decoder allocates.
+
+    Width and height sit at bytes 24 and 27, after a 3-byte reserved
+    field. Pillow will not read the size from a shorter prefix.
+    """
+    payload = (
+        bytes([0, 0, 0, 0])
+        + (width - 1).to_bytes(3, "little")
+        + (height - 1).to_bytes(3, "little")
+    )
+    chunk = b"VP8X" + len(payload).to_bytes(4, "little") + payload
+    body = b"WEBP" + chunk
+    return b"RIFF" + len(body).to_bytes(4, "little") + body
+
+
+def _ico_with_png_ihdr(width: int, height: int) -> bytes:
+    """ICO directory says 16x16. The embedded PNG header says otherwise.
+
+    ``IcoImageFile._open`` decodes that PNG before ``Image.open`` returns.
+    The directory entry alone cannot see this size.
+    """
+    ihdr = (
+        width.to_bytes(4, "big")
+        + height.to_bytes(4, "big")
+        + bytes([8, 2, 0, 0, 0])
+    )
+    png = b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IHDR" + ihdr + b"\x00\x00\x00\x00"
+    entry = bytes([16, 16, 0, 0]) + (1).to_bytes(2, "little")
+    entry += (32).to_bytes(2, "little") + len(png).to_bytes(4, "little")
+    entry += (22).to_bytes(4, "little")
+    return b"\x00\x00\x01\x00" + (1).to_bytes(2, "little") + entry + png
+
+
+def test_coerce_to_pil_rejects_webp_and_ico_headers_before_open() -> None:
+    """WebP and ICO bombs are rejected from the header.
+
+    Pillow allocates a WebP canvas and fully decodes an ICO inside
+    ``Image.open``. Setting ``Image.MAX_IMAGE_PIXELS`` to ``None``
+    turns Pillow's own check off; the inlined limit still applies.
+    """
+    from arbez.engines.helpers import MAX_IMAGE_PIXELS
+
+    previous = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        for raw in (
+            _webp_vp8x(10_000, 10_000),
+            _ico_with_png_ihdr(10_000, 10_000),
+        ):
+            with pytest.raises(InvalidInputError, match="decompression-bomb limit of") as exc_info:
+                coerce_to_pil(raw)
+            message = str(exc_info.value)
+            assert "10000x10000" in message
+            assert str(MAX_IMAGE_PIXELS) in message
+            assert exc_info.value.__cause__ is None
+    finally:
+        Image.MAX_IMAGE_PIXELS = previous
+
+
+def test_coerce_to_pil_quotes_stricter_pillow_bomb_limit() -> None:
+    """When Pillow's global fires, the error names that limit.
+
+    The inlined constant stays 89,478,485. A lower process global
+    raises first, at twice that global, and the wrapper must not
+    claim the inlined constant was what fired.
+    """
+    from arbez.engines.helpers import MAX_IMAGE_PIXELS
+
+    # Open while the global is still the default. A stricter global
+    # makes Pillow raise inside Image.open, before the test can hold
+    # the image the PIL branch is supposed to wrap.
+    src = Image.open(io.BytesIO(_tiff_with_orientation(6, size=(64, 48))))
+    previous = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = 1000
+    try:
+        raw = _ppm(1, 3000)
+        with pytest.raises(InvalidInputError, match="limit of 2000") as exc_info:
+            coerce_to_pil(raw)
+        message = str(exc_info.value)
+        assert str(MAX_IMAGE_PIXELS) not in message
+        assert type(exc_info.value.__cause__).__name__ == "DecompressionBombError"
+
+        with pytest.raises(InvalidInputError, match="limit of 2000") as pil_exc:
+            coerce_to_pil(src)
+        assert str(MAX_IMAGE_PIXELS) not in str(pil_exc.value)
+        cause = pil_exc.value.__cause__
+        assert cause is not None
+        assert type(cause).__name__ == "DecompressionBombError"
+    finally:
+        Image.MAX_IMAGE_PIXELS = previous
+        src.close()
 
 
 def test_coerce_to_pil_rejects_oversize_array_shape() -> None:

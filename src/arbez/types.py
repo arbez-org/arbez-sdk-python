@@ -216,7 +216,11 @@ class Result:
     """All accepted detections, in descending score order."""
 
     image_size: tuple[int, int]
-    """Input image (width, height) in pixels."""
+    """Input image (width, height) in pixels, after EXIF orientation.
+
+    This is the frame detection coordinates use. A missing orientation
+    tag, or orientation 1, leaves the stored size unchanged.
+    """
 
     per_engine: Mapping[str, tuple[Detection, ...]] = field(default_factory=dict)
     """Each engine's own raw detections, keyed by engine name (S-093).
@@ -274,10 +278,10 @@ class Result:
     when they have nothing to say.
 
     * ``"stage_hit"`` — ``tuple[str, ...]`` of engine names that
-      returned at least one decoded payload, in the Scanner's engine
-      order (not thread-completion order). ``()`` when nothing decoded.
-      Today the entries are engine names. Later stages may append
-      other stage names to the same tuple.
+      returned at least one non-empty payload, in the Scanner's engine
+      order (not thread-completion order). ``None`` and ``""`` are not
+      hits. ``()`` when nothing decoded. Today the entries are engine
+      names. Later stages may append other stage names to the same tuple.
     * ``"isolation"`` — ``{engine_name: "process" | "inprocess"}``.
       ``"process"`` means a spawned worker. ``"inprocess"`` means the
       engine ran in the caller because a pool could not.

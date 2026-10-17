@@ -7,7 +7,8 @@ Covers:
    behaves as ``"off"``: no downscale, no ``"preprocess"`` timing.
 3. Invalid mode strings raise ``ValueError`` with a friendly message.
 4. ``Result.timings_ms`` records coerce plus per-engine time, and
-   ``Result.extras["stage_hit"]`` names the engines that decoded a payload.
+   ``Result.extras["stage_hit"]`` names the engines that returned a
+   non-empty payload. ``None`` and ``""`` are not hits.
 
 ``_auto_preprocess`` / ``_rescale_detection`` stay until the parameter
 is removed. ``scan()`` no longer calls them.
@@ -286,10 +287,94 @@ def test_consensus_timings_are_per_engine_and_stage_hit_follows_engine_order(
     expected = tuple(
         name
         for name in scanner.engines
-        if any(d.payload is not None for d in result.per_engine[name])
+        if any(d.payload for d in result.per_engine[name])
     )
     assert result.extras["stage_hit"] == expected
     assert "zxing" in result.extras["stage_hit"]
+
+
+def test_stage_hit_counts_only_the_engine_with_a_payload() -> None:
+    """One engine decoded. The other returned a detection and no payload.
+
+    The expected tuple is the decoding engine, not a filter reapplied
+    to ``per_engine``. An empty string is not a hit.
+    """
+
+    class _Hit:
+        name = "zxing"
+
+        def detect_and_decode(self, image: object) -> tuple[Detection, ...]:
+            return (
+                Detection(
+                    bbox_xyxy=(0.0, 0.0, 4.0, 4.0),
+                    symbology=Symbology.QR,
+                    score=0.9,
+                    payload="ok",
+                    engine="zxing",
+                ),
+            )
+
+    class _Miss:
+        name = "arbez"
+
+        def detect_and_decode(self, image: object) -> tuple[Detection, ...]:
+            return (
+                Detection(
+                    bbox_xyxy=(1.0, 1.0, 3.0, 3.0),
+                    symbology=Symbology.QR,
+                    score=0.4,
+                    payload="",
+                    engine="arbez",
+                ),
+                Detection(
+                    bbox_xyxy=(5.0, 5.0, 6.0, 6.0),
+                    symbology=Symbology.QR,
+                    score=0.2,
+                    payload=None,
+                    engine="arbez",
+                ),
+            )
+
+    scanner = Scanner(engines=("zxing", "arbez"))
+    scanner._consensus_engines = {"zxing": _Hit(), "arbez": _Miss()}
+    result = scanner.scan(Image.new("RGB", (8, 8), "white"))
+    assert result.extras["stage_hit"] == ("zxing",)
+
+
+def test_failed_engine_does_not_record_a_timing() -> None:
+    """``engine.<name>`` is written only when ``detect_and_decode`` returns.
+
+    The vote treats a raised engine as empty. That must not leave a
+    timing the single-engine path cannot record, because a single-engine
+    failure never builds a Result.
+    """
+
+    class _Hit:
+        name = "zxing"
+
+        def detect_and_decode(self, image: object) -> tuple[Detection, ...]:
+            return (
+                Detection(
+                    bbox_xyxy=(0.0, 0.0, 2.0, 2.0),
+                    symbology=Symbology.QR,
+                    score=1.0,
+                    payload="ok",
+                    engine="zxing",
+                ),
+            )
+
+    class _Boom:
+        name = "arbez"
+
+        def detect_and_decode(self, image: object) -> tuple[Detection, ...]:
+            raise RuntimeError("engine failed")
+
+    scanner = Scanner(engines=("zxing", "arbez"))
+    scanner._consensus_engines = {"zxing": _Hit(), "arbez": _Boom()}
+    result = scanner.scan(Image.new("RGB", (8, 8), "white"))
+    assert "engine.zxing" in result.timings_ms
+    assert "engine.arbez" not in result.timings_ms
+    assert result.extras["stage_hit"] == ("zxing",)
 
 
 def test_result_extras_defensive_copy() -> None:
