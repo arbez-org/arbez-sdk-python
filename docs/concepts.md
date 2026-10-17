@@ -128,12 +128,14 @@ Result(
 `len(result)` works — it's the number of detections.
 
 `timings_ms` carries per-stage wall-clock. Keys you may see:
-`"engine"` (the engine's `detect_and_decode` time, single-engine
-path), `"consensus"` (the full parallel-merge wall-clock on the
-multi-engine path — bare `Scanner()` or any `consensus=N`), and
-`"preprocess"` when `preprocess="auto"` kicks in. Useful for
-benchmarking, debugging slow scans, and latency monitoring in
-production.
+`"coerce"` (every scan), `"engine"` (single-engine path),
+`"consensus"` (multi-engine path — bare `Scanner()` or any
+`consensus=N`), `"engine.<name>"` (that engine's own time), and
+`"ladder.<rung>"` when a whole-frame ZXing miss was recovered by
+`clahe`, `up`, `gh`, or `adclose`. Only the winning rung is recorded.
+`preprocess="auto"` does not add a key. `extras["stage_hit"]` lists
+the engines that returned a payload, in engine-set order, and appends
+that same rung name when the hit was not the base read.
 
 `image_size` exists so client overlay code doesn't need to re-open
 the source image just to know its dimensions — handy when scaling
@@ -180,6 +182,13 @@ on an `ArbezEngine` crop stops the remaining pad and full-image
 stages for that detection. A read with no code still escalates.
 Whole-frame RGB is sent as BGR, because the numpy binding treats an
 unlabeled 3-channel array as BGR. Crop arrays stay as they were.
+
+A whole-frame ZXing miss stays in that same worker. It tries CLAHE
+(clip 2, 8×8), one capped ×2 upscale, GlobalHistogram, then an
+adaptive threshold closed by a 3×3 kernel, and stops at the first
+hit. The deadline is the one the pool already has. A kill or a crash
+returns the empty result and does not run the remaining rungs in the
+caller. Crop reads do not use this ladder.
 
 The pool runs in the calling process when `ARBEZ_ISOLATION=off`, when
 the caller is a daemon, when Linux cannot write `/dev/shm`, or when
