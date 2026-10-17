@@ -41,6 +41,9 @@ Other constructor shapes
   Apple Vision requests, then applied after consensus to the decoding
   engine's symbology (S-099). Micro QR and rMQR stay opt-in
   (``micro_qr=`` / ``rmqr=``).
+* ``Scanner(full_frame_fallback=False)`` — WeChat engines this Scanner
+  constructs skip the classical full-frame pass (S-100). Default ``True``.
+  A pre-built ``WeChatEngine`` keeps the flag it was constructed with.
 
 The 0.1.x ``engine="auto"`` and ``consensus="off"/"vote"`` + ``min_votes``
 API were removed in 0.2.0 (S-093).
@@ -153,6 +156,7 @@ def _resolve_engine(
     symbologies: frozenset[Symbology] | None = None,
     micro_qr: bool = False,
     rmqr: bool = False,
+    full_frame_fallback: bool = True,
 ) -> Engine:
     """Map an engine name to an instance.
 
@@ -202,7 +206,7 @@ def _resolve_engine(
         # drops its results after the vote (S-099).
         from arbez.engines.wechat import WeChatEngine
 
-        return WeChatEngine()
+        return WeChatEngine(full_frame_fallback=full_frame_fallback)
     raise EngineUnavailable(
         f"Unknown engine name {name!r}. Expected one of: "
         f"'auto', 'arbez', 'apple_vision', 'zxing', 'wechat'."
@@ -550,6 +554,13 @@ class Scanner:
         Also request rMQR from zxing and the arbez crop decoder. Reported
         as ``Symbology.QR``. Ignored when the allow-list excludes QR.
         Apple Vision has no rMQR symbology. Keyword-only. Default ``False``.
+    full_frame_fallback:
+        Whether a WeChat engine this Scanner constructs decodes the whole
+        frame again when the ONNX nets return no payload (S-100). Default
+        ``True``, which is maximum yield (S-093). ``False`` keeps the net
+        pass only. Ignored for every engine other than WeChat, and ignored
+        when ``engine=`` is an already-built instance: that object's own
+        ``full_frame_fallback`` stands. Keyword-only.
 
     Raises
     ------
@@ -560,8 +571,8 @@ class Scanner:
     TypeError
         ``engine=`` is neither a string nor an Engine instance; ``engines=``
         is neither None nor a tuple/list; ``consensus=`` is not an int;
-        ``micro_qr`` / ``rmqr`` are not bools; or ``symbologies`` is a bare
-        string or a single ``Symbology``.
+        ``micro_qr`` / ``rmqr`` / ``full_frame_fallback`` are not bools; or
+        ``symbologies`` is a bare string or a single ``Symbology``.
     ValueError
         ``consensus < 1``; ``consensus`` greater than the number of engines;
         ``iou_threshold`` outside ``[0, 1]``; ``engine=`` combined with
@@ -583,6 +594,7 @@ class Scanner:
         symbologies: Iterable[Symbology | str] | None = None,
         micro_qr: bool = False,
         rmqr: bool = False,
+        full_frame_fallback: bool = True,
     ) -> None:
         # S-093 (0.2.0): engine-selection model.
         #
@@ -625,6 +637,11 @@ class Scanner:
             raise TypeError(
                 f"micro_qr and rmqr must be bools; got micro_qr={micro_qr!r}, rmqr={rmqr!r}."
             )
+        if not isinstance(full_frame_fallback, bool):
+            raise TypeError(
+                "full_frame_fallback must be a bool; "
+                f"got {type(full_frame_fallback).__name__}"
+            )
         # Imported here so scanner and consensus don't cycle at import.
         # Coerce before any early return so every construction path
         # stores the allow-list scan() filters on (S-099).
@@ -643,6 +660,8 @@ class Scanner:
         self._consensus_engines_lock = threading.Lock()
         self._engine: Engine | None = None
         self._engines: tuple[str, ...] | None = None
+        # S-100: applied only when this Scanner constructs a WeChatEngine.
+        self._full_frame_fallback = full_frame_fallback
         self._is_consensus = False
         self._consensus_min_votes = 1
         self._symbology_allow: frozenset[Symbology] | None = allow
@@ -817,7 +836,9 @@ class Scanner:
         ``"consensus"``, and ``"engine.<name>"``), and
         ``extras["stage_hit"]``. ``extras`` also records engine
         isolation (S-097): whether a native engine ran in a worker,
-        and any crash or deadline that was contained.
+        and any crash or deadline that was contained. When a WeChat
+        call finishes, ``wechat_full_frame_fallback`` says whether the
+        classical full-frame pass ran (S-100).
         """
         # Delegate to the public ``coerce_to_pil`` helper — same code
         # path the engines themselves use. Previously Scanner had a
@@ -1157,6 +1178,7 @@ class Scanner:
                         symbologies=self._symbology_allow,
                         micro_qr=self._micro_qr,
                         rmqr=self._rmqr,
+                        full_frame_fallback=self._full_frame_fallback,
                     )
             return self._engine
 
@@ -1189,6 +1211,7 @@ class Scanner:
                         symbologies=self._symbology_allow,
                         micro_qr=self._micro_qr,
                         rmqr=self._rmqr,
+                        full_frame_fallback=self._full_frame_fallback,
                     )
                     for name in names
                 }

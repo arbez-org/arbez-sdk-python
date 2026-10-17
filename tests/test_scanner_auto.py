@@ -446,6 +446,21 @@ def test_scanner_consensus_string_raises_type_error() -> None:
         Scanner(consensus="vote")  # type: ignore[arg-type]
 
 
+def test_full_frame_fallback_must_be_bool() -> None:
+    """S-100: a non-bool is a TypeError, not a silent true."""
+    with pytest.raises(TypeError, match="full_frame_fallback"):
+        Scanner(full_frame_fallback=1)  # type: ignore[arg-type]
+
+
+def test_full_frame_fallback_on_a_non_wechat_engine_is_absent_from_extras(
+    blank_image: PILImage,
+) -> None:
+    """The key is WeChat's. Another engine does not invent it."""
+    result = Scanner(engine="zxing", full_frame_fallback=False).scan(blank_image)
+    assert "wechat_full_frame_fallback" not in result.extras
+    assert result.detections == ()
+
+
 def test_scanner_consensus_bool_raises_type_error() -> None:
     """``bool`` is an int subclass; ``Scanner(consensus=True)`` must NOT be
     silently read as 1 — it raises TypeError."""

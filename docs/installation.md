@@ -51,7 +51,7 @@ below mirrors the canonical engine order.
 |---|---|---|
 | `[apple-vision]` | nothing extra | **No-op alias** — `pyobjc-framework-Vision` + `pyobjc-framework-Quartz` are core deps with `platform_system == 'Darwin'` markers (auto-pulled by `pip install arbez` on macOS, excluded everywhere else). Kept so pinned scripts keep resolving. New macOS code can just `pip install arbez`. |
 | `[zxing]` | `zxing-cpp>=3.1.1` | **No-op alias** — zxing-cpp is a core dep (ships with bare `pip install arbez`). Kept so pinned scripts keep resolving. |
-| `[wechat]` | `opencv-contrib-python>=5`, `numpy>=2` | WeChat QR detector (vendored `detect.onnx` + `sr.onnx`). QR-only. Joins consensus voting. OpenCV 5 needs numpy 2 or newer. A bare install can stay on numpy 1.24. |
+| `[wechat]` | `opencv-contrib-python>=5`, `numpy>=2` | WeChat QR detector (vendored `detect.onnx` + `sr.onnx`). QR-only. Joins consensus voting. Requires numpy >= 2. An OpenCV 4 install loses the engine: `WeChatEngine()` raises `EngineUnavailable`. A bare install can stay on numpy 1.24. |
 | `[consensus]` | apple-vision + wechat (zxing already core) | Bundle — all consensus engines (Apple Vision, WeChat, ZXing alongside the bundled arbez detector) |
 | `[coreml]` | `coremltools>=8` (Darwin only) | **Scaffolding** for future Core ML toolchain work. Note: the default `pip install arbez` already gets CoreML acceleration on Mac via ORT's `CoreMLExecutionProvider` — no `[coreml]` extra needed. Install this extra only when doing Core ML model conversion / inspection. |
 | `[cuda]` | `onnxruntime-gpu>=1.18` (Linux + Windows only) | Enables ArbezEngine's `CUDAExecutionProvider` auto-pick. On hosts with this extra installed and a working NVIDIA driver, `Scanner()` runs YOLOX-s on GPU. Not benchmarked yet. |
@@ -59,6 +59,12 @@ below mirrors the canonical engine order.
 | `[avif]` | `pillow-avif-plugin>=1.4` | AVIF decoding — modern web image format. Same pattern as `[heic]`. |
 | `[all]` | All of the above | Everything for power users |
 | `[dev]` | pytest + hypothesis + ruff + mypy + fixture generators | Contributor tooling (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)) |
+
+An OpenCV 4 install loses the WeChat engine. `WeChatEngine()` raises
+`EngineUnavailable` unless OpenCV is 5 or newer and the vendored nets
+are present. The `[wechat]` extra requires numpy >= 2, because that is
+what OpenCV 5.0.0.93 resolves against. A bare `pip install arbez` can
+stay on numpy 1.24; the two pins are not one resolution.
 
 ### Combining extras
 

@@ -11,6 +11,62 @@ ID prefix is `S-` (for SDK).
 
 ---
 
+## S-100 — WeChat full-frame fallback is switchable (2026-10-18)
+
+**Context.** The vendored WeChat nets decode, and when they return no
+payload the same frame is decoded again with the no-argument
+constructor (S-096). That classical pass runs on every miss. Measured
+on photos, WeChat p95 goes from 290 ms with the nets alone to 1,954 ms
+with the fallback. The fallback runs on every code-free image and adds
+13 codes that zxing and the arbez engine miss. `Scanner()` is still
+maximum yield (S-093), so the pass stays the default. The 0.4.0
+cascade turns it off in `balanced`, which needs the switch to exist
+now.
+
+The same OpenCV binding raises `UnicodeDecodeError` when a payload is
+not UTF-8. A multi-engine scan already logs that and treats the engine
+as empty. `Scanner(engine="wechat")` lets the exception out.
+
+OpenCV 4 cannot load the vendored nets. An OpenCV 4 install loses the
+WeChat engine. The `[wechat]` extra requires numpy >= 2.
+
+**Decision.** `WeChatEngine(full_frame_fallback: bool = True)` and the
+same keyword on `Scanner`. The default stays `True`. Scanner passes
+the flag only when it constructs the engine. A caller-supplied
+instance keeps its own value. The spawned worker is built with the
+flag, by which zero-argument entrypoint is used. The parent does not
+run the classical pass itself.
+
+`detectAndDecode` raising `UnicodeDecodeError` ends that scan: no
+detections, and one warning logged in the parent. The classical pass
+is not started when the net pass was the call that raised. The
+exception is not raised, including from `Scanner(engine="wechat")`.
+
+A finished WeChat call records
+`Result.extras["wechat_full_frame_fallback"]` as `True` or `False`.
+The key is absent when WeChat did not finish a call: it was not in
+the scan, or the call crashed or timed out.
+
+**Alternatives.** Leaving the fallback unconditional keeps the yield
+and blocks the later latency mode. Defaulting it to off would drop
+those codes from today's maximum-yield `Scanner()` before that mode
+exists. Catching the Unicode error only in `Scanner` would still raise
+from a direct `detect_and_decode`. Running the classical pass after a
+Unicode error on the net pass spends the slow call on a result this
+decision already treats as no read, and it uses the same binding.
+
+**Consequences.** `full_frame_fallback=False` is the net pass only.
+The latency gate (p95 near 290 ms) and the yield gate (fallback on,
++13 codes ±3) are measured later by QR-Bench. This change does not
+retune the default, the deadlines, or the ladder. Callers who need
+the classical codes leave the default on and scan through `Scanner`
+(10 s). A direct call stays at 2 s. The non-UTF-8 images are not
+fixtures here; the suite raises `UnicodeDecodeError` from a fake
+detector. OpenCV 4 installs still lose the engine
+(`EngineUnavailable`), and `[wechat]` still requires numpy >= 2.
+
+---
+
 ## S-098 — zxing-cpp reads run in the isolation pool (2026-10-18)
 
 **Context.** S-097 put WeChat and the libdmtx fallback in `EnginePool` and
