@@ -115,16 +115,35 @@ engine. S-022 left it in place.
   checks that distinguish `"engine"` from `"consensus"` still hold.
 * `preprocess="auto"` no longer changes a bbox. Code that depended on
   the 2000 px downscale needs to resize before `scan`.
-* An already-open TIFF is oriented from a private reopen. Pillow
-  applies the tag inside `load()`, in place, and `Image.copy()`
-  loads, so the caller's image is not loaded. A closed TIFF raises
-  `InvalidInputError`: `getexif()` asserts on a null file pointer
-  (`AttributeError` under `-O`) while `mode` is still RGB.
+* An already-open TIFF is oriented from a private reopen at the
+  caller's current frame. Pillow applies the tag inside `load()`,
+  in place, and `Image.copy()` loads, so the caller's image is not
+  loaded. The reopen seeks to that frame before the pixel check, so
+  an oversize earlier frame is not returned for a later small one
+  and is not a reason to reject the small frame. `Image.open` still
+  warns when that earlier frame is above the limit and below twice
+  the limit; the warning is Pillow's, and those pixels are not
+  decoded. The path is tried
+  first; a failed path open reads the live file pointer. If neither
+  source can be read, or the current frame cannot be selected, the
+  result is `InvalidInputError`, not the caller's object.
+  Orientations 2–8 are applied only to the private image. A closed
+  TIFF raises `InvalidInputError`: `getexif()` asserts on a null
+  file pointer (`AttributeError` under `-O`) while `mode` is still
+  RGB.
+* The orientation source is the root IFD tag when it is present,
+  otherwise XMP `tiff:Orientation`, the same source Pillow's
+  `getexif` uses on the bytes path. That read happens on the private
+  image, before `Result.image_size` is recorded, so a later `load()`
+  is not what rotates the caller's TIFF.
 * WebP and ICO sizes are read from the container header before
   `Image.open`. Those plugins allocate or `load()` inside `_open`,
   and Pillow's check does nothing when `Image.MAX_IMAGE_PIXELS` is
-  `None`. The parser does not call `Image._decompression_bomb_check`.
-  JPEG, PNG, and PPM stay lazy and are still checked after open.
+  `None`. The ICO's embedded PNG size is its `IHDR` chunk, including
+  when a chunk precedes `IHDR`. An ICO whose frame size cannot be
+  read is rejected instead of opened. The parser does not call
+  `Image._decompression_bomb_check`. JPEG, PNG, and PPM stay lazy
+  and are still checked after open.
 * When Pillow's own bomb error fires (a stricter process global, at
   twice that global), the wrapped `InvalidInputError` quotes that
   limit. The inlined constant is quoted only when our check fired.

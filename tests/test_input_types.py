@@ -516,6 +516,286 @@ def test_coerce_to_pil_rejects_closed_tiff() -> None:
         coerce_to_pil(src)
 
 
+def _multiframe_tiff(orientation: int) -> bytes:
+    """Two frames. Frame 1's pixels are not frame 0's.
+
+    Orientation is on both frames. Frame 0 is stored 40x20 and frame
+    1 is stored 16x8. An oversize first frame is declared by patching
+    the first IFD, not by allocating those pixels.
+    """
+    first = Image.new("RGB", (40, 20), "white")
+    first.putpixel((0, 0), (255, 0, 0))
+    first.putpixel((39, 0), (0, 255, 0))
+    first.putpixel((0, 19), (0, 0, 255))
+    second = Image.new("RGB", (16, 8), "white")
+    second.putpixel((0, 0), (1, 2, 3))
+    second.putpixel((15, 7), (9, 8, 7))
+    exif = first.getexif()
+    exif[_EXIF_ORIENTATION] = orientation
+    buf = io.BytesIO()
+    first.save(
+        buf, format="TIFF", save_all=True, append_images=[second], exif=exif
+    )
+    return buf.getvalue()
+
+
+def _declare_first_tiff_frame(raw: bytes, width: int, height: int) -> bytes:
+    """Rewrite the first IFD's inline width and height.
+
+    The strip is left alone, so opening the file does not allocate
+    ``width * height`` pixels. Only a classic little-endian TIFF is
+    patched, and only the first IFD.
+    """
+    data = bytearray(raw)
+    assert data[:4] == b"II*\x00"
+    ifd = int.from_bytes(data[4:8], "little")
+    count = int.from_bytes(data[ifd : ifd + 2], "little")
+    found = 0
+    for index in range(count):
+        off = ifd + 2 + index * 12
+        tag = int.from_bytes(data[off : off + 2], "little")
+        if tag == 256:
+            data[off + 8 : off + 12] = width.to_bytes(4, "little")
+            found += 1
+        elif tag == 257:
+            data[off + 8 : off + 12] = height.to_bytes(4, "little")
+            found += 1
+    assert found == 2
+    return bytes(data)
+
+
+def _reference_oriented_frame(raw: bytes, frame: int) -> PILImage:
+    """EXIF applied to one frame, then RGB. Does not use the caller's image."""
+    from PIL import ImageOps
+
+    src = Image.open(io.BytesIO(raw))
+    try:
+        src.seek(frame)
+        transposed = ImageOps.exif_transpose(src)
+        assert transposed is not None
+        return transposed.convert("RGB")
+    finally:
+        src.close()
+
+
+def test_coerce_to_pil_reopens_tiff_at_the_current_frame() -> None:
+    """Frame 1 is oriented. The oversize first frame is not returned.
+
+    10000x10000 is 100,000,000 pixels, over the inlined limit. That
+    size is written into the first IFD only. The pixel strip stays
+    the original small frame, so decoding frame 0 would allocate it.
+    The caller stays on frame 1, unloaded.
+    """
+    from PIL.TiffImagePlugin import TiffImageFile
+
+    from arbez.engines.helpers import MAX_IMAGE_PIXELS
+
+    raw = _declare_first_tiff_frame(_multiframe_tiff(6), 10_000, 10_000)
+    probe = Image.open(io.BytesIO(raw))
+    try:
+        assert probe.size == (10_000, 10_000)
+        probe.seek(1)
+        assert probe.size == (8, 16)
+        assert getattr(probe, "_im", None) is None
+    finally:
+        probe.close()
+
+    src = Image.open(io.BytesIO(raw))
+    assert isinstance(src, TiffImageFile)
+    try:
+        src.seek(1)
+        assert src.tell() == 1
+        assert src.tag_v2.get(_EXIF_ORIENTATION) == 6
+        assert getattr(src, "_im", None) is None
+        caller_size = src.size
+        out = coerce_to_pil(src)
+        assert src.tell() == 1
+        assert src.tag_v2.get(_EXIF_ORIENTATION) == 6
+        assert getattr(src, "_im", None) is None
+        assert src.size == caller_size
+    finally:
+        src.close()
+    ref = _reference_oriented_frame(raw, 1)
+    assert out is not src
+    assert out.size == ref.size == (8, 16)
+    assert out.size[0] * out.size[1] <= MAX_IMAGE_PIXELS
+    assert out.tobytes() == ref.tobytes()
+
+
+def test_coerce_to_pil_rejects_oversize_current_tiff_frame() -> None:
+    """The current frame is the oversize one, so it is not returned."""
+    from arbez.engines.helpers import MAX_IMAGE_PIXELS
+
+    raw = _declare_first_tiff_frame(_multiframe_tiff(6), 10_000, 10_000)
+    src = Image.open(io.BytesIO(raw))
+    try:
+        assert src.tell() == 0
+        assert getattr(src, "_im", None) is None
+        with pytest.raises(
+            InvalidInputError, match="decompression-bomb limit of"
+        ) as exc_info:
+            coerce_to_pil(src)
+        message = str(exc_info.value)
+        assert "10000x10000" in message
+        assert str(MAX_IMAGE_PIXELS) in message
+        assert exc_info.value.__cause__ is None
+        assert getattr(src, "_im", None) is None
+        assert src.tell() == 0
+    finally:
+        src.close()
+
+
+def test_coerce_to_pil_refuses_tiff_when_current_frame_cannot_be_reopened() -> None:
+    """A frame that cannot be selected is not replaced with frame 0."""
+    raw = _multiframe_tiff(6)
+    src = Image.open(io.BytesIO(raw))
+    try:
+        src.seek(1)
+
+        def _missing_frame() -> int:
+            return 9
+
+        src.tell = _missing_frame  # type: ignore[method-assign]
+        assert getattr(src, "_im", None) is None
+        with pytest.raises(InvalidInputError, match="current frame"):
+            coerce_to_pil(src)
+        assert getattr(src, "_im", None) is None
+    finally:
+        src.close()
+
+
+def test_coerce_to_pil_rereads_tiff_fp_when_path_open_fails(tmp_path: Path) -> None:
+    """A missing path does not return the caller's live TIFF.
+
+    ``Image.open(filename)`` raises. The open file pointer still has
+    the bytes. Orientation is applied to a private image, and the
+    caller stays unloaded.
+    """
+    from PIL.TiffImagePlugin import TiffImageFile
+
+    raw = _tiff_with_orientation(6)
+    path = tmp_path / "oriented.tiff"
+    path.write_bytes(raw)
+    src = Image.open(path)
+    path.unlink()
+    assert isinstance(src, TiffImageFile)
+    try:
+        assert src.tag_v2.get(_EXIF_ORIENTATION) == 6
+        assert getattr(src, "_im", None) is None
+        caller_size = src.size
+        out = coerce_to_pil(src)
+        assert out is not src
+        assert src.tag_v2.get(_EXIF_ORIENTATION) == 6
+        assert getattr(src, "_im", None) is None
+        assert src.size == caller_size
+    finally:
+        src.close()
+    ref = _reference_oriented(raw)
+    assert out.size == ref.size
+    assert out.tobytes() == ref.tobytes()
+
+
+def test_coerce_to_pil_refuses_tiff_when_bytes_cannot_be_reread(
+    tmp_path: Path,
+) -> None:
+    """When the path and the file pointer both fail, the caller is not returned."""
+    from PIL.TiffImagePlugin import TiffImageFile
+
+    src = Image.open(io.BytesIO(_tiff_with_orientation(6)))
+    assert isinstance(src, TiffImageFile)
+    src.filename = str(tmp_path / "gone.tiff")
+    assert src.fp is not None
+    src.fp.close()
+    try:
+        assert getattr(src, "_im", None) is None
+        with pytest.raises(InvalidInputError, match="could not be reread"):
+            coerce_to_pil(src)
+        assert getattr(src, "_im", None) is None
+        assert src.tag_v2.get(_EXIF_ORIENTATION) == 6
+    finally:
+        src.close()
+
+
+def _tiff_with_xmp_orientation(orientation: int) -> bytes:
+    """TIFF whose only orientation is XMP ``tiff:Orientation``.
+
+    Tag 274 is not written. Pillow's ``load()`` still rotates from
+    the packet, and ``getexif`` reports the same digit.
+    """
+    from PIL import TiffTags
+    from PIL.TiffImagePlugin import ImageFileDirectory_v2
+
+    img = Image.new("RGB", (40, 20), "white")
+    img.putpixel((0, 0), (255, 0, 0))
+    img.putpixel((39, 0), (0, 255, 0))
+    img.putpixel((0, 19), (0, 0, 255))
+    ifd = ImageFileDirectory_v2()
+    ifd[700] = f'<tiff:Orientation="{orientation}">'.encode("ascii")
+    ifd.tagtype[700] = TiffTags.BYTE
+    buf = io.BytesIO()
+    img.save(buf, format="TIFF", tiffinfo=ifd)
+    return buf.getvalue()
+
+
+def test_coerce_to_pil_applies_xmp_orientation_on_open_and_bytes() -> None:
+    """XMP-only orientation matches on the bytes path and the open path.
+
+    The already-open caller keeps its stored size and stays unloaded.
+    ``Scanner`` records ``image_size`` from the private oriented image.
+    An engine ``load()`` of that image does not rotate the caller.
+    """
+    from PIL.TiffImagePlugin import TiffImageFile
+
+    from arbez import Scanner
+    from arbez.types import Detection
+
+    raw = _tiff_with_xmp_orientation(6)
+    from_bytes = coerce_to_pil(raw)
+    src = Image.open(io.BytesIO(raw))
+    assert isinstance(src, TiffImageFile)
+    try:
+        assert _EXIF_ORIENTATION not in src.tag_v2
+        assert src.size == (40, 20)
+        assert getattr(src, "_im", None) is None
+        opened = coerce_to_pil(src)
+        assert src.size == (40, 20)
+        assert getattr(src, "_im", None) is None
+        assert _EXIF_ORIENTATION not in src.tag_v2
+    finally:
+        src.close()
+    ref = _reference_oriented(raw)
+    assert from_bytes.size == opened.size == ref.size == (20, 40)
+    assert from_bytes.tobytes() == opened.tobytes() == ref.tobytes()
+
+    class _Load:
+        name = "load"
+
+        def __init__(self) -> None:
+            self.seen: tuple[int, int] | None = None
+            self.image_id: int | None = None
+
+        def detect_and_decode(self, image: object) -> tuple[Detection, ...]:
+            assert isinstance(image, Image.Image)
+            image.load()
+            self.seen = image.size
+            self.image_id = id(image)
+            return ()
+
+    engine = _Load()
+    caller = Image.open(io.BytesIO(raw))
+    assert isinstance(caller, TiffImageFile)
+    try:
+        result = Scanner(engine=engine).scan(caller)
+        assert result.image_size == (20, 40)
+        assert engine.seen == (20, 40)
+        assert engine.image_id != id(caller)
+        assert caller.size == (40, 20)
+        assert getattr(caller, "_im", None) is None
+        assert _EXIF_ORIENTATION not in caller.tag_v2
+    finally:
+        caller.close()
+
+
 def test_scanner_scan_reports_exif_oriented_size_and_decodes(qr_payload: str) -> None:
     """A sideways-stored QR with an EXIF tag scans in the upright frame.
 
@@ -639,6 +919,34 @@ def _ico_with_png_ihdr(width: int, height: int) -> bytes:
     return b"\x00\x00\x01\x00" + (1).to_bytes(2, "little") + entry + png
 
 
+def _ico_png_ihdr_after_chunk(width: int, height: int) -> bytes:
+    """ICO whose embedded PNG has a one-byte chunk before IHDR.
+
+    The directory says 16x16. IHDR is not at bytes 12:16 of the PNG,
+    which is the only place a 24-byte peek looks. The pixel buffer is
+    omitted: a solid 4000x24000 PNG is what Pillow decodes inside
+    ``IcoImageFile._open``.
+    """
+    prefix = (
+        b"\x89PNG\r\n\x1a\n"
+        + (1).to_bytes(4, "big")
+        + b"tEXt"
+        + b"\x00"
+        + b"\x00\x00\x00\x00"
+    )
+    ihdr = (
+        width.to_bytes(4, "big")
+        + height.to_bytes(4, "big")
+        + bytes([8, 2, 0, 0, 0])
+    )
+    png = prefix + (13).to_bytes(4, "big") + b"IHDR" + ihdr + b"\x00\x00\x00\x00"
+    assert png[12:16] != b"IHDR"
+    entry = bytes([16, 16, 0, 0]) + (1).to_bytes(2, "little")
+    entry += (32).to_bytes(2, "little") + len(png).to_bytes(4, "little")
+    entry += (22).to_bytes(4, "little")
+    return b"\x00\x00\x01\x00" + (1).to_bytes(2, "little") + entry + png
+
+
 def test_coerce_to_pil_rejects_webp_and_ico_headers_before_open() -> None:
     """WebP and ICO bombs are rejected from the header.
 
@@ -663,6 +971,76 @@ def test_coerce_to_pil_rejects_webp_and_ico_headers_before_open() -> None:
             assert exc_info.value.__cause__ is None
     finally:
         Image.MAX_IMAGE_PIXELS = previous
+
+
+def test_coerce_to_pil_rejects_ico_png_with_chunk_before_ihdr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """4000x24000 behind a leading chunk is rejected before ``Image.open``.
+
+    Pillow 13 decodes that PNG inside ``IcoImageFile._open`` when IHDR
+    is not first, and RSS rises by about 379 MB. Setting
+    ``Image.MAX_IMAGE_PIXELS`` to ``None`` does not disable this
+    reject. The fixture is the header, not the solid pixel buffer.
+    """
+    from arbez.engines.helpers import MAX_IMAGE_PIXELS
+
+    raw = _ico_png_ihdr_after_chunk(4000, 24_000)
+    assert len(raw) < 200
+    assert b"IHDR" in raw
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Image.open must not run")
+
+    monkeypatch.setattr(Image, "open", _boom)
+    previous = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with pytest.raises(
+            InvalidInputError, match="decompression-bomb limit of"
+        ) as exc_info:
+            coerce_to_pil(raw)
+        message = str(exc_info.value)
+        assert "4000x24000" in message
+        assert str(MAX_IMAGE_PIXELS) in message
+        assert exc_info.value.__cause__ is None
+    finally:
+        Image.MAX_IMAGE_PIXELS = previous
+
+
+def test_coerce_to_pil_rejects_ico_when_frame_size_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ICO whose PNG has no readable IHDR is not opened."""
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + (1).to_bytes(4, "big")
+        + b"tEXt"
+        + b"\x00"
+        + b"\x00\x00\x00\x00"
+    )
+    entry = bytes([16, 16, 0, 0]) + (1).to_bytes(2, "little")
+    entry += (32).to_bytes(2, "little") + len(png).to_bytes(4, "little")
+    entry += (22).to_bytes(4, "little")
+    raw = b"\x00\x00\x01\x00" + (1).to_bytes(2, "little") + entry + png
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Image.open must not run")
+
+    monkeypatch.setattr(Image, "open", _boom)
+    with pytest.raises(InvalidInputError, match="could not be read"):
+        coerce_to_pil(raw)
+
+
+def test_coerce_to_pil_accepts_small_ico() -> None:
+    """A Pillow-written ICO still decodes. The header walk finds its IHDR."""
+    img = Image.new("RGB", (16, 16), "red")
+    buf = io.BytesIO()
+    img.save(buf, format="ICO")
+    out = coerce_to_pil(buf.getvalue())
+    assert out.mode == "RGB"
+    assert out.size == (16, 16)
+    assert out.getpixel((0, 0)) == (255, 0, 0)
 
 
 def test_coerce_to_pil_quotes_stricter_pillow_bomb_limit() -> None:

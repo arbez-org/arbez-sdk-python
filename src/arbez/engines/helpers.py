@@ -44,6 +44,18 @@ _PILLOW_BOMB_LIMIT = re.compile(r"limit of (\d+) pixels")
 # the stable contract, and the enum is only a convenience.
 _EXIF_ORIENTATION_TAG = 274
 
+# Pillow's ``Image.getexif`` XMP fallback. Group 2 is one digit, the
+# same search Pillow runs. The IFD tag wins when it is present.
+_XMP_ORIENTATION_TEXT = re.compile(r'tiff:Orientation(="|>)([0-9])')
+_XMP_ORIENTATION_BYTES = re.compile(rb'tiff:Orientation(="|>)([0-9])')
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# IHDR is not always the first chunk. Walk a bounded prefix so a chunk
+# in front of it cannot make the size look unreadable and fall through
+# to ``IcoImageFile._open``, which decodes the PNG.
+_MAX_PNG_CHUNK_LENGTH = 16 * 1024 * 1024
+_MAX_PNG_CHUNKS_BEFORE_IHDR = 32
+
 
 # Candidate allow-list of Pillow format names arbez accepts as input.
 # The actual list passed to ``Image.open(..., formats=...)`` is the
@@ -327,12 +339,43 @@ def _webp_canvas_size(header: bytes) -> tuple[int, int] | None:
     return None
 
 
+def _png_ihdr_size(source: Any, offset: int) -> tuple[int, int] | None:
+    """Width and height from a PNG embedded at ``offset``.
+
+    Walks chunks until IHDR. A one-byte chunk before IHDR hides the
+    size from a 24-byte peek, and Pillow still decodes that PNG inside
+    ``IcoImageFile._open``. ``None`` means the size could not be read.
+    """
+    pos = offset + 8
+    for _ in range(_MAX_PNG_CHUNKS_BEFORE_IHDR):
+        header = _peek_source(source, pos, 8)
+        if header is None or len(header) < 8:
+            return None
+        length = int.from_bytes(header[:4], "big")
+        if length > _MAX_PNG_CHUNK_LENGTH:
+            return None
+        if header[4:8] == b"IHDR":
+            if length < 8:
+                return None
+            data = _peek_source(source, pos + 8, 8)
+            if data is None or len(data) < 8:
+                return None
+            return (
+                int.from_bytes(data[:4], "big"),
+                int.from_bytes(data[4:8], "big"),
+            )
+        pos += 12 + length
+    return None
+
+
 def _ico_frame_size(source: Any) -> tuple[int, int] | None:
     """Pixel size of the frame Pillow would ``load()`` from an ICO.
 
     The directory entry is at most 256 px. The embedded PNG or DIB
     header is the size ``IcoImageFile._open`` decodes, and that
-    ``load()`` runs before ``Image.open`` returns.
+    ``load()`` runs before ``Image.open`` returns. ``None`` means
+    that size could not be read; the caller rejects the ICO instead
+    of opening it.
     """
     header = _peek_source(source, 0, 6)
     if header is None or len(header) < 6 or header[:4] != b"\x00\x00\x01\x00":
@@ -357,14 +400,17 @@ def _ico_frame_size(source: Any) -> tuple[int, int] | None:
         entries.append((width * height, int(color_depth), offset))
     entries.sort(key=lambda item: item[1])
     entries.sort(key=lambda item: item[0], reverse=True)
-    frame = _peek_source(source, entries[0][2], 24)
-    if frame is None or len(frame) < 8:
+    frame_offset = entries[0][2]
+    if frame_offset < 0:
         return None
-    if frame[:8] == b"\x89PNG\r\n\x1a\n" and len(frame) >= 24 and frame[12:16] == b"IHDR":
-        return (
-            int.from_bytes(frame[16:20], "big"),
-            int.from_bytes(frame[20:24], "big"),
-        )
+    signature = _peek_source(source, frame_offset, 8)
+    if signature is None or len(signature) < 8:
+        return None
+    if signature == _PNG_SIGNATURE:
+        return _png_ihdr_size(source, frame_offset)
+    frame = _peek_source(source, frame_offset, 16)
+    if frame is None:
+        return None
     header_size = int.from_bytes(frame[:4], "little")
     if header_size == 12 and len(frame) >= 8:
         return (
@@ -386,9 +432,11 @@ def _reject_allocating_container(source: Any, *, where: str) -> None:
 
     Those plugins allocate or ``load()`` inside ``_open``. Pillow's
     check raises only above twice ``Image.MAX_IMAGE_PIXELS``, and
-    does nothing when that global is ``None``. A header this parser
-    cannot read falls through; JPEG, PNG, and PPM are still checked
-    after ``Image.open`` returns.
+    does nothing when that global is ``None``. An ICO whose frame
+    size cannot be read is rejected here: opening it would decode
+    the embedded image. A WebP whose canvas size cannot be read
+    still falls through. JPEG, PNG, and PPM are checked after
+    ``Image.open`` returns.
     """
     head = _peek_source(source, 0, 30)
     if not head:
@@ -400,8 +448,11 @@ def _reject_allocating_container(source: Any, *, where: str) -> None:
         return
     if head[:4] == b"\x00\x00\x01\x00":
         size = _ico_frame_size(source)
-        if size is not None:
-            _reject_too_many_pixels(size[0], size[1], where=where)
+        if size is None:
+            raise InvalidInputError(
+                f"{where} is an ICO whose frame size could not be read"
+            )
+        _reject_too_many_pixels(size[0], size[1], where=where)
 
 
 def _transpose_exif(image: PILImage) -> PILImage:
@@ -439,37 +490,59 @@ def _transpose_exif(image: PILImage) -> PILImage:
     return transposed
 
 
-def _tiff_orientation(image: PILImage) -> int:
-    """Root IFD orientation, without ``load()`` or ``getexif()``.
+def _orientation_in_xmp(packet: object) -> int | None:
+    """``tiff:Orientation`` from one XMP packet, or ``None`` if it has none."""
+    if isinstance(packet, str):
+        match = _XMP_ORIENTATION_TEXT.search(packet)
+        if match is None:
+            return None
+        return int(match.group(2))
+    if isinstance(packet, (bytes, bytearray)):
+        raw = _XMP_ORIENTATION_BYTES.search(bytes(packet))
+        if raw is None:
+            return None
+        return int(raw.group(2))
+    return None
 
-    ``getexif`` on a TIFF seeks the caller's file pointer. The root
-    tag is already in ``tag_v2`` from ``_open``, which is the value
-    Pillow's own setup uses.
+
+def _xmp_orientation(image: PILImage) -> int | None:
+    """XMP orientation, without ``getexif()`` or ``load()``.
+
+    ``Image.getexif`` reads ``XML:com.adobe.xmp`` first and, only when
+    that entry is missing, ``info["xmp"]``. TIFF stores the packet in
+    the second. ``getexif`` on a TIFF seeks the caller's file pointer.
+    """
+    info = image.info
+    xml_packet = info.get("XML:com.adobe.xmp")
+    if xml_packet:
+        return _orientation_in_xmp(xml_packet)
+    return _orientation_in_xmp(info.get("xmp"))
+
+
+def _tiff_orientation(image: PILImage) -> int:
+    """Orientation Pillow will apply, without ``load()`` or ``getexif()``.
+
+    A root IFD tag is already in ``tag_v2`` and wins, including tag 1:
+    Pillow does not consult XMP when the IFD already has Orientation.
+    When the tag is absent, XMP ``tiff:Orientation`` is the source
+    ``getexif`` and TIFF ``load()`` both use. Missing both means 1.
     """
     tag_v2 = getattr(image, "tag_v2", None)
-    if tag_v2 is None:
-        return 1
-    raw = tag_v2.get(_EXIF_ORIENTATION_TAG, 1)
-    try:
-        return 1 if raw is None else int(raw)
-    except (TypeError, ValueError):
-        return 1
-
-
-def _reopen_unloaded(image: PILImage) -> PILImage | None:
-    """A new loader for ``image``'s bytes, or ``None`` if they can't be reread.
-
-    Does not ``load()`` the object the caller passed. The file position
-    is restored when the bytes come from its stream.
-    """
-    from PIL import Image as _Image
-
-    filename = getattr(image, "filename", "") or ""
-    if isinstance(filename, (str, Path)) and filename:
+    if tag_v2 is not None and _EXIF_ORIENTATION_TAG in tag_v2:
+        raw = tag_v2.get(_EXIF_ORIENTATION_TAG)
         try:
-            return _Image.open(filename, formats=_supported_input_formats())
-        except (OSError, ValueError):
-            return None
+            return 1 if raw is None else int(raw)
+        except (TypeError, ValueError):
+            return 1
+    xmp = _xmp_orientation(image)
+    return 1 if xmp is None else xmp
+
+
+def _image_fp_bytes(image: PILImage) -> bytes | None:
+    """Bytes from the caller's open stream, or ``None`` if it cannot be read.
+
+    Restores the stream position. Does not ``load()`` the image.
+    """
     fp = getattr(image, "fp", None)
     seek = getattr(fp, "seek", None)
     read = getattr(fp, "read", None)
@@ -483,14 +556,95 @@ def _reopen_unloaded(image: PILImage) -> PILImage | None:
             data = read()
         finally:
             seek(pos)
-    except (OSError, AttributeError, TypeError):
+    except (OSError, AttributeError, TypeError, ValueError):
         return None
     if not isinstance(data, (bytes, bytearray)) or not data:
         return None
+    return bytes(data)
+
+
+def _seek_to_caller_frame(caller: PILImage, private: PILImage) -> None:
+    """Select the frame ``caller`` is on.
+
+    A fresh ``Image.open`` starts at frame 0. Orienting that frame
+    when the caller has seeked substitutes the wrong pixels, and an
+    oversize first frame would be returned for a later small one.
+    TIFF ``tell`` is the frame index, not a byte offset.
+    """
     try:
-        return _Image.open(io.BytesIO(bytes(data)), formats=_supported_input_formats())
-    except (OSError, ValueError):
-        return None
+        frame = caller.tell()
+    except (EOFError, OSError, ValueError) as e:
+        raise InvalidInputError(
+            "TIFF orientation could not be applied; "
+            "the current frame could not be reopened"
+        ) from e
+    if frame < 0:
+        raise InvalidInputError(
+            "TIFF orientation could not be applied; "
+            "the current frame could not be reopened"
+        )
+    if frame == private.tell():
+        return
+    try:
+        private.seek(frame)
+    except (EOFError, OSError, ValueError) as e:
+        raise InvalidInputError(
+            "TIFF orientation could not be applied; "
+            "the current frame could not be reopened"
+        ) from e
+    if private.tell() != frame:
+        raise InvalidInputError(
+            "TIFF orientation could not be applied; "
+            "the current frame could not be reopened"
+        )
+
+
+def _reopen_unloaded(image: PILImage) -> PILImage:
+    """Private loader at the caller's current frame.
+
+    The path is tried first. A failed path open reads the live file
+    pointer instead of returning the caller's object. The sought
+    frame is the one checked against the pixel limit: frame 0's size
+    is not this image. Failure raises ``InvalidInputError``.
+    """
+    from PIL import Image as _Image
+
+    private: PILImage | None = None
+    failure: BaseException | None = None
+    filename = getattr(image, "filename", "") or ""
+    if isinstance(filename, (str, Path)) and filename:
+        try:
+            private = _Image.open(filename, formats=_supported_input_formats())
+        except (OSError, ValueError) as e:
+            failure = e
+    if private is None:
+        data = _image_fp_bytes(image)
+        if data is not None:
+            try:
+                private = _Image.open(
+                    io.BytesIO(data), formats=_supported_input_formats()
+                )
+            except (OSError, ValueError) as e:
+                failure = e
+    if private is None:
+        raise InvalidInputError(
+            "TIFF orientation could not be applied; image bytes could not be reread"
+        ) from failure
+    try:
+        _seek_to_caller_frame(image, private)
+        # After the seek. Checking frame 0 here would reject a later
+        # small frame, or return the oversize frame if the check moved.
+        _reject_too_many_pixels(private.width, private.height, where="PIL image")
+    except InvalidInputError:
+        private.close()
+        raise
+    except (EOFError, OSError, ValueError) as e:
+        private.close()
+        raise InvalidInputError(
+            "TIFF orientation could not be applied; "
+            "the current frame could not be reopened"
+        ) from e
+    return private
 
 
 def _apply_exif_orientation(image: PILImage, *, owned: bool = False) -> PILImage:
@@ -498,13 +652,16 @@ def _apply_exif_orientation(image: PILImage, *, owned: bool = False) -> PILImage
 
     No copy when the orientation tag is missing or 1. Orientations 2
     through 8 are the ones Pillow knows how to apply. A tag that cannot
-    be read is left as stored: rejecting the scan would drop photos
-    whose pixels still decode.
+    be read on an image this function owns is left as stored: rejecting
+    the scan would drop photos whose pixels still decode.
 
     ``owned`` is for an image this function just opened. Pillow's TIFF
     loader applies orientation inside ``load()``, in place, and
     ``Image.copy()`` loads, so an image the caller still holds is
-    reopened instead of loaded.
+    reopened instead of loaded. Orientations 2-8 are applied only to
+    that private image. If it cannot be reread, or the caller's frame
+    cannot be selected, this raises ``InvalidInputError`` rather than
+    returning the caller's object for a later ``load()`` to transpose.
     """
     if owned or getattr(image, "format", None) != "TIFF":
         return _transpose_exif(image)
@@ -512,13 +669,9 @@ def _apply_exif_orientation(image: PILImage, *, owned: bool = False) -> PILImage
         raise InvalidInputError("PIL image is closed and cannot be decoded")
     if _tiff_orientation(image) not in range(2, 9):
         return image
-    private = _reopen_unloaded(image)
-    if private is None:
-        _log.debug("tiff orientation left as stored; image bytes could not be reread")
-        return image
-    # ``private`` is ours. Transpose may load it in place; the caller
-    # never sees that object.
-    return _transpose_exif(private)
+    # ``private`` is ours. Transpose may load it; the caller never
+    # sees that object, and a later ``load()`` cannot rotate theirs.
+    return _transpose_exif(_reopen_unloaded(image))
 
 
 def _open_rgb(source: Any, *, where: str) -> PILImage:
@@ -592,14 +745,24 @@ def coerce_to_pil(
     ``Result.image_size`` and detection coordinates use that frame.
     A missing tag, or orientation 1, does not copy. The tag is cleared
     so a second ``coerce_to_pil`` does not rotate again. An already-open
-    TIFF is oriented from a private reopen: Pillow applies the tag
-    inside ``load()``, in place. A closed TIFF raises
+    TIFF is oriented from a private reopen at the caller's current
+    frame: Pillow applies the tag inside ``load()``, in place. The IFD
+    Orientation tag wins; when it is absent, XMP ``tiff:Orientation``
+    is used, the same source as the bytes path. Orientations 2-8 are
+    applied only to that private image. If the bytes or the current
+    frame cannot be reread, this raises ``InvalidInputError`` instead
+    of returning the caller's image. A closed TIFF raises
     ``InvalidInputError`` (``mode`` is still RGB after ``close()``).
+    The pixel check is the sought frame, so an oversize earlier frame
+    is not returned for a later small one.
 
     WebP and ICO sizes are read from the container header before the
     plugin is constructed. Those plugins allocate or ``load()`` inside
     ``Image.open``, and Pillow's own check does not run when
-    ``Image.MAX_IMAGE_PIXELS`` is ``None``.
+    ``Image.MAX_IMAGE_PIXELS`` is ``None``. An ICO whose embedded PNG
+    hides ``IHDR`` behind another chunk is still measured from that
+    ``IHDR``. An ICO whose frame size cannot be read is rejected
+    before ``Image.open``.
 
     Branch order: PIL duck-type FIRST because the common case is
     "Scanner already coerced; engine re-coerces defensively". Hot path

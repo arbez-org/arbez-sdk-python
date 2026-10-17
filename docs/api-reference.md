@@ -660,17 +660,28 @@ Always returns RGB mode. No-op fast path: an RGB PIL image with no
 EXIF orientation (or orientation 1) passes through without a buffer
 copy. Any other orientation tag is applied first (orientations 2–8);
 the tag is then cleared so a second call does not rotate again. An
-already-open TIFF is oriented from a private copy of its bytes:
-Pillow applies that tag inside `load()`, in place, and `Image.copy()`
-loads. A closed TIFF raises `InvalidInputError`.
+already-open TIFF is oriented from a private copy of its bytes at
+the caller's current frame: Pillow applies that tag inside `load()`,
+in place, and `Image.copy()` loads. The root IFD Orientation tag
+wins; when it is absent, XMP `tiff:Orientation` is applied, the same
+source as a bytes load, and `image_size` is that oriented frame. If
+the path cannot be opened, the live file pointer is read. If the
+bytes or the current frame cannot be reread, this raises
+`InvalidInputError` instead of returning the caller's image. A
+closed TIFF raises `InvalidInputError`.
 Images whose width × height exceeds 89,478,485 pixels (Pillow's
 default `Image.MAX_IMAGE_PIXELS`, 256 MiB of 24-bit RGB) raise
-`InvalidInputError` before the pixels are decoded. WebP and ICO are
-judged from the container header before the plugin is constructed,
-because those plugins allocate or `load()` inside `Image.open`.
-Pillow's own check only raises above twice that, and setting
-`Image.MAX_IMAGE_PIXELS = None` does not disable this one. When
-Pillow's check does raise, the message quotes the limit Pillow used.
+`InvalidInputError` before the pixels are decoded. The check uses
+the caller's current frame, so an oversize earlier TIFF frame is
+not returned for a later small one. WebP and ICO are judged from
+the container header before the plugin is constructed, because
+those plugins allocate or `load()` inside `Image.open`. The ICO
+size is the embedded PNG `IHDR`, including when another chunk
+precedes it. An ICO whose frame size cannot be read is rejected
+instead of opened. Pillow's own check only raises above twice
+that, and setting `Image.MAX_IMAGE_PIXELS = None` does not disable
+this one. When Pillow's check does raise, the message quotes the
+limit Pillow used.
 Bad inputs wrap into `InvalidInputError`; the original error chains
 via `__cause__` when there is one.
 
