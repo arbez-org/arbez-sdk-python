@@ -15,8 +15,10 @@ Covers:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 from PIL import Image
 from PIL.Image import Image as PILImage
@@ -148,7 +150,7 @@ def test_wechat_detects_multiple_qrs_largest_first(qr_payload: str) -> None:
     assert detections[0].payload == "https://arbez.org/large"
 
 
-def _qr_array(payload: str, box_size: int) -> np.ndarray:
+def _qr_array(payload: str, box_size: int) -> npt.NDArray[np.uint8]:
     """Version-2 QR. ``(25 + 2) * box_size`` pixels with border 1."""
     import qrcode
 
@@ -162,10 +164,12 @@ def _qr_array(payload: str, box_size: int) -> np.ndarray:
     qr.make(fit=False)
     img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
     assert isinstance(img, PILImage)
-    return np.asarray(img)
+    # Pillow has no stubs, so asarray is Any. NumPy 2.2's ndarray is generic
+    # and has no default type parameters; 2.5 does. The cast satisfies both.
+    return cast(npt.NDArray[np.uint8], np.asarray(img))
 
 
-def _box_blur(arr: np.ndarray, radius: int) -> np.ndarray:
+def _box_blur(arr: npt.NDArray[np.uint8], radius: int) -> npt.NDArray[np.uint8]:
     """Edge-replicated box filter. Radius 1 is the measured recovery case."""
     kernel = radius * 2 + 1
     padded = np.pad(arr, ((radius, radius), (radius, radius), (0, 0)), mode="edge")
@@ -185,10 +189,10 @@ def _box_blur(arr: np.ndarray, radius: int) -> np.ndarray:
         - integral[y + kernel, x]
         + integral[y, x]
     )
-    return (total // (kernel * kernel)).astype(np.uint8)
+    return cast(npt.NDArray[np.uint8], (total // (kernel * kernel)).astype(np.uint8))
 
 
-def _hash_noise(height: int, width: int, amplitude: int) -> np.ndarray:
+def _hash_noise(height: int, width: int, amplitude: int) -> npt.NDArray[np.uint8]:
     """Deterministic grayscale noise. Not ``numpy.random``, so the bits stay stable."""
     ys, xs = np.indices((height, width))
     mixed = (
@@ -196,7 +200,7 @@ def _hash_noise(height: int, width: int, amplitude: int) -> np.ndarray:
     ) & np.uint32(255)
     level = (255 - mixed.astype(np.int16) * amplitude // 255).clip(0, 255)
     plane = level.astype(np.uint8)
-    return np.stack([plane, plane, plane], axis=-1)
+    return cast(npt.NDArray[np.uint8], np.stack([plane, plane, plane], axis=-1))
 
 
 def test_wechat_constructor_receives_vendored_onnx_paths(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -253,7 +257,7 @@ def test_empty_net_pass_falls_back_to_the_full_frame(
             self._args = args
             calls.append(args)
 
-        def detectAndDecode(self, _bgr: np.ndarray) -> tuple[list[str], list[np.ndarray]]:
+        def detectAndDecode(self, _bgr: Any) -> tuple[list[str], list[Any]]:
             if self._args:
                 return [""], [np.zeros((4, 2), np.float32)]
             corners = np.array([[1, 1], [30, 1], [30, 30], [1, 30]], np.float32)
@@ -283,7 +287,7 @@ def test_net_hit_does_not_also_run_the_full_frame(
         def __init__(self, *args: object) -> None:
             calls.append(len(args))
 
-        def detectAndDecode(self, _bgr: np.ndarray) -> tuple[list[str], list[np.ndarray]]:
+        def detectAndDecode(self, _bgr: Any) -> tuple[list[str], list[Any]]:
             corners = np.array([[1, 1], [30, 1], [30, 30], [1, 30]], np.float32)
             return ["net-payload"], [corners]
 
@@ -305,7 +309,7 @@ def test_forward_error_is_not_turned_into_a_full_frame_decode(
         def __init__(self, *args: object) -> None:
             calls.append(len(args))
 
-        def detectAndDecode(self, _bgr: np.ndarray) -> tuple[list[str], list[np.ndarray]]:
+        def detectAndDecode(self, _bgr: Any) -> tuple[list[str], list[Any]]:
             raise RuntimeError("forward failed")
 
     monkeypatch.setattr(cv2.wechat_qrcode, "WeChatQRCode", _ForwardFails)
