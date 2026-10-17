@@ -201,6 +201,11 @@ the explicit maintainer act of tagging is the gate.
 
 ### Fixed
 
+* **A caller-supplied WeChatEngine keeps its fallback after `Scanner.close()` (S-100).**
+  The next scan uses that same object, so `full_frame_fallback` stays
+  the value on the engine. A name-built engine and a consensus WeChat
+  engine still take the Scanner flag.
+
 * **A non-UTF-8 WeChat payload no longer raises (S-100).**
   `detectAndDecode` raising `UnicodeDecodeError` returns no detection
   and logs one warning. `Scanner(engine="wechat")` does not raise.

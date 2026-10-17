@@ -99,7 +99,7 @@ schedule + macOS's malloc-reclamation timing.
 | `symbologies` | `None` | Allow-list of `Symbology` members or value strings (`{"qr"}`, `{Symbology.QR}`). `None` does not filter. Mapped onto zxing formats and Apple Vision's request, then enforced after consensus on the **decoding** engine's symbology, not the voted cluster label (S-099). A kept cluster is labelled with that symbology when a payload is present. A bare string or a single `Symbology` raises `TypeError`. An empty iterable raises `ValueError`. A prebuilt `engine=` instance is not rebuilt with these flags, including after `close()`; `scan` still filters. Keyword-only. |
 | `micro_qr` | `False` | Also read Micro QR. With an allow-list, `MICRO_QR` is unioned in. Keyword-only. |
 | `rmqr` | `False` | Also read rMQR (zxing and the arbez crop decoder). Reported as `Symbology.QR`. Ignored when the allow-list excludes QR. Apple Vision has no rMQR symbology. Keyword-only. |
-| `full_frame_fallback` | `True` | When this Scanner constructs a WeChat engine, decode the whole frame again if the ONNX nets return no payload (S-100). `False` keeps the net pass only. Ignored for other engines, and ignored when `engine=` is an already-built instance (that object's own flag stands). A non-bool raises `TypeError`. Keyword-only. |
+| `full_frame_fallback` | `True` | When this Scanner constructs a WeChat engine, decode the whole frame again if the ONNX nets return no payload (S-100). `False` keeps the net pass only. Ignored for other engines, and ignored when `engine=` is an already-built instance (that object's own flag stands, including the scan after `close()`). A non-bool raises `TypeError`. Keyword-only. |
 
 **Properties:**
 
@@ -149,9 +149,11 @@ schedule + macOS's malloc-reclamation timing.
 - **`close() -> None`** — release the engine's
   native handles (ORT session, cv2.wechat_qrcode detector, pyobjc
   Vision module). Idempotent — safe to call multiple times. After
-  `close()`, a subsequent `scan()` lazy-reinit's the engine. Most
-  callers treat `close()` as terminal; the lazy reinit makes the
-  API forgiving for test fixtures + context managers. Use via
+  `close()`, a subsequent `scan()` lazy-reinit's the engine. A
+  name-built engine is constructed again. A caller-supplied instance
+  is that same object, so its configuration stands. Most callers
+  treat `close()` as terminal; the lazy reinit makes the API
+  forgiving for test fixtures + context managers. Use via
   `with Scanner(...)` for the common case.
 
   Caveat: `close()` releases the *Python* references promptly; the
