@@ -358,8 +358,10 @@ with ThreadPoolExecutor(max_workers=recommended_workers(scanner.engine_name)) as
 ```
 
 `recommended_workers(engine_name)` returns an engine-aware worker
-count: full `cpu_count()` for ZXing (releases the GIL, fully
-parallel), `min(cpu_count, 8)` for Apple Vision on Apple Silicon
+count: `cpu_count()` for ZXing. That number is unchanged. One shared
+`ZXingEngine` queues native reads on a single worker when isolation is
+on; give each thread its own engine when those scans must overlap.
+`min(cpu_count, 8)` for Apple Vision on Apple Silicon
 (`min(cpu_count, 16)` on Ultra chips), and half the CPUs (floored
 at 2, capped at 8) for `arbez`. See
 [API reference → arbez.parallelism](api-reference.md#arbezparallelism)

@@ -52,6 +52,16 @@ the explicit maintainer act of tagging is the gate.
 
 ### Added
 
+* **zxing-cpp reads run in the isolation pool (S-098).** Whole-frame
+  `ZXingEngine` reads and `ArbezEngine` crop and full-image fallback
+  reads use the S-097 worker. The format filter is applied inside the
+  worker, so a narrow `formats=` set does not run the other readers. A
+  native hang is bounded by the same deadlines: 2 s on a direct call and
+  10 s on `Scanner.scan`. A crash or a deadline is an empty read recorded
+  on `Result.extras`, not raised. `ARBEZ_ISOLATION=off` and the other
+  S-097 fallbacks still run in-process, and that path keeps the format
+  filter.
+
 * **Native engine isolation (S-097).** WeChat and the libdmtx Data Matrix
   fallback run in a spawned worker, loaded once, with the image passed
   through shared memory. The parent unlinks those segments. A crash or a
@@ -93,6 +103,16 @@ the explicit maintainer act of tagging is the gate.
 
 ### Changed
 
+* **Concurrent scans on one `ZXingEngine` share one worker (S-098).**
+  The instance stays safe to share. Native reads queue when isolation is
+  on. Separate instances each have a worker. The in-process fallback
+  still calls `read_barcodes` in the caller, and the pool lock serializes
+  those calls too. `recommended_workers("zxing")` is unchanged.
+  `ArbezEngine` crop and full-image reads share one process-wide worker,
+  separate from any `ZXingEngine`, so a consensus scan does not queue
+  both on one deadline. The real reader always receives an explicit
+  `BarcodeFormats` set. Model 2 is the default. An empty request does
+  not call `read_barcodes`.
 * **QR defaults are Model 2, and symbology allow-lists apply after consensus (S-099).**
   ZXing and the arbez crop decoder request `QRCodeModel2` instead of
   the QR family bit. Micro QR is off unless `micro_qr=True` or the
@@ -162,6 +182,11 @@ the explicit maintainer act of tagging is the gate.
   OpenCV 5.0.0.93 does not resolve against numpy 1.24.
 
 ### Security
+
+* **A zxing-cpp native hang no longer takes down the host** when the
+  isolation pool can run (S-098). The worker is killed at the deadline
+  and the next call works. The in-process fallback cannot make that
+  promise.
 
 * **A WeChat or libdmtx native crash no longer takes down the host**
   when the isolation pool can run (S-097). The worker dies instead.

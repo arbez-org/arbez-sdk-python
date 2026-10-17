@@ -256,7 +256,7 @@ def _spawn_context() -> Any:
     return mp.get_context("spawn")
 
 
-def _import_entrypoint(spec: str) -> Callable[[], Any]:
+def _import_entrypoint(spec: str) -> Callable[..., Any]:
     module_name, sep, func_name = spec.partition(":")
     if not sep or not module_name or not func_name:
         raise EngineRuntimeError(f"engine pool entrypoint {spec!r} is not module:function")
@@ -264,7 +264,9 @@ def _import_entrypoint(spec: str) -> Callable[[], Any]:
     fn = getattr(module, func_name, None)
     if not callable(fn):
         raise EngineRuntimeError(f"engine pool entrypoint {spec!r} is not callable")
-    return cast(Callable[[], Any], fn)
+    # Not always a zero-argument loader. zxing passes the format filter
+    # here because the child cannot close over the parent.
+    return cast(Callable[..., Any], fn)
 
 
 def _send_tagged(conn: Connection, kind: str, exc: BaseException) -> None:
@@ -356,9 +358,7 @@ class _SharedMemoryCapacityError(Exception):
     """The frame does not fit in the POSIX shm backing store."""
 
     def __init__(self, need: int, free: int) -> None:
-        super().__init__(
-            f"shared memory backing store has {free} bytes free, frame needs {need}"
-        )
+        super().__init__(f"shared memory backing store has {free} bytes free, frame needs {need}")
         self.need = need
         self.free = free
 
@@ -434,8 +434,17 @@ def _map_shared_image(
     return shm, shape, str(array.dtype.str)
 
 
-def _worker_main(entrypoint: str, conn: Connection) -> None:
-    """Spawn target. Top-level so the child pickles a string, not a closure."""
+def _worker_main(
+    entrypoint: str,
+    conn: Connection,
+    init_args: tuple[Any, ...] = (),
+) -> None:
+    """Spawn target. Top-level so the child pickles a string, not a closure.
+
+    ``init_args`` is how a caller configures the engine inside the child.
+    The entrypoint itself is only a ``module:function`` string, so it
+    cannot close over a format filter or any other parent state.
+    """
     import faulthandler
 
     import numpy as np
@@ -443,7 +452,7 @@ def _worker_main(entrypoint: str, conn: Connection) -> None:
     # A deliberate crash should not dump a traceback into the parent's log.
     faulthandler.disable()
     try:
-        engine = _import_entrypoint(entrypoint)()
+        engine = _import_entrypoint(entrypoint)(*init_args)
     except BaseException as exc:
         _send_tagged(conn, "init_error", exc)
         return
@@ -636,6 +645,11 @@ class EnginePool:
     does not raise. A Python exception from the engine still propagates,
     and the worker stays up. ``close`` is idempotent; ``call`` after
     ``close`` raises ``RuntimeError``.
+
+    ``init_args`` is passed to the entrypoint in the child and, when
+    there is no ``inprocess_factory``, on the in-process fallback. The
+    factory reuses an object the parent already built, and it does not
+    receive ``init_args``.
     """
 
     def __init__(
@@ -645,12 +659,17 @@ class EnginePool:
         engine: str,
         deadline: float = DEFAULT_DEADLINE_S,
         inprocess_factory: Callable[[], Callable[[Any], Any]] | None = None,
+        init_args: tuple[Any, ...] = (),
     ) -> None:
         _reject_fork()
         self._entrypoint = entrypoint
         self.engine = engine
         self._deadline = float(deadline)
         self._inprocess_factory = inprocess_factory
+        # Same arguments the child receives. The in-process fallback
+        # must apply a format filter too, or it would decode more than
+        # the worker does.
+        self._init_args = init_args
         self._block_reason = isolation_block_reason()
         self._force_inprocess = self._block_reason is not None
         # Set only after a spawn or a kill we already attempted gives up.
@@ -728,6 +747,22 @@ class EnginePool:
             self._note(result)
             return result
 
+    def inprocess_reader(self) -> Callable[[Any], Any] | None:
+        """Load the in-process reader and return it.
+
+        ``None`` when this pool spawns. The caller runs the callable
+        outside this lock. A hang in that reader must leave
+        :meth:`close` able to return. :meth:`call` still holds the lock
+        for the whole read; WeChat depends on that.
+        """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("EnginePool is closed")
+            if self.isolation != "inprocess":
+                return None
+            self.last_deadline_s = self._resolve_deadline(None)
+            return self._load_inprocess()
+
     def close(self) -> None:
         """Stop the worker. A second call does nothing."""
         with self._lock:
@@ -770,7 +805,7 @@ class EnginePool:
             if self._inprocess_factory is not None:
                 self._inprocess_fn = self._inprocess_factory()
             else:
-                self._inprocess_fn = _import_entrypoint(self._entrypoint)()
+                self._inprocess_fn = _import_entrypoint(self._entrypoint)(*self._init_args)
         return self._inprocess_fn
 
     def _call_inprocess(self, image: npt.NDArray[Any]) -> PoolResult:
@@ -913,7 +948,7 @@ class EnginePool:
         parent, child = ctx.Pipe(duplex=True)
         proc: mp.Process = ctx.Process(
             target=_worker_main,
-            args=(self._entrypoint, child),
+            args=(self._entrypoint, child, self._init_args),
             daemon=True,
             name=f"arbez-{self.engine}",
         )

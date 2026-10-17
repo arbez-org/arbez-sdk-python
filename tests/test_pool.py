@@ -52,6 +52,16 @@ from arbez.engines._pool import _source_has_main_guard as source_has_main_guard
 _ENTRY = "tests.test_pool:_scripted_worker_init"
 
 
+def _init_args_worker_init(marker: str) -> Any:
+    """Load once. The marker is the only way the parent sees ``init_args``."""
+
+    def run(image: npt.NDArray[Any]) -> dict[str, str]:
+        flag = str(int(image.flat[0]) if image.size else 0)
+        return {"marker": marker, "flag": flag}
+
+    return run
+
+
 def _scripted_worker_init() -> Any:
     """Load once per worker. The image's first byte selects the behaviour.
 
@@ -1229,3 +1239,37 @@ def test_engine_close_drops_only_a_libdmtx_pool_that_gave_up() -> None:
         assert libdmtx_pool_if_any() is None
     finally:
         close_libdmtx_pool()
+
+
+def test_init_args_reach_the_worker() -> None:
+    """The child applies caller config. The entrypoint string cannot close over it."""
+    _require_process_pools()
+    pool = EnginePool(
+        "tests.test_pool:_init_args_worker_init",
+        engine="fake",
+        init_args=("qr-only",),
+    )
+    try:
+        result = pool.call(_image(0))
+        assert result.status == "ok"
+        assert result.isolation == "process"
+        assert result.value == {"marker": "qr-only", "flag": "0"}
+    finally:
+        pool.close()
+
+
+def test_init_args_reach_the_inprocess_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``ARBEZ_ISOLATION=off`` must not drop the format filter."""
+    monkeypatch.setenv("ARBEZ_ISOLATION", "off")
+    pool = EnginePool(
+        "tests.test_pool:_init_args_worker_init",
+        engine="fake",
+        init_args=("qr-only",),
+    )
+    try:
+        result = pool.call(_image(4))
+        assert result.isolation == "inprocess"
+        assert pool.fallback_reason == "ARBEZ_ISOLATION=off"
+        assert result.value == {"marker": "qr-only", "flag": "4"}
+    finally:
+        pool.close()

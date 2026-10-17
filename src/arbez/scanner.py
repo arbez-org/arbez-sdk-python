@@ -468,8 +468,10 @@ class Scanner:
     init. **Engine-level** thread-safety depends on which engine was
     picked:
 
-    * ``ZXingEngine`` — thread-safe by design (stateless C++ function
-      call). Share freely across N threads for full parallelism.
+    * ``ZXingEngine`` — safe to share (S-098). When isolation is on,
+      native reads for one instance queue on its worker. Separate
+      instances each have a worker. The in-process fallback calls
+      ``read_barcodes`` in the caller.
     * ``AppleVisionEngine`` — thread-safe (each scan builds its own
       ``VNDetectBarcodesRequest``; Apple's Vision handlers are doc'd
       safe). Share freely.
