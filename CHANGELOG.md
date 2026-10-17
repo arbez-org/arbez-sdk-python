@@ -52,6 +52,16 @@ the explicit maintainer act of tagging is the gate.
 
 ### Added
 
+* **zxing-cpp reads run in the isolation pool (S-098).** Whole-frame
+  `ZXingEngine` reads and `ArbezEngine` crop and full-image fallback
+  reads use the S-097 worker. The format filter is applied inside the
+  worker, so a narrow `formats=` set does not run the other readers. A
+  native hang is bounded by the same deadlines: 2 s on a direct call and
+  10 s on `Scanner.scan`. A crash or a deadline is an empty read recorded
+  on `Result.extras`, not raised. `ARBEZ_ISOLATION=off` and the other
+  S-097 fallbacks still run in-process, and that path keeps the format
+  filter.
+
 * **Native engine isolation (S-097).** WeChat and the libdmtx Data Matrix
   fallback run in a spawned worker, loaded once, with the image passed
   through shared memory. The parent unlinks those segments. A crash or a
@@ -93,6 +103,24 @@ the explicit maintainer act of tagging is the gate.
 
 ### Changed
 
+* **Concurrent scans on one `ZXingEngine` share one worker (S-098).**
+  The instance stays safe to share. Native reads queue when isolation is
+  on. Separate instances each have a worker. The in-process fallback
+  calls `read_barcodes` in the caller, outside the engine lock and the
+  pool lock, so `close()` can return during that read and those reads
+  can overlap. A hang on that path is unbounded.
+  `recommended_workers("zxing")` is unchanged. `ArbezEngine` crop and
+  full-image reads share one process-wide worker per zxing format set,
+  separate from any `ZXingEngine`, so a consensus scan does not queue
+  both on one deadline. The real reader always receives an explicit
+  `BarcodeFormats` set. Model 2 is the default. An empty request does
+  not call `read_barcodes`. A timeout or a crash stops the rest of that
+  detection's existing pad and full-image ladder; a real miss still
+  escalates. Colored whole-frame images are handed to zxing as BGR so
+  the numpy binding matches the previous PIL RGB read. An instance pool
+  is replaced when isolation can spawn again, same as the crop pool, so
+  an in-process pool does not stick and leave a later hang unbounded.
+
 * **QR defaults are Model 2, and symbology allow-lists apply after consensus (S-099).**
   ZXing and the arbez crop decoder request `QRCodeModel2` instead of
   the QR family bit. Micro QR is off unless `micro_qr=True` or the
@@ -114,6 +142,7 @@ the explicit maintainer act of tagging is the gate.
   flags after `close()`. Migration: pass `micro_qr=True` to keep the
   old Micro QR behaviour; pass `symbologies={"qr"}` for a QR-only
   scan instead of filtering the merged `qr` label yourself.
+
 * **Direct WeChat calls use the 2 s deadline (S-097).** `Scanner.scan`
   asks for 10 s, which covers the WeChat full-frame fallback (p95 about
   1.95 s). A direct `WeChatEngine.detect_and_decode` that exceeds 2 s
@@ -162,6 +191,11 @@ the explicit maintainer act of tagging is the gate.
   OpenCV 5.0.0.93 does not resolve against numpy 1.24.
 
 ### Security
+
+* **A zxing-cpp native hang no longer takes down the host** when the
+  isolation pool can run (S-098). The worker is killed at the deadline
+  and the next call works. The in-process fallback cannot make that
+  promise.
 
 * **A WeChat or libdmtx native crash no longer takes down the host**
   when the isolation pool can run (S-097). The worker dies instead.

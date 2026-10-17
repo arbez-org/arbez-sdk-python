@@ -45,8 +45,7 @@ def test_recommended_workers_default_arg_is_auto() -> None:
 
 
 def test_zxing_uses_full_cpu_count() -> None:
-    """ZXing releases the GIL inside ``read_barcodes``; the heuristic should hand back the full
-    logical-CPU count."""
+    """The zxing heuristic stays at the full logical-CPU count. S-098 does not retune it."""
     expected = max(1, os.cpu_count() or 1)
     assert recommended_workers("zxing") == expected
 

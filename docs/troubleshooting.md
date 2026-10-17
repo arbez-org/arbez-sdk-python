@@ -163,8 +163,11 @@ as unreadable.
 calling process. That happens for `ARBEZ_ISOLATION=off`, a daemonic
 caller, Linux with no writable `/dev/shm`, or a program started
 without an `if __name__ == "__main__"` guard. In-process mode cannot
-cancel a native hang or catch a native crash. zxing-cpp is not in
-this worker yet; a hang there still blocks the caller.
+cancel a native hang or catch a native crash. zxing-cpp uses the same
+worker and the same 2 s / 10 s deadlines. A direct
+`ZXingEngine.detect_and_decode` that hangs comes back empty.
+`ArbezEngine` crop and full-image reads do too. The next call works
+when the pool can run.
 
 ## `cuda_is_available()` returns `False` but I have a GPU
 

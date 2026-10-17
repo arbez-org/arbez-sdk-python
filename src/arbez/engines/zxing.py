@@ -30,14 +30,24 @@ from __future__ import annotations
 
 import functools
 import logging
-from collections.abc import Iterable, Mapping
+import math
+import threading
+from collections.abc import Callable, Iterable, Mapping
+from contextvars import ContextVar
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import IO, TYPE_CHECKING, Any
 
+from arbez.engines._pool import (
+    EnginePool,
+    PoolResult,
+    bind_diagnostics,
+    isolation_block_reason,
+    reset_diagnostics,
+)
 from arbez.engines.base import ThreadSafety
 from arbez.engines.helpers import coerce_to_pil
-from arbez.exceptions import EngineUnavailable
+from arbez.exceptions import EngineRuntimeError, EngineUnavailable
 from arbez.types import Detection, Symbology
 
 # Per-module logger — silent by default (no handlers attached). Users
@@ -375,6 +385,390 @@ def barcode_formats_for(
     return _z.BarcodeFormats(chosen)
 
 
+# ── Isolated reads (S-098, S-099) ──────────────────────────────────────────
+#
+# A native hang inside ``read_barcodes`` cannot be stopped from a thread.
+# Whole-frame and crop reads go through the one EnginePool. The child
+# cannot close over ``formats=``, so the S-099 BarcodeFormat member names
+# travel as init args. ``None`` is the safe default (Model 2, no Micro QR,
+# no rMQR), not an omitted ``formats=`` argument. An empty tuple is the
+# match-nothing sentinel and does not call ``read_barcodes``.
+#
+# One crop worker cannot change ``init_args`` per call, and two
+# ``ArbezEngine`` instances can request different sets. Crop pools are
+# keyed by that set. The call still goes through ``_crop_zxing_pool()``
+# with no arguments: tests replace that function, and the request for
+# the call sits in ``_crop_request``.
+#
+# The reply is plain tuples. A zxing Result is not a safe pickle, and it
+# must not keep a view of the shared-memory segment the parent unlinks.
+
+_WORKER_ENTRY = "arbez.engines.zxing:_zxing_worker_init"
+_Corner = tuple[float, float]
+_Corners = tuple[_Corner, _Corner, _Corner, _Corner]
+# text, format name, corners (TL, TR, BR, BL) or None, symbology id, ec level
+_PackedHit = tuple[str, str, _Corners | None, str | None, str | None]
+
+_crop_guard = threading.Lock()
+_crop_pools: dict[tuple[str, ...], EnginePool] = {}
+_crop_pool_last: EnginePool | None = None
+_crop_request: ContextVar[Any] = ContextVar("arbez_zxing_crop_request", default=None)
+
+
+def _member_names(formats: Any) -> tuple[str, ...]:
+    """Sorted ``BarcodeFormat`` member names for one request set."""
+    names: list[str] = []
+    for member in formats:
+        name = getattr(member, "name", None)
+        if not isinstance(name, str) or not name:
+            raise EngineRuntimeError("zxing format set has a member with no name")
+        names.append(name)
+    return tuple(sorted(names))
+
+
+def _crop_pool_key(formats: Any) -> tuple[str, ...]:
+    """Pool key for a request. ``None`` is the safe default set."""
+    if formats is None:
+        formats = barcode_formats_for(None)
+    if formats is _NO_BARCODE_FORMATS:
+        return ()
+    return _member_names(formats)
+
+
+def _format_name(fmt: Any) -> str:
+    """Worker-side format name. ``str(fmt)`` covers a member with no ``.name``."""
+    name = getattr(fmt, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    return str(fmt)
+
+
+def _pack_results(raw_results: Any) -> tuple[_PackedHit, ...]:
+    """Copy valid reads out of the worker before the parent unlinks the segment."""
+    hits: list[_PackedHit] = []
+    for raw in raw_results:
+        if not getattr(raw, "valid", False):
+            continue
+        corners: _Corners | None
+        try:
+            pos = raw.position
+            corners = (
+                (float(pos.top_left.x), float(pos.top_left.y)),
+                (float(pos.top_right.x), float(pos.top_right.y)),
+                (float(pos.bottom_right.x), float(pos.bottom_right.y)),
+                (float(pos.bottom_left.x), float(pos.bottom_left.y)),
+            )
+        except AttributeError:
+            # ArbezEngine skips a result with no position. ZXingEngine
+            # drops that hit before translate, so top_left is never read.
+            corners = None
+        sym = getattr(raw, "symbology_identifier", None)
+        ec = getattr(raw, "ec_level", None)
+        hits.append(
+            (
+                str(raw.text),
+                _format_name(raw.format),
+                corners,
+                sym if isinstance(sym, str) else None,
+                ec if isinstance(ec, str) and ec else None,
+            )
+        )
+    return tuple(hits)
+
+
+def _zxing_worker_init(
+    format_member_names: tuple[str, ...] | None = None,
+) -> Any:
+    """Load zxing-cpp once and bind the S-099 format set.
+
+    ``None`` requests the safe default via :func:`barcode_formats_for`.
+    An empty tuple is the match-nothing sentinel. Neither path calls
+    ``read_barcodes`` without an explicit set, and neither passes
+    ``BarcodeFormats([])``.
+    """
+    import zxingcpp as zxing
+
+    if format_member_names is None:
+        formats: Any = barcode_formats_for(None)
+    elif not format_member_names:
+        formats = _NO_BARCODE_FORMATS
+    else:
+        bf = zxing.BarcodeFormat
+        members = getattr(bf, "__members__", None)
+        if not isinstance(members, Mapping):
+            raise EngineRuntimeError("zxing BarcodeFormat has no member map")
+        chosen: list[Any] = []
+        for name in format_member_names:
+            if name not in members:
+                raise EngineRuntimeError("zxing worker was given an unknown format")
+            chosen.append(members[name])
+        formats = zxing.BarcodeFormats(chosen)
+
+    def run(image: Any) -> tuple[_PackedHit, ...]:
+        if formats is _NO_BARCODE_FORMATS:
+            return ()
+        return _pack_results(zxing.read_barcodes(image, formats=formats))
+
+    return run
+
+
+def _as_array(image: Any) -> Any:
+    """Array view the pool can place in shared memory."""
+    import numpy as np
+
+    return np.asarray(image)
+
+
+def _whole_frame_bgr(image: Any) -> Any:
+    """Contiguous BGR for a whole-frame read.
+
+    ``coerce_to_pil`` produces RGB, and zxing-cpp 3.1.1 labels a PIL
+    ``RGB`` image as RGB. The same binding labels an unlabeled
+    3-channel array as BGR. The pool can only send the array, so the
+    whole-frame path swaps here. Crop bytes are the arrays Arbez
+    already passed and are not swapped.
+    """
+    import numpy as np
+
+    array = np.asarray(image)
+    if array.ndim == 3 and array.shape[2] == 3:
+        return np.ascontiguousarray(array[:, :, ::-1])
+    return np.ascontiguousarray(array)
+
+
+def _parse_hit(item: object) -> _PackedHit | None:
+    """Accept one worker hit. Reject anything that is not that shape.
+
+    The worker is another process. A truncated or substituted reply must
+    not be walked as if it were a zxing Result.
+    """
+    if not isinstance(item, tuple) or len(item) != 5:
+        return None
+    text, fmt, corners, sym, ec = item
+    if not isinstance(text, str) or not isinstance(fmt, str):
+        return None
+    parsed: _Corners | None
+    if corners is None:
+        parsed = None
+    elif isinstance(corners, tuple) and len(corners) == 4:
+        points: list[_Corner] = []
+        for point in corners:
+            if (
+                not isinstance(point, tuple)
+                or len(point) != 2
+                or isinstance(point[0], bool)
+                or isinstance(point[1], bool)
+                or not isinstance(point[0], (int, float))
+                or not isinstance(point[1], (int, float))
+            ):
+                return None
+            try:
+                x = float(point[0])
+                y = float(point[1])
+            except (OverflowError, ValueError):
+                return None
+            # NaN fails the degenerate-bbox check; inf can survive it.
+            if not math.isfinite(x) or not math.isfinite(y):
+                return None
+            points.append((x, y))
+        parsed = (points[0], points[1], points[2], points[3])
+    else:
+        return None
+    return (
+        text,
+        fmt,
+        parsed,
+        sym if isinstance(sym, str) else None,
+        ec if isinstance(ec, str) and ec else None,
+    )
+
+
+def _parse_hits(value: object) -> tuple[_PackedHit, ...]:
+    """Require a tuple of hits. A bad reply is ``EngineRuntimeError``."""
+    if not isinstance(value, tuple):
+        raise EngineRuntimeError("zxing worker returned a non-tuple")
+    hits: list[_PackedHit] = []
+    for item in value:
+        hit = _parse_hit(item)
+        if hit is None:
+            raise EngineRuntimeError("zxing worker returned a malformed hit")
+        hits.append(hit)
+    return tuple(hits)
+
+
+def _barcode_format(name: str) -> Any:
+    """Map a worker format name. Anything else is a malformed hit.
+
+    ``getattr`` on ``BarcodeFormat`` also resolves ``__dict__`` and the
+    enum's private maps. Those objects are unhashable, and a membership
+    test against them raises ``TypeError`` instead of dropping the hit.
+    """
+    import zxingcpp
+
+    bf = zxingcpp.BarcodeFormat
+    members = getattr(bf, "__members__", None)
+    if not isinstance(members, Mapping) or name not in members:
+        raise EngineRuntimeError("zxing worker returned a malformed hit")
+    member = members[name]
+    if not isinstance(member, bf):
+        raise EngineRuntimeError("zxing worker returned a malformed hit")
+    return member
+
+
+def _raw_from_hit(hit: _PackedHit) -> Any:
+    """Rebuild the small surface :meth:`ZXingEngine._translate` already accepts."""
+    text, fmt_name, corners, sym, ec = hit
+    if corners is None:
+        position = None
+    else:
+        position = SimpleNamespace(
+            top_left=SimpleNamespace(x=corners[0][0], y=corners[0][1]),
+            top_right=SimpleNamespace(x=corners[1][0], y=corners[1][1]),
+            bottom_right=SimpleNamespace(x=corners[2][0], y=corners[2][1]),
+            bottom_left=SimpleNamespace(x=corners[3][0], y=corners[3][1]),
+        )
+    return SimpleNamespace(
+        valid=True,
+        text=text,
+        format=_barcode_format(fmt_name),
+        position=position,
+        symbology_identifier=sym,
+        ec_level=ec or "",
+    )
+
+
+def _is_zxingcpp_module(zxing: Any) -> bool:
+    """True only for the real ``zxingcpp`` module.
+
+    Tests and callers that pass another reader keep the in-process call.
+    The native hang is in zxing-cpp itself, not in a Python double.
+    """
+    read = getattr(zxing, "read_barcodes", None)
+    return getattr(zxing, "__name__", None) == "zxingcpp" and callable(read)
+
+
+def _crop_reusable(pool: EnginePool, mode: str | None) -> bool:
+    """Whether ``pool`` still matches the current isolation mode."""
+    if pool.closed:
+        return False
+    if pool.gave_up:
+        # A kill that did not stick stays in-process until close drops it.
+        # A process that cannot spawn at all is a different pool.
+        return mode is None
+    if mode is None:
+        return pool.isolation == "process"
+    return pool.fallback_reason == mode
+
+
+def _new_zxing_pool(format_member_names: tuple[str, ...] | None) -> EnginePool:
+    """One worker whose ``init_args`` are the S-099 format member names."""
+    return EnginePool(
+        _WORKER_ENTRY,
+        engine="zxing",
+        init_args=(format_member_names,),
+    )
+
+
+def _crop_zxing_pool() -> EnginePool:
+    """Process-wide worker for the request currently in ``_crop_request``.
+
+    One worker per format set, not one per ``ArbezEngine``: the fallback
+    is on the hot path and the decoder is stateless. ``ZXingEngine`` does
+    not use this pool. A consensus scan runs that engine beside these
+    crops, and the two must not queue on one deadline.
+
+    Zero arguments on purpose. Callers that need a specific set assign
+    ``_crop_request`` first. Tests replace this function with a zero-arg
+    lambda.
+    """
+    global _crop_pool_last
+    key = _crop_pool_key(_crop_request.get())
+    mode = isolation_block_reason()
+    with _crop_guard:
+        current = _crop_pools.get(key)
+        if current is not None and _crop_reusable(current, mode):
+            _crop_pool_last = current
+            return current
+        fresh = _new_zxing_pool(key)
+        previous = current
+        _crop_pools[key] = fresh
+        _crop_pool_last = fresh
+    if previous is not None and previous is not fresh:
+        previous.close()
+    return fresh
+
+
+def _crop_zxing_pool_if_any() -> EnginePool | None:
+    """The crop pool a real decode just used, if it is still open."""
+    with _crop_guard:
+        if _crop_pool_last is not None and not _crop_pool_last.closed:
+            return _crop_pool_last
+        for pool in _crop_pools.values():
+            if not pool.closed:
+                return pool
+        return None
+
+
+def _drop_crop_zxing_pool_if_given_up() -> None:
+    """Forget crop pools that abandoned their worker.
+
+    A live worker stays, so one ``ArbezEngine.close`` does not stop a
+    decode another engine is using. The next read can spawn again.
+    """
+    global _crop_pool_last
+    dropped: list[EnginePool] = []
+    with _crop_guard:
+        for key, pool in list(_crop_pools.items()):
+            if not pool.gave_up:
+                continue
+            dropped.append(pool)
+            del _crop_pools[key]
+            if _crop_pool_last is pool:
+                _crop_pool_last = None
+    for pool in dropped:
+        pool.close()
+
+
+def _close_crop_zxing_pool() -> None:
+    """Drop every global crop worker. Tests use this between cases."""
+    global _crop_pool_last
+    with _crop_guard:
+        pools = list(_crop_pools.values())
+        _crop_pools.clear()
+        _crop_pool_last = None
+    for pool in pools:
+        pool.close()
+
+
+class _LadderHalt(Exception):
+    """A timeout or crash stops the rest of this detection's crop stages."""
+
+
+def _isolated_hits(image: Any, formats: Any = None) -> tuple[_PackedHit, ...]:
+    """Crop or full-image read used by ``ArbezEngine``.
+
+    ``formats`` is a zxing-cpp format set or ``_NO_BARCODE_FORMATS``.
+    ``None`` uses the safe default. The match-nothing sentinel returns
+    no hits and does not call ``read_barcodes``.
+
+    A crash or a deadline raises :class:`_LadderHalt` so the remaining
+    pad and full-image stages of that detection do not run. A Python
+    error from zxing, and a worker that dies while loading, still
+    propagate. The pool does not retry those in-process.
+    """
+    if formats is _NO_BARCODE_FORMATS:
+        return ()
+    token = _crop_request.set(formats)
+    try:
+        pool = _crop_zxing_pool()
+    finally:
+        _crop_request.reset(token)
+    outcome = pool.call(_as_array(image))
+    if outcome.status != "ok":
+        raise _LadderHalt
+    return _parse_hits(outcome.value)
+
+
 # ── Engine ─────────────────────────────────────────────────────────────────
 
 
@@ -396,14 +790,17 @@ class ZXingEngine:
     ``OTHER_1D``; post-S-076 they surface as the specific
     symbology — see DECISIONS.md S-076 for the rationale.
 
-    Thread-safety (S-012)
-    ---------------------
-    Safe to share across threads with full parallelism. ``zxingcpp.
-    read_barcodes()`` is a pure C++ function call with no per-thread
-    state, ``self._formats`` is an immutable ``frozenset``, and the
-    format lookup table is built once via ``@functools.cache`` (which
-    is itself thread-safe). One ``ZXingEngine`` instance can serve any
-    number of concurrent ``detect_and_decode`` calls.
+    Thread-safety (S-012, S-098)
+    ----------------------------
+    Safe to share across threads. ``self._formats`` is an immutable
+    ``frozenset`` and the format table is built once via
+    ``@functools.cache``. When the isolation pool can run, native reads
+    for this instance share one spawned worker, so concurrent scans
+    queue on it. The in-process fallback calls ``read_barcodes`` in the
+    caller, outside this engine's lock and the pool lock, so ``close``
+    can return during that read and those reads can overlap. A hang on
+    that path is unbounded. One instance can serve any number of
+    concurrent calls; they do not corrupt each other's results.
 
     Parameters
     ----------
@@ -443,9 +840,9 @@ class ZXingEngine:
     # format instead of N times across engines. Single-engine mode
     # ignores this; the engine handles its own conversion internally.
     native_format: str = "pil_rgb"
-    # S-038: zxing-cpp's ``read_barcodes`` is a stateless C++ call that
-    # releases the GIL; one ZXingEngine instance serves any number of
-    # concurrent ``detect_and_decode`` calls.
+    # S-038 / S-098: sharing one instance is safe. Process mode queues
+    # on one worker. The in-process fallback runs outside both locks,
+    # so close() can return during that read and the reads can overlap.
     thread_safety: ThreadSafety = "shared"
 
     def __init__(
@@ -480,6 +877,16 @@ class ZXingEngine:
             micro_qr=micro_qr,
             rmqr=rmqr,
         )
+        # S-098: one worker for this instance, created on first scan.
+        # The child applies this S-099 set inside ``read_barcodes``.
+        # An empty tuple is the match-nothing sentinel. It does not
+        # mean "omit formats=" (that re-enables the QR family bit).
+        if self._barcode_formats is _NO_BARCODE_FORMATS:
+            self._format_names: tuple[str, ...] | None = ()
+        else:
+            self._format_names = _member_names(self._barcode_formats)
+        self._pool: EnginePool | None = None
+        self._lock = threading.Lock()
 
     def __repr__(self) -> str:
         fmts = "all" if self._formats is None else sorted(s.value for s in self._formats)
@@ -508,18 +915,35 @@ class ZXingEngine:
 
         _get_tables()
         prewarm_pil()
+        # An empty request must not start a worker. An empty native
+        # format set means every format, including Micro QR and rMQR.
+        if self._barcode_formats is _NO_BARCODE_FORMATS:
+            return
+        # S-098: load zxing-cpp in the worker now, so the first scan does
+        # not pay the spawn. In-process, this builds the reader here and
+        # does not call ``read_barcodes``. A pool whose isolation mode no
+        # longer matches is closed after this lock, same as a scan.
+        retired: EnginePool | None = None
+        try:
+            with self._lock:
+                pool, retired = self._checkout_pool()
+                pool.start()
+        finally:
+            if retired is not None:
+                retired.close()
 
     def close(self) -> None:
-        """Release native resources (S-042).
+        """Release the isolation worker (S-042, S-098).
 
-        ZXingEngine is essentially stateless — it has no per-instance native handles. The shared
-        ``_get_tables`` cache is module-level (``functools.cache``) and stays for the process
-        lifetime; clearing it would just force the next ZXingEngine construction to rebuild it. So
-        this is a no-op today, defined only so ``Scanner.close()`` can call it uniformly across all
-        engines.
+        The shared ``_get_tables`` cache is module-level and stays for the process lifetime.
+        ``close`` stops this instance's worker. A later ``detect_and_decode`` starts another.
+        Idempotent.
         """
-
-        # Intentional no-op; see docstring.
+        with self._lock:
+            pool = self._pool
+            self._pool = None
+        if pool is not None:
+            pool.close()
 
     def detect_and_decode(
         self,
@@ -533,28 +957,70 @@ class ZXingEngine:
         Returns a tuple of :class:`~arbez.Detection` sorted by descending score. Empty tuple if
         nothing was decoded. Score is ``1.0`` for every valid ZXing result (the library doesn't
         expose a numeric confidence); invalid results are dropped before return.
+
+        A native crash or a deadline (S-098) is also an empty tuple. ``Scanner`` records it on
+        ``Result.extras`` instead of raising. A Python error from zxing still propagates.
         """
         # ``__init__`` already probed via ``_get_tables()``; this guard
         # is defense-in-depth against sys.modules mutation mid-process,
         # matching the other engines' pattern — a scan-time miss still
         # surfaces as ``EngineUnavailable``, never a raw ImportError.
         try:
-            import zxingcpp as _z
+            import zxingcpp  # noqa: F401
         except ImportError as e:
             raise EngineUnavailable(_MISSING_ZXING_MSG) from e
 
         pil_image = coerce_to_pil(image)
+        token = bind_diagnostics(pil_image)
+        try:
+            return self._detect_bound(pil_image)
+        finally:
+            reset_diagnostics(token)
 
-        # S-099: never call read_barcodes without an explicit set.
-        # Omitting formats, or passing an empty BarcodeFormats, re-enables
-        # the QR family bit (Micro QR and rMQR included).
+    def _detect_bound(self, pil_image: Any) -> tuple[Detection, ...]:
+        # Process-mode call stays under the engine lock: the deadline
+        # bounds how long close() waits. The in-process fallback cannot
+        # be killed, so it runs outside both locks and close() can return.
+        # A replaced pool is closed after the lock and before that read,
+        # so a hang does not pin the retired worker either.
+        # S-099: an empty request is not an empty native set.
+        # That set means every format, including Micro QR and rMQR.
         if self._barcode_formats is _NO_BARCODE_FORMATS:
             return ()
-        raw_results = _z.read_barcodes(pil_image, formats=self._barcode_formats)
-
+        array = _whole_frame_bgr(pil_image)
+        retired: EnginePool | None = None
+        reader: Callable[[Any], Any] | None = None
+        outcome: PoolResult | None = None
+        pool: EnginePool | None = None
+        try:
+            with self._lock:
+                pool, retired = self._checkout_pool()
+                if pool.isolation == "inprocess":
+                    reader = pool.inprocess_reader()
+                    if reader is None:
+                        outcome = pool.call(array)
+                else:
+                    outcome = pool.call(array)
+        finally:
+            if retired is not None:
+                retired.close()
+        if reader is not None and pool is not None:
+            value = reader(array)
+            outcome = PoolResult(
+                status="ok",
+                value=value,
+                detail="",
+                isolation="inprocess",
+            )
+            pool._note(outcome)
+        if outcome is None or outcome.status != "ok":
+            return ()
+        hits = _parse_hits(outcome.value)
         detections: list[Detection] = []
-        for r in raw_results:
-            translated = self._translate(r)
+        for hit in hits:
+            if hit[2] is None:
+                continue
+            translated = self._translate(_raw_from_hit(hit))
             if translated is not None:
                 detections.append(translated)
         # Stable sort: keep ZXing's own ordering for equal scores; ours
@@ -563,12 +1029,28 @@ class ZXingEngine:
         detections.sort(key=lambda d: d.score, reverse=True)
         _log.debug(
             "ZXing scan: raw=%d kept=%d image=%dx%d",
-            len(raw_results),
+            len(hits),
             len(detections),
             pil_image.width,
             pil_image.height,
         )
         return tuple(detections)
+
+    def _checkout_pool(self) -> tuple[EnginePool, EnginePool | None]:
+        """Reuse a pool whose mode still matches. Caller holds ``self._lock``.
+
+        The second value is the previous pool when this call replaced it.
+        The caller closes that pool after releasing the lock. Nothing else
+        is inside ``call`` on it: a process read holds this lock, and an
+        in-process read has already borrowed its callable.
+        """
+        mode = isolation_block_reason()
+        pool = self._pool
+        if pool is not None and _crop_reusable(pool, mode):
+            return pool, None
+        fresh = _new_zxing_pool(self._format_names)
+        self._pool = fresh
+        return fresh, pool
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
