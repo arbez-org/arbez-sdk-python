@@ -31,7 +31,7 @@ snakeviz /tmp/arbez-scan-arbez-off.prof
 
 Profile when one of:
 
-* **A latency regression is suspected** — `Result.timings_ms` (key `"engine"` or `"consensus"`)
+* **A latency regression is suspected** — `Result.timings_ms` (`"engine"`, `"consensus"`, or `"engine.<name>"`)
   in CI runs has climbed.
 * **You're optimizing a hot path** — measure before/after with the
   same workload. Always.
@@ -63,16 +63,16 @@ Example:
 
 ```bash
 .venv/bin/python tools/profile_scan.py \
-    --engine arbez --preprocess auto --n-images 100
+    --engine arbez --n-images 100
 ```
 
 Reads top-30 hot functions to stdout, saves the full profile to
-`/tmp/arbez-scan-arbez-auto.prof`. Drop the file into snakeviz for
+`/tmp/arbez-scan-arbez-off.prof`. Drop the file into snakeviz for
 visual exploration:
 
 ```bash
 pip install snakeviz
-snakeviz /tmp/arbez-scan-arbez-auto.prof
+snakeviz /tmp/arbez-scan-arbez-off.prof
 ```
 
 **Reading the output:**
@@ -145,12 +145,19 @@ from arbez import Scanner
 s = Scanner()
 result = s.scan("photo.jpg")
 print(result.timings_ms)
-# {'consensus': 42.7}                   # bare Scanner() (all installed engines, union)
-# {'engine': 38.4}                      # for Scanner(engine="arbez")
-# {'engine': 4.2}                       # for Scanner(engine="apple_vision")
-# {'consensus': 152.1}                  # for Scanner(consensus=2) etc. (multi-engine)
-# {'engine': 38.4, 'preprocess': 6.1}   # 'preprocess' appears only with scan(..., preprocess="auto")
+# bare Scanner() (engines in parallel; per-engine times are not slices of consensus):
+# {'coerce': 3.1, 'consensus': 42.7, 'engine.arbez': 38.4, 'engine.zxing': 12.0}
+# Scanner(engine="zxing"):
+# {'coerce': 3.1, 'engine': 12.0, 'engine.zxing': 12.0}
+print(result.extras["stage_hit"])
+# ('arbez', 'zxing')  # engines that returned a non-empty payload, in engine-set order
 ```
+
+`"coerce"` is input load (decode, EXIF orientation, the pixel-limit
+check, RGB conversion). `"engine"` is only the single-engine path.
+`"consensus"` is the multi-engine wall clock, including the merge.
+`"engine.<name>"` is that engine's own `detect_and_decode`.
+`preprocess="auto"` is deprecated and does not add a timing key.
 
 Use this in your own code paths to track per-stage cost without
 running an external profiler. It's how the benchmark sections compute

@@ -114,21 +114,12 @@ schedule + macOS's malloc-reclamation timing.
 
 - **`scan(image, *, preprocess="off") -> Result`** — scan one image.
   ``preprocess`` is a keyword-only argument:
-  * `"off"` (default, **recommended**) — no manipulation; pre-v0.0.8
-    behavior preserved. Per the v0.0.33 full-corpus benchmark, `"off"`
-    produces a higher decode rate than `"auto"` on every built-in
-    engine (`arbez` +0.7 pp, `apple_vision` +0.1 pp, `zxing` +1.9 pp,
-    `wechat` +0.3 pp on a 4276-image corpus). Use this unless you
-    have a specific reason not to.
-  * `"auto"` — downscale to max 2000 px on the long axis (LANCZOS,
-    aspect-ratio preserving) + autocontrast. Detection coordinates
-    are rescaled back to the original image dimensions before
-    returning. `Result.image_size` is always the original. Adds a
-    `"preprocess"` key to `Result.timings_ms`. Available for callers
-    who specifically need the downscale (memory pressure on very
-    large images) or the autocontrast effect. **Benchmark your
-    specific corpus before turning it on** — decode rate may
-    regress.
+  * `"off"` (default) — no manipulation. The coerced image, including
+    EXIF orientation, is what the engine sees.
+  * `"auto"` — **deprecated in 0.3 (S-101), removed in 0.4.0**. Emits
+    `DeprecationWarning` and behaves as `"off"`. The old long-axis
+    downscale and autocontrast are not applied, and no `"preprocess"`
+    timing key is written. Pass `"off"` (or omit the argument).
 
   ``image`` accepts any of the following:
   * PIL.Image.Image (any mode → converted to RGB)
@@ -140,11 +131,14 @@ schedule + macOS's malloc-reclamation timing.
   * file-like binary stream (anything with `.read()` + `.seek()`)
 
   Returns a `Result` with detections sorted by descending score, the
-  input image size, the per-engine raw detections in `per_engine`, and
-  per-stage timings in `timings_ms`. Timing keys: `"engine"` (the
-  single-engine path), `"consensus"` (the multi-engine path — bare
-  `Scanner()` or `consensus=N`), `"preprocess"` (when
-  `preprocess="auto"` triggers).
+  input image size **after EXIF orientation**, the per-engine raw
+  detections in `per_engine`, per-stage timings in `timings_ms`, and
+  `extras["stage_hit"]`. Timing keys: `"coerce"` (load, EXIF, pixel
+  limit, RGB conversion), `"engine"` (the single-engine path only),
+  `"consensus"` (the multi-engine path — bare `Scanner()` or
+  `consensus=N`), and `"engine.<name>"` for each engine that ran
+  (that engine's own `detect_and_decode` time; on the parallel path
+  these are not slices of `"consensus"`).
 
 - **`warmup() -> None`** — pre-load the engine. Useful in
   latency-sensitive paths; the first `scan()` otherwise has to import
@@ -181,7 +175,9 @@ schedule + macOS's malloc-reclamation timing.
   instance; `micro_qr` / `rmqr` are not bools; or `symbologies` is a
   bare string or a single `Symbology`.
 - `InvalidInputError` — `scan(image)` couldn't coerce `image` into a
-  usable PIL image. Wraps the underlying error; chained via `__cause__`.
+  usable PIL image, or the image exceeds the decompression-bomb pixel
+  limit (89,478,485 pixels, Pillow's default `Image.MAX_IMAGE_PIXELS`).
+  Wraps the underlying error when there is one; chained via `__cause__`.
 - `EngineRuntimeError` — engine failed at scan time. In consensus
   mode, single-engine failures are isolated (logged as WARNING; that
   engine's contribution is empty); only catastrophic dispatch
@@ -259,8 +255,9 @@ for d in result.detections:
 class Result:
     detections: tuple[Detection, ...]
     image_size: tuple[int, int]
-    timings_ms: dict[str, float] = field(default_factory=dict)
     per_engine: Mapping[str, tuple[Detection, ...]] = field(default_factory=dict)
+    timings_ms: dict[str, float] = field(default_factory=dict)
+    extras: Mapping[str, object] = field(default_factory=dict)
 
     def __len__(self) -> int: ...
 ```
@@ -272,9 +269,10 @@ The full output of one `Scanner.scan()` call. Immutable.
 | Field | Type | Description |
 |---|---|---|
 | `detections` | `tuple[Detection, ...]` | The merged, **per-code** result, descending by score. On the multi-engine path each `Detection` carries `extras["voted_by"]` (the engines that agreed on that code); for bare `Scanner()` (threshold `1`) this is the full union. On the single-engine path it's that engine's detections verbatim. |
-| `image_size` | `(width, height)` int | Input image dimensions in pixels. |
-| `timings_ms` | `dict[str, float]` | Per-stage wall-clock. Keys: `"engine"` (the single-engine path), `"consensus"` (the multi-engine path — bare `Scanner()` or `consensus=N`), `"preprocess"` (when `preprocess="auto"` triggers). Read-only `MappingProxyType` view. |
+| `image_size` | `(width, height)` int | Input image dimensions in pixels, after EXIF orientation. This is the frame detection coordinates use. |
 | `per_engine` | `Mapping[str, tuple[Detection, ...]]` | Each engine's **own raw detections** — what it independently saw, before the merge — keyed by engine name. Always populated for every engine that ran (on the single-engine path, the one engine's key). Use it to see which engine contributed what, independent of the consensus merge. Read-only `MappingProxyType` view. |
+| `timings_ms` | `dict[str, float]` | Per-stage wall-clock. Keys: `"coerce"` (every scan), `"engine"` (the single-engine path), `"consensus"` (the multi-engine path — bare `Scanner()` or `consensus=N`), `"engine.<name>"` (that engine's own `detect_and_decode` time). Read-only `MappingProxyType` view. |
+| `extras` | `Mapping[str, object]` | Scan-level metadata. `"stage_hit"` is a `tuple[str, ...]` of engine names that returned a non-empty payload, in engine-set order, or `()` when nothing decoded. `None` and `""` are not hits. Read-only `MappingProxyType` view. |
 
 `len(result)` returns `len(result.detections)`.
 
@@ -658,9 +656,36 @@ Accepted input types:
 - **File-like binary stream** (anything with `.read()` + `.seek()` —
   open file handles, `io.BytesIO`, HTTP-response body adapters)
 
-Always returns RGB mode. No-op fast path: RGB PIL input passes through
-without a buffer copy. Bad inputs wrap into `InvalidInputError`; the
-original error chains via `__cause__`.
+Always returns RGB mode. No-op fast path: an RGB PIL image with no
+EXIF orientation (or orientation 1) passes through without a buffer
+copy. Any other orientation tag is applied first (orientations 2–8);
+the tag is then cleared so a second call does not rotate again. An
+already-open TIFF is oriented from a private copy of its bytes at
+the caller's current frame: Pillow applies that tag inside `load()`,
+in place, and `Image.copy()` loads. The root IFD Orientation tag
+wins; when it is absent, XMP `tiff:Orientation` is applied, the same
+source as a bytes load, and `image_size` is that oriented frame. If
+the path cannot be opened, the live file pointer is read. If the
+bytes or the current frame cannot be reread, this raises
+`InvalidInputError` instead of returning the caller's image. A
+closed TIFF raises `InvalidInputError`.
+Images whose width × height exceeds 89,478,485 pixels (Pillow's
+default `Image.MAX_IMAGE_PIXELS`, 256 MiB of 24-bit RGB) raise
+`InvalidInputError` before the pixels are decoded. The check uses
+the caller's current frame, so an oversize earlier TIFF frame is
+not returned for a later small one. WebP and ICO are judged from
+the container header before the plugin is constructed, because
+those plugins allocate or `load()` inside `Image.open`. The ICO
+size is the last embedded PNG `IHDR` before the first IDAT, fdAT,
+or IEND, which is the size Pillow decodes. An ICO whose frame size
+cannot be read, or whose chunk walk hits its cap before one of
+those, is rejected instead of opened. Pillow's own check only
+raises above twice
+that, and setting `Image.MAX_IMAGE_PIXELS = None` does not disable
+this one. When Pillow's check does raise, the message quotes the
+limit Pillow used.
+Bad inputs wrap into `InvalidInputError`; the original error chains
+via `__cause__` when there is one.
 
 HEIC / AVIF support is opt-in via extras (`pillow-heif` /
 `pillow-avif-plugin`). The plugins are registered with Pillow on the
@@ -908,9 +933,12 @@ Not raised for "found nothing" — that's an empty tuple from
 
 Raised by `coerce_to_pil` (and transitively by `Scanner.scan` /
 engine `detect_and_decode`) when an input can't be coerced to a
-usable PIL image. Wraps the underlying error (`FileNotFoundError`,
-`PIL.UnidentifiedImageError`, `AttributeError`, `TypeError`,
-`ValueError`) — original chained via `__cause__`.
+usable PIL image, including a pixel count over the decompression-bomb
+limit. Wraps the underlying error (`FileNotFoundError`,
+`PIL.UnidentifiedImageError`, `PIL.DecompressionBombError`,
+`AttributeError`, `TypeError`, `ValueError`) when there is one —
+original chained via `__cause__`. The pixel-limit error raised from
+the header has no `__cause__`.
 
 Double-inherits from `ValueError` so existing
 `try: ... except ValueError:` callers keep working.
