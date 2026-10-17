@@ -67,13 +67,13 @@ Detection. Every rule is deterministic given the cluster contents.
 |---|---|
 | `bbox_xyxy` | per-coordinate **median** across cluster members. `(median(x1), median(y1), median(x2), median(y2))`. Robust against one engine reporting a slightly off bbox. |
 | `score` | arithmetic **mean** of cluster members' scores. |
-| `symbology` | Most common symbology across cluster members. **Tie at the top count → among the members whose symbology sits at the top count, the highest-scored member's symbology wins; any remaining tie breaks stably on the symbology's string value.** |
-| `payload` | If any non-None payloads exist in the cluster: most common non-None payload. **Tie at the top count → the highest-scored member's payload wins if it sits at the top count; otherwise the highest-scored member whose payload sits at the top count wins (the S-077 deterministic pick).** If no non-None payloads: `None`. |
+| `symbology` | When a payload is present: the winning decoder's symbology (same selection as `payload`, S-099). Otherwise the most common symbology. **Tie at the top count → among the members whose symbology sits at the top count, the highest-scored member's symbology wins; any remaining tie breaks stably on the symbology's string value.** |
+| `payload` | If any canonical payloads exist: the most common one. **Among decoded members at that top count, the highest score wins, then the symbology value, then the canonical string (S-077 / S-099).** Equal scores do not follow group order. If nothing decoded: `None`. |
 | `polygon` | The highest-scored member's polygon. Medians don't generalize cleanly to rotated quads. |
 | `engine` | Hardcoded literal string `"consensus"`. |
 | `extras.voted_by` | Sorted tuple of unique engine names that contributed. |
 | `extras.vote_count` | Count of unique engine names (= `len(voted_by)`). |
-| `extras.agreed_payloads` | Sorted tuple of distinct non-None payloads observed in the cluster. Lets callers see when engines decoded the same crop differently. |
+| `extras.agreed_payloads` | Sorted tuple of distinct non-None payloads observed in the cluster. When an allow-list is set, strings from members outside that list are omitted (S-099). `per_engine` is not filtered. |
 | `extras.source_count` | Total detections in the cluster. May exceed `vote_count` if an engine emitted multiple overlapping detections that all landed in the same cluster. |
 
 ## Worked examples
@@ -140,12 +140,12 @@ The highest-score detection wins the payload tiebreak. The other
 engine's payload is preserved in `agreed_payloads` so downstream
 code can audit the disagreement.
 
-**Edge case (rare):** if both engines' scores are exactly equal
-(say both 0.93), `best_det` resolves to whichever detection
-appeared first in the post-S2 tagged list — which depends on the
-order `as_completed` returned the engines' futures (Stage 1) →
-**non-deterministic across runs**. See "Non-determinism sources"
-below.
+**Equal scores:** the winning payload is the member at the top
+canonical count with the highest score, then the greater symbology
+value, then the canonical string. It does not follow
+`as_completed` order (S-099). The polygon still comes from the
+first highest-scored member, which can flip. See "Non-determinism
+sources" below.
 
 ### Example 3 — `min_votes=2`, but only one engine detected this code
 
@@ -201,8 +201,9 @@ Where: Stage 2 sort is stable. Ties in score preserve the input
 
 Effect: which detection becomes a cluster's seed can flip across
         runs. The cluster MEMBERS are identical (greedy clustering
-        is symmetric over overlapping bboxes), but bbox medians +
-        the score-driven payload tiebreak can flip.
+        is symmetric over overlapping bboxes). The polygon still
+        comes from the first highest-scored member, so it can flip.
+        Payload and the published symbology do not (S-099).
 
 When does this bite: only when two detections from different engines
         have BIT-IDENTICAL scores. Real model confidences are
@@ -218,16 +219,18 @@ Earlier releases resolved symbology / payload count ties via
 `Counter.most_common`'s first-encountered pick, which inherited
 N1's ordering. Both rules now resolve count ties by score instead:
 
-- **payload** — the S-077 deterministic pick: the highest-scored
-  member whose payload sits at the top count wins.
-- **symbology** — among the members whose symbology sits at the top
-  count, the highest-scored member's symbology wins, with a final
-  stable tiebreak on the symbology's string value.
+- **payload** — among decoded members whose canonical payload sits
+  at the top count, the highest score wins, then the symbology
+  value, then the canonical string (S-077 / S-099). Bit-identical
+  scores no longer follow N1.
+- **symbology** — the winning decoder's symbology when a payload is
+  present. Otherwise, among the members whose symbology sits at the
+  top count, the highest-scored member's symbology wins, with a
+  final stable tiebreak on the symbology's string value.
 
-Given distinct scores, both picks are fully deterministic. The
-symbology rule's value-based final tiebreak is deterministic even
-under tied scores; the payload pick under bit-identical scores
-reduces to N1.
+Both picks are deterministic under tied scores. N1 still affects
+which member supplies the polygon, and which detection seeds a
+cluster.
 
 ## Determinism guarantees (independent of N1)
 
@@ -235,13 +238,13 @@ reduces to N1.
 - `vote_count`, `source_count`, `voted_by`, `agreed_payloads`: deterministic.
 - `bbox_xyxy` medians: deterministic (median is order-independent).
 - `score` mean: deterministic.
-- `symbology`: deterministic — count ties resolve by score, then
-  stably by the symbology's string value.
+- `symbology`: deterministic — the winning decoder when a payload is present; otherwise count ties resolve by score, then by the symbology's string value.
+- `payload`: deterministic under tied scores — symbology value, then the canonical string.
 
 The non-determinism only affects:
 
 - `bbox_xyxy` when N1 swaps which detections seed clusters (and so the median's input set changes).
-- `payload` when N1 produces bit-identical scores among the members whose payload sits at the top count (the S-077 pick is score-driven).
+- `polygon`, which still comes from the first highest-scored member.
 
 ## See also
 
