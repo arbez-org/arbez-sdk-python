@@ -361,6 +361,9 @@ with ThreadPoolExecutor(max_workers=recommended_workers(scanner.engine_name)) as
 count: `cpu_count()` for ZXing. That number is unchanged. One shared
 `ZXingEngine` queues native reads on a single worker when isolation is
 on; give each thread its own engine when those scans must overlap.
+The in-process fallback calls `read_barcodes` in the caller, outside
+the engine lock and the pool lock. Those reads can overlap, and a hang
+on that path is unbounded.
 `min(cpu_count, 8)` for Apple Vision on Apple Silicon
 (`min(cpu_count, 16)` on Ultra chips), and half the CPUs (floored
 at 2, capped at 8) for `arbez`. See

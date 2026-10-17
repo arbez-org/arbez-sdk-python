@@ -170,7 +170,14 @@ not raised.
 full-image reads share one process-wide worker, so a consensus scan
 does not queue both on the same deadline. Concurrent calls on one
 `ZXingEngine` are safe and queue on that worker when isolation is on.
-Separate instances each have a worker.
+Separate instances each have a worker. The in-process fallback calls
+`read_barcodes` in the caller, outside the engine lock and the pool
+lock, so `close()` can return during that read. Those reads can
+overlap, and a hang on that path is unbounded. A timeout or a crash
+on an `ArbezEngine` crop stops the remaining pad and full-image
+stages for that detection. A read with no code still escalates.
+Whole-frame RGB is sent as BGR, because the numpy binding treats an
+unlabeled 3-channel array as BGR. Crop arrays stay as they were.
 
 The pool runs in the calling process when `ARBEZ_ISOLATION=off`, when
 the caller is a daemon, when Linux cannot write `/dev/shm`, or when
@@ -511,7 +518,7 @@ depends on which engine got picked:
 
 | Engine | Shared instance | Parallelism | Why |
 |---|:-:|:-:|---|
-| `ZXingEngine` | safe | **queued** | One spawned worker per instance when isolation is on (S-098). Concurrent scans on that instance queue. The in-process fallback still calls `read_barcodes` in the caller. Separate instances each have a worker. |
+| `ZXingEngine` | safe | **queued** | One spawned worker per instance when isolation is on (S-098). Concurrent scans on that instance queue. The in-process fallback calls `read_barcodes` in the caller, outside the engine lock and the pool lock, so `close()` can return during that read. Those reads can overlap, and a hang on that path is unbounded. Separate instances each have a worker. |
 | `AppleVisionEngine` | safe | **full** | Each scan builds a fresh `VNDetectBarcodesRequest` + `VNImageRequestHandler`. Apple's Vision is doc'd thread-safe at the handler level. |
 | `WeChatEngine` | safe | **serialized** | OpenCV's WeChat detector is thread-unsafe; we serialize calls on a shared instance with a per-instance `threading.Lock`. Concurrent scans queue up — no crashes, no parallelism. |
 

@@ -1273,3 +1273,31 @@ def test_init_args_reach_the_inprocess_fallback(monkeypatch: pytest.MonkeyPatch)
         assert result.value == {"marker": "qr-only", "flag": "4"}
     finally:
         pool.close()
+
+
+def test_inprocess_factory_ignores_init_args(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A zero-arg factory wins over the entrypoint. ``init_args`` are not passed to it."""
+    from collections.abc import Callable
+
+    monkeypatch.setenv("ARBEZ_ISOLATION", "off")
+
+    def factory() -> Callable[[Any], Any]:
+        def run(image: Any) -> str:
+            del image
+            return "from-factory"
+
+        return run
+
+    pool = EnginePool(
+        "tests.test_pool:_init_args_worker_init",
+        engine="fake",
+        inprocess_factory=factory,
+        init_args=("qr-only",),
+    )
+    try:
+        result = pool.call(_image(0))
+        assert result.status == "ok"
+        assert result.isolation == "inprocess"
+        assert result.value == "from-factory"
+    finally:
+        pool.close()

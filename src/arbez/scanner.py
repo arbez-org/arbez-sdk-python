@@ -471,7 +471,9 @@ class Scanner:
     * ``ZXingEngine`` — safe to share (S-098). When isolation is on,
       native reads for one instance queue on its worker. Separate
       instances each have a worker. The in-process fallback calls
-      ``read_barcodes`` in the caller.
+      ``read_barcodes`` in the caller, outside the engine lock and
+      the pool lock, so ``close`` can return during that read.
+      Those reads can overlap, and a hang on that path is unbounded.
     * ``AppleVisionEngine`` — thread-safe (each scan builds its own
       ``VNDetectBarcodesRequest``; Apple's Vision handlers are doc'd
       safe). Share freely.

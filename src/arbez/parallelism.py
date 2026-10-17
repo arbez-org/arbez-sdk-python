@@ -37,8 +37,10 @@ in S-012:
                      (S-098). One shared engine queues native reads
                      on its worker when isolation is on. Separate
                      instances each have a worker. The in-process
-                     fallback still calls ``read_barcodes`` in the
-                     caller.
+                     fallback calls ``read_barcodes`` in the caller,
+                     outside the engine lock and the pool lock.
+                     Those reads can overlap, and a hang there is
+                     unbounded.
 * ``wechat``       — ``min(8, max(2, physical_cores * 3 // 4))``
                      (S-020). Heavy detector (~80 MB per instance);
                      bottleneck is memory bandwidth, not cv2 OpenMP
@@ -260,7 +262,10 @@ def recommended_workers(engine: str = "auto") -> int:
                          One shared engine queues native reads on its
                          worker when isolation is on. Separate
                          instances each have a worker. The in-process
-                         fallback still calls ``read_barcodes``.
+                         fallback calls ``read_barcodes`` in the
+                         caller, outside the engine lock and the pool
+                         lock. Those reads can overlap, and a hang
+                         there is unbounded.
     * ``wechat``       — ``min(8, max(2, physical_cores * 3 // 4))``
                          (S-020 refined). Heavy detector (~80 MB);
                          empirical sweet-spot at 6 workers on M1.

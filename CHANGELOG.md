@@ -106,13 +106,21 @@ the explicit maintainer act of tagging is the gate.
 * **Concurrent scans on one `ZXingEngine` share one worker (S-098).**
   The instance stays safe to share. Native reads queue when isolation is
   on. Separate instances each have a worker. The in-process fallback
-  still calls `read_barcodes` in the caller, and the pool lock serializes
-  those calls too. `recommended_workers("zxing")` is unchanged.
-  `ArbezEngine` crop and full-image reads share one process-wide worker,
+  calls `read_barcodes` in the caller, outside the engine lock and the
+  pool lock, so `close()` can return during that read and those reads
+  can overlap. A hang on that path is unbounded.
+  `recommended_workers("zxing")` is unchanged. `ArbezEngine` crop and
+  full-image reads share one process-wide worker per zxing format set,
   separate from any `ZXingEngine`, so a consensus scan does not queue
   both on one deadline. The real reader always receives an explicit
   `BarcodeFormats` set. Model 2 is the default. An empty request does
-  not call `read_barcodes`.
+  not call `read_barcodes`. A timeout or a crash stops the rest of that
+  detection's existing pad and full-image ladder; a real miss still
+  escalates. Colored whole-frame images are handed to zxing as BGR so
+  the numpy binding matches the previous PIL RGB read. An instance pool
+  is replaced when isolation can spawn again, same as the crop pool, so
+  an in-process pool does not stick and leave a later hang unbounded.
+
 * **QR defaults are Model 2, and symbology allow-lists apply after consensus (S-099).**
   ZXing and the arbez crop decoder request `QRCodeModel2` instead of
   the QR family bit. Micro QR is off unless `micro_qr=True` or the
@@ -134,6 +142,7 @@ the explicit maintainer act of tagging is the gate.
   flags after `close()`. Migration: pass `micro_qr=True` to keep the
   old Micro QR behaviour; pass `symbologies={"qr"}` for a QR-only
   scan instead of filtering the merged `qr` label yourself.
+
 * **Direct WeChat calls use the 2 s deadline (S-097).** `Scanner.scan`
   asks for 10 s, which covers the WeChat full-frame fallback (p95 about
   1.95 s). A direct `WeChatEngine.detect_and_decode` that exceeds 2 s

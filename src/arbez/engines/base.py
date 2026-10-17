@@ -108,7 +108,8 @@ class Engine(Protocol):
       use this to pre-convert once across engines.
     * ``thread_safety : ThreadSafety`` — ``"shared"`` (default) or
       ``"per-thread"`` (S-038). Tells callers whether one instance
-      can serve many threads (Apple Vision / ZXing / Arbez) or each
+      can serve many threads (Apple Vision / Arbez; ZXing shares
+      safely, and process-mode reads queue on one worker) or each
       thread should get its own for real parallelism (WeChat —
       sharing is safe but serialized by an internal lock).
     """

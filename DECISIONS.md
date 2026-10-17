@@ -28,10 +28,13 @@ not keep a view of the shared-memory segment the parent unlinks.
 
 **Decision.** Both call sites use the existing `EnginePool`. No second
 pool class, and no `fork`. `ZXingEngine` has one pool per instance. The
-format filter travels as `init_args` (symbology names) and the child
-passes `BarcodeFormats` into `read_barcodes`. `ArbezEngine` crop and
-full-image reads share one process-wide all-formats pool, separate from
-any `ZXingEngine`, so a consensus scan does not queue both on one
+format filter travels as `init_args` (zxing `BarcodeFormat` member
+names from the S-099 request, including `QRCodeModel2` and an
+opted-in `RMQRCode`). The child always passes that set into
+`read_barcodes`. `None` is the safe default, not an omitted
+`formats=` argument. `ArbezEngine` crop and full-image reads share
+one process-wide pool per request set, separate from any
+`ZXingEngine`, so a consensus scan does not queue both on one
 deadline. The child copies each valid read into a tuple (text, format
 name, four corners, symbology id, EC level) before the parent unlinks
 the segment. The parent checks that shape and rebuilds the small object
@@ -66,9 +69,18 @@ the bound this change needs; a lane is a second pool shape.
 comes back empty at 2 s. The same frame through `Scanner.scan` gets
 10 s. Concurrent scans on one `ZXingEngine` stay safe and queue on that
 worker when isolation is on. Separate instances each have a worker.
-`ArbezEngine` crops share one worker. The in-process fallback cannot
-promise to stop a hang. The paired decode difference and the overhead
-gate are measured later, not in this change.
+`ArbezEngine` crops share one worker per request set. The in-process fallback cannot
+promise to stop a hang. In-process reads run outside the engine lock
+and the pool lock, so `close()` is not stuck behind that read and those
+reads can overlap. Whole-frame RGB is channel-swapped to BGR before the
+pool, because the numpy binding assumes BGR. Crops are not swapped. An
+instance pool is replaced when `isolation_block_reason()` no longer
+matches, same as the crop pool, and the previous pool is closed after
+the engine lock is released. A timeout or a crash stops the rest of
+that detection's existing pad and full-image ladder. A real miss still
+escalates. The failure-only ladder is still not part of this change.
+The paired decode difference and the overhead gate are measured later,
+not in this change.
 
 ---
 

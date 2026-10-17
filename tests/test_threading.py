@@ -96,7 +96,7 @@ def test_scanner_get_engine_concurrent_lazy_load_no_crash(qr_image: PILImage) ->
     )
 
 
-# ── ZXingEngine: shared instance, full parallelism ────────────────────────
+# ── ZXingEngine: shared instance stays correct when calls queue ───────────
 
 
 def test_zxing_engine_concurrent_share_no_crash(qr_image: PILImage, qr_payload: str) -> None:
@@ -110,10 +110,10 @@ def test_zxing_engine_concurrent_share_no_crash(qr_image: PILImage, qr_payload: 
 
 
 def test_zxing_engine_concurrent_share_actually_overlaps(qr_image: PILImage) -> None:
-    """Wall-clock check: 32 ZXing scans across 8 threads must finish sooner than 32 serial scans.
+    """32 scans on one shared engine stay within 3x the serial run.
 
-    If the GIL or some hidden global mutex is serializing us, we'll fail here with parallel ~=
-    serial.
+    Process mode queues on one worker, so parallel time near serial time
+    is expected. The bar is that the queued run stays within 3x.
     """
     engine = ZXingEngine()
 
@@ -123,7 +123,7 @@ def test_zxing_engine_concurrent_share_actually_overlaps(qr_image: PILImage) -> 
         engine.detect_and_decode(qr_image)
     serial_s = time.perf_counter() - t0
 
-    # Parallel run.
+    # Parallel run. One worker queues these when isolation is on.
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=8) as ex:
         futures = [ex.submit(engine.detect_and_decode, qr_image) for _ in range(32)]
@@ -131,28 +131,19 @@ def test_zxing_engine_concurrent_share_actually_overlaps(qr_image: PILImage) -> 
             f.result()
     parallel_s = time.perf_counter() - t0
 
-    # Soft assertion: zxing-cpp releases the GIL inside ``read_barcodes``,
-    # so 32 scans across 8 threads should NOT be wildly slower than
-    # serial. The bar isn't "parallel must be faster" — per-scan time is
-    # so short (~6 ms) that scheduler + ThreadPoolExecutor overhead can
-    # dominate on noisy CI runners, especially Windows. Documented flakes:
+    # Queueing makes parallel about the same as serial. Per-scan time is
+    # short, and scheduler noise on CI can push the ratio around.
+    # Documented flakes:
     # - 2026-05 CI: py3.14 windows-latest, ratio 1.24x, runner under load
     # - 2026-05 CI: py3.13 windows-latest, similar noise
     #
-    # The bar IS "parallel doesn't take 5x+ serial" — that would only
-    # happen if some hidden global mutex was serializing zxing scans
-    # (GIL or a per-process zxing lock), which is the regression we
-    # really care about catching. 3x is loose enough for CI noise but
-    # still flags a true GIL-blocking regression by a wide margin
-    # (genuine serialization at 8 threads would give ~8x).
+    # 3x leaves room for that noise. A multi-fold slowdown still fails.
     MAX_RATIO = 3.0
     ratio = parallel_s / max(serial_s, 0.001)
     assert ratio <= MAX_RATIO, (
-        f"ZXing scans didn't parallelize "
+        f"ZXing scans on one shared engine exceeded {MAX_RATIO}x "
         f"(parallel={parallel_s*1000:.1f}ms is {ratio:.2f}x serial="
-        f"{serial_s*1000:.1f}ms, > {MAX_RATIO}x threshold). "
-        f"This suggests the GIL is NOT being released inside "
-        f"zxing-cpp.read_barcodes — true regression."
+        f"{serial_s*1000:.1f}ms)."
     )
 
 
