@@ -29,7 +29,13 @@ import qrcode
 from PIL import Image
 
 from arbez import Scanner, Symbology
-from arbez.consensus import _aggregate_group, _iou, run_consensus
+from arbez.consensus import (
+    _aggregate_group,
+    _iou,
+    run_consensus,
+    run_consensus_detailed,
+)
+from arbez.engines.base import Engine
 from arbez.parallelism import installed_consensus_engines
 from arbez.types import Detection
 
@@ -50,7 +56,8 @@ def qr_image_640() -> Image.Image:
     qr.add_data("https://arbez.org/consensus-fixture")
     qr.make(fit=True)
     img: Image.Image = qr.make_image(
-        fill_color="black", back_color="white",
+        fill_color="black",
+        back_color="white",
     ).convert("RGB")
     return img.resize((640, 640), Image.Resampling.LANCZOS)
 
@@ -94,8 +101,8 @@ def test_iou_disjoint_bboxes() -> None:
 
 def test_iou_one_contains_other() -> None:
     """When B is fully inside A, IoU = area(B) / area(A)."""
-    a = (0.0, 0.0, 100.0, 100.0)   # 10000
-    b = (25.0, 25.0, 75.0, 75.0)   # 2500
+    a = (0.0, 0.0, 100.0, 100.0)  # 10000
+    b = (25.0, 25.0, 75.0, 75.0)  # 2500
     assert _iou(a, b) == pytest.approx(0.25)
 
 
@@ -123,9 +130,9 @@ def test_aggregate_group_bbox_is_per_corner_median() -> None:
     Robust to one engine reporting an outlier box.
     """
     group = [
-        ("zxing",        _make_det((100.0, 200.0, 300.0, 400.0))),
+        ("zxing", _make_det((100.0, 200.0, 300.0, 400.0))),
         ("apple_vision", _make_det((110.0, 210.0, 310.0, 410.0))),
-        ("wechat",       _make_det((200.0, 300.0, 350.0, 450.0))),  # outlier
+        ("wechat", _make_det((200.0, 300.0, 350.0, 450.0))),  # outlier
     ]
     out = _aggregate_group(group)
     # Medians: x1 in (100, 110, 200) -> 110; same logic for others
@@ -141,9 +148,9 @@ def test_aggregate_group_payload_majority_vote() -> None:
     Tie -> highest-score's payload.
     """
     group = [
-        ("zxing",        _make_det((0.0, 0.0, 100.0, 100.0), payload="foo", score=0.9)),
+        ("zxing", _make_det((0.0, 0.0, 100.0, 100.0), payload="foo", score=0.9)),
         ("apple_vision", _make_det((0.0, 0.0, 100.0, 100.0), payload="foo", score=0.8)),
-        ("wechat",       _make_det((0.0, 0.0, 100.0, 100.0), payload="bar", score=0.7)),
+        ("wechat", _make_det((0.0, 0.0, 100.0, 100.0), payload="bar", score=0.7)),
     ]
     out = _aggregate_group(group)
     assert out.payload == "foo"
@@ -152,7 +159,7 @@ def test_aggregate_group_payload_majority_vote() -> None:
 def test_aggregate_group_payload_none_when_all_undecoded() -> None:
     """If no engine decoded a payload, the consensus payload is None."""
     group = [
-        ("zxing",        _make_det((0.0, 0.0, 100.0, 100.0), payload=None)),
+        ("zxing", _make_det((0.0, 0.0, 100.0, 100.0), payload=None)),
         ("apple_vision", _make_det((0.0, 0.0, 100.0, 100.0), payload=None)),
     ]
     out = _aggregate_group(group)
@@ -186,7 +193,7 @@ def test_aggregate_group_engine_field_is_consensus() -> None:
 def test_aggregate_group_score_is_mean() -> None:
     """Consensus score = mean of group scores."""
     group = [
-        ("zxing",        _make_det((0.0, 0.0, 100.0, 100.0), score=0.9)),
+        ("zxing", _make_det((0.0, 0.0, 100.0, 100.0), score=0.9)),
         ("apple_vision", _make_det((0.0, 0.0, 100.0, 100.0), score=0.7)),
     ]
     out = _aggregate_group(group)
@@ -210,14 +217,13 @@ def test_aggregate_group_payload_tiebreak_uses_highest_score_decoder() -> None:
     non-None payload).
     """
     group = [
-        ("arbez",   _make_det((0.0, 0.0, 100.0, 100.0), score=0.9, payload=None)),
-        ("zxing",   _make_det((0.0, 0.0, 100.0, 100.0), score=0.7, payload="X")),
-        ("wechat",  _make_det((0.0, 0.0, 100.0, 100.0), score=0.65, payload="Y")),
+        ("arbez", _make_det((0.0, 0.0, 100.0, 100.0), score=0.9, payload=None)),
+        ("zxing", _make_det((0.0, 0.0, 100.0, 100.0), score=0.7, payload="X")),
+        ("wechat", _make_det((0.0, 0.0, 100.0, 100.0), score=0.65, payload="Y")),
     ]
     out = _aggregate_group(group)
     assert out.payload == "X", (
-        f"Expected highest-scored non-None payload 'X' (score=0.7); "
-        f"got {out.payload!r}"
+        f"Expected highest-scored non-None payload 'X' (score=0.7); got {out.payload!r}"
     )
 
 
@@ -227,10 +233,8 @@ def test_aggregate_group_symbology_tiebreak_to_highest_score() -> None:
     from arbez import Symbology
 
     group = [
-        ("arbez", _make_det((0.0, 0.0, 100.0, 100.0), score=0.9,
-                            symbology=Symbology.MICRO_QR)),
-        ("zxing", _make_det((0.0, 0.0, 100.0, 100.0), score=0.7,
-                            symbology=Symbology.QR)),
+        ("arbez", _make_det((0.0, 0.0, 100.0, 100.0), score=0.9, symbology=Symbology.MICRO_QR)),
+        ("zxing", _make_det((0.0, 0.0, 100.0, 100.0), score=0.7, symbology=Symbology.QR)),
     ]
     out = _aggregate_group(group)
     # Each symbology has count 1 → tied at top. best_det is the arbez
@@ -258,10 +262,16 @@ def _agreed(out: Detection) -> tuple[str, ...]:
 def test_aggregate_gs1_ai_framing_merged() -> None:
     """GS1 (01)-AI+check form and the bare 13-digit GTIN canonicalize equal."""
     group = [
-        ("zxing", _make_det(_BOX, symbology=Symbology.GS1_DATABAR,
-                            payload="(01)76075587716395", score=0.8)),
-        ("apple_vision", _make_det(_BOX, symbology=Symbology.GS1_DATABAR,
-                                   payload="7607558771639", score=0.7)),
+        (
+            "zxing",
+            _make_det(
+                _BOX, symbology=Symbology.GS1_DATABAR, payload="(01)76075587716395", score=0.8
+            ),
+        ),
+        (
+            "apple_vision",
+            _make_det(_BOX, symbology=Symbology.GS1_DATABAR, payload="7607558771639", score=0.7),
+        ),
     ]
     out = _aggregate_group(group)
     # zxing wins on score; its RAW string is preserved (not canonicalized).
@@ -272,10 +282,11 @@ def test_aggregate_gs1_ai_framing_merged() -> None:
 def test_aggregate_upc_a_leading_zero_merged() -> None:
     """UPC-A with an EAN-13 leading zero canonicalizes to the 12-digit form."""
     group = [
-        ("apple_vision", _make_det(_BOX, symbology=Symbology.UPC_A,
-                                   payload="0236153819774", score=0.9)),
-        ("zxing", _make_det(_BOX, symbology=Symbology.UPC_A,
-                            payload="236153819774", score=0.8)),
+        (
+            "apple_vision",
+            _make_det(_BOX, symbology=Symbology.UPC_A, payload="0236153819774", score=0.9),
+        ),
+        ("zxing", _make_det(_BOX, symbology=Symbology.UPC_A, payload="236153819774", score=0.8)),
     ]
     out = _aggregate_group(group)
     assert out.payload == "0236153819774"
@@ -285,10 +296,8 @@ def test_aggregate_upc_a_leading_zero_merged() -> None:
 def test_aggregate_upc_e_compressed_and_expanded_merged() -> None:
     """Compressed UPC-E and the expanded 12-digit UPC-A share the 11-digit key."""
     group = [
-        ("apple_vision", _make_det(_BOX, symbology=Symbology.UPC_E,
-                                   payload="0461580", score=0.9)),
-        ("zxing", _make_det(_BOX, symbology=Symbology.UPC_E,
-                            payload="046000001586", score=0.8)),
+        ("apple_vision", _make_det(_BOX, symbology=Symbology.UPC_E, payload="0461580", score=0.9)),
+        ("zxing", _make_det(_BOX, symbology=Symbology.UPC_E, payload="046000001586", score=0.8)),
     ]
     out = _aggregate_group(group)
     assert len(_agreed(out)) == 1
@@ -298,10 +307,8 @@ def test_aggregate_upc_e_compressed_and_expanded_merged() -> None:
 def test_aggregate_code39_fullascii_vs_standard_merged() -> None:
     """Code-39 Full-ASCII ctrl char and its standard '$Q' shift pair merge."""
     group = [
-        ("apple_vision", _make_det(_BOX, symbology=Symbology.CODE_39,
-                                   payload=chr(17), score=0.9)),
-        ("zxing", _make_det(_BOX, symbology=Symbology.CODE_39,
-                            payload="$Q", score=0.8)),
+        ("apple_vision", _make_det(_BOX, symbology=Symbology.CODE_39, payload=chr(17), score=0.9)),
+        ("zxing", _make_det(_BOX, symbology=Symbology.CODE_39, payload="$Q", score=0.8)),
     ]
     out = _aggregate_group(group)
     assert len(_agreed(out)) == 1
@@ -312,10 +319,16 @@ def test_aggregate_agreed_payloads_raw_representative() -> None:
     """The single agreed_payloads entry is a RAW form an engine emitted --
     specifically the highest-scored member's raw string."""
     group = [
-        ("zxing", _make_det(_BOX, symbology=Symbology.GS1_DATABAR,
-                            payload="(01)76075587716395", score=0.8)),
-        ("apple_vision", _make_det(_BOX, symbology=Symbology.GS1_DATABAR,
-                                   payload="7607558771639", score=0.7)),
+        (
+            "zxing",
+            _make_det(
+                _BOX, symbology=Symbology.GS1_DATABAR, payload="(01)76075587716395", score=0.8
+            ),
+        ),
+        (
+            "apple_vision",
+            _make_det(_BOX, symbology=Symbology.GS1_DATABAR, payload="7607558771639", score=0.7),
+        ),
     ]
     out = _aggregate_group(group)
     agreed = out.extras["agreed_payloads"]
@@ -327,10 +340,11 @@ def test_aggregate_agreed_payloads_raw_representative() -> None:
 def test_aggregate_genuinely_different_still_split() -> None:
     """Two truly different QR payloads must NOT be falsely merged."""
     group = [
-        ("zxing", _make_det(_BOX, symbology=Symbology.QR,
-                            payload="https://a.com", score=0.9)),
-        ("apple_vision", _make_det(_BOX, symbology=Symbology.QR,
-                                   payload="https://b.com", score=0.8)),
+        ("zxing", _make_det(_BOX, symbology=Symbology.QR, payload="https://a.com", score=0.9)),
+        (
+            "apple_vision",
+            _make_det(_BOX, symbology=Symbology.QR, payload="https://b.com", score=0.8),
+        ),
     ]
     out = _aggregate_group(group)
     assert len(_agreed(out)) == 2
@@ -366,12 +380,14 @@ def test_run_consensus_single_engine_short_circuits_no_threadpool() -> None:
         native_format = "pil_rgb"
 
         def detect_and_decode(self, _img: object) -> tuple[Detection, ...]:
-            return (Detection(
-                bbox_xyxy=(0.0, 0.0, 50.0, 50.0),
-                symbology=Symbology.QR,
-                score=0.8,
-                payload="solo",
-            ),)
+            return (
+                Detection(
+                    bbox_xyxy=(0.0, 0.0, 50.0, 50.0),
+                    symbology=Symbology.QR,
+                    score=0.8,
+                    payload="solo",
+                ),
+            )
 
     # min_votes=1 since a 1-engine "vote" can only have 1 voter.
     out = run_consensus(img, {"stub": _StubEngine()}, min_votes=1, iou_threshold=0.5)
@@ -414,7 +430,6 @@ def test_run_consensus_dispatches_same_pil_image_object_to_all_engines() -> None
     # narrow concrete-class value type would otherwise reject at the
     # run_consensus call site. The Engine Protocol is structural;
     # _RecordingEngine satisfies it via name + detect_and_decode.
-    from arbez.engines.base import Engine
     engines: dict[str, Engine] = {f"eng{i}": _RecordingEngine(f"eng{i}") for i in range(3)}
     run_consensus(img, engines, min_votes=1, iou_threshold=0.5)
     assert len(received_images) == 3
@@ -447,7 +462,10 @@ def test_run_consensus_iou_out_of_range_raises() -> None:
     img = Image.new("RGB", (320, 240), "white")
     with pytest.raises(ValueError, match="iou_threshold must be in"):
         run_consensus(
-            img, {"x": object()}, min_votes=1, iou_threshold=2.0,  # type: ignore[dict-item]
+            img,
+            {"x": object()},  # type: ignore[dict-item]
+            min_votes=1,
+            iou_threshold=2.0,
         )
 
 
@@ -673,15 +691,15 @@ def test_run_consensus_per_code_threshold_filters_independently() -> None:
     The threshold must filter each code on its own vote count, keeping A and
     dropping B in the same scan.
     """
-    code_a = (10.0, 10.0, 60.0, 60.0)    # both engines agree here
+    code_a = (10.0, 10.0, 60.0, 60.0)  # both engines agree here
     code_b = (140.0, 140.0, 190.0, 190.0)  # only e1 sees this
-    e1 = _StubEngine((
-        _make_det(code_a, payload="A"),
-        _make_det(code_b, payload="B"),
-    ))
-    e2 = _StubEngine((
-        _make_det(code_a, payload="A"),
-    ))
+    e1 = _StubEngine(
+        (
+            _make_det(code_a, payload="A"),
+            _make_det(code_b, payload="B"),
+        )
+    )
+    e2 = _StubEngine((_make_det(code_a, payload="A"),))
     img = Image.new("RGB", (200, 200), "white")
     out = run_consensus(img, {"e1": e1, "e2": e2}, min_votes=2, iou_threshold=0.5)
     # Only code A reaches 2 votes; code B (1 vote) is filtered out.
@@ -704,13 +722,13 @@ def test_scanner_per_code_consensus_filters_independently() -> None:
 
     code_a = (10.0, 10.0, 60.0, 60.0)
     code_b = (140.0, 140.0, 190.0, 190.0)
-    arbez_stub = _StubEngine((
-        _make_det(code_a, payload="A"),
-        _make_det(code_b, payload="B"),  # only arbez sees code B
-    ))
-    zxing_stub = _StubEngine((
-        _make_det(code_a, payload="A"),
-    ))
+    arbez_stub = _StubEngine(
+        (
+            _make_det(code_a, payload="A"),
+            _make_det(code_b, payload="B"),  # only arbez sees code B
+        )
+    )
+    zxing_stub = _StubEngine((_make_det(code_a, payload="A"),))
     pool = {"arbez": arbez_stub, "zxing": zxing_stub}
 
     s = Scanner(consensus=2, engines=("arbez", "zxing"))
@@ -741,6 +759,7 @@ def test_run_consensus_engine_failure_isolated() -> None:
     class _BrokenEngine:
         name = "broken"
         native_format = "pil_rgb"
+
         def detect_and_decode(self, image: object) -> tuple[Detection, ...]:
             raise RuntimeError("simulated engine crash")
 
@@ -761,3 +780,146 @@ def test_run_consensus_engine_failure_isolated() -> None:
     assert isinstance(voted_by, tuple)
     assert "broken" not in voted_by
     assert set(voted_by) == {"good1", "good2"}
+
+
+# ── S-099: allow-list uses the decoding engine's symbology ────────────────
+
+
+def test_allow_list_uses_decoding_symbology_not_voted_label() -> None:
+    """T4: an undecoded QR box overlapping a Data Matrix read.
+
+    The merged label stays QR (the detector's vote). A QR allow-list
+    must drop the cluster because the payload came from a Data Matrix
+    decode. Filtering on the voted label would keep it.
+    """
+    box = (10.0, 10.0, 80.0, 80.0)
+    arbez = _StubEngine(
+        (_make_det(box, symbology=Symbology.QR, score=0.95, payload=None, engine="arbez"),)
+    )
+    apple = _StubEngine(
+        (
+            _make_det(
+                box,
+                symbology=Symbology.DATA_MATRIX,
+                score=0.8,
+                payload="DM-PAYLOAD",
+                engine="apple_vision",
+            ),
+        )
+    )
+    img = Image.new("RGB", (100, 100), "white")
+    engines: dict[str, Engine] = {"arbez": arbez, "apple_vision": apple}
+
+    kept = run_consensus(img, engines, min_votes=1, iou_threshold=0.5)
+    assert len(kept) == 1
+    assert kept[0].symbology is Symbology.QR
+    assert kept[0].payload == "DM-PAYLOAD"
+
+    dropped = run_consensus(
+        img,
+        engines,
+        min_votes=1,
+        iou_threshold=0.5,
+        symbologies={Symbology.QR},
+    )
+    assert dropped == ()
+    dropped_str = run_consensus(
+        img,
+        engines,
+        min_votes=1,
+        iou_threshold=0.5,
+        symbologies={"qr"},
+    )
+    assert dropped_str == ()
+
+    by_decoder = run_consensus(
+        img,
+        engines,
+        min_votes=1,
+        iou_threshold=0.5,
+        symbologies={Symbology.DATA_MATRIX},
+    )
+    assert len(by_decoder) == 1
+    assert by_decoder[0].payload == "DM-PAYLOAD"
+    # The filter does not relabel. The voted symbology stays QR.
+    assert by_decoder[0].symbology is Symbology.QR
+
+    both = run_consensus(
+        img,
+        engines,
+        min_votes=1,
+        iou_threshold=0.5,
+        symbologies={Symbology.QR, Symbology.DATA_MATRIX},
+    )
+    assert len(both) == 1
+
+
+def test_undecoded_cluster_filters_on_voted_symbology() -> None:
+    box = (10.0, 10.0, 40.0, 40.0)
+    img = Image.new("RGB", (80, 80), "white")
+    qr = _StubEngine((_make_det(box, symbology=Symbology.QR, score=0.9, payload=None),))
+    code = _StubEngine((_make_det(box, symbology=Symbology.CODE_128, score=0.9, payload=None),))
+    qr_only: dict[str, Engine] = {"qr": qr}
+    assert (
+        len(
+            run_consensus(
+                img,
+                qr_only,
+                min_votes=1,
+                symbologies={Symbology.QR},
+            )
+        )
+        == 1
+    )
+    code_only: dict[str, Engine] = {"c": code}
+    assert (
+        run_consensus(
+            img,
+            code_only,
+            min_votes=1,
+            symbologies={Symbology.QR},
+        )
+        == ()
+    )
+    assert (
+        len(
+            run_consensus(
+                img,
+                {"c": code},
+                min_votes=1,
+                symbologies={Symbology.CODE_128},
+            )
+        )
+        == 1
+    )
+
+
+def test_allow_list_leaves_per_engine_raw() -> None:
+    box = (10.0, 10.0, 80.0, 80.0)
+    arbez = _StubEngine((_make_det(box, symbology=Symbology.QR, score=0.95, payload=None),))
+    apple = _StubEngine((_make_det(box, symbology=Symbology.DATA_MATRIX, score=0.8, payload="DM"),))
+    img = Image.new("RGB", (100, 100), "white")
+    voters: dict[str, Engine] = {"arbez": arbez, "apple": apple}
+    detailed = run_consensus_detailed(
+        img,
+        voters,
+        min_votes=1,
+        symbologies={Symbology.QR},
+    )
+    assert detailed.detections == ()
+    assert len(detailed.per_engine["arbez"]) == 1
+    assert len(detailed.per_engine["apple"]) == 1
+    assert detailed.per_engine["apple"][0].payload == "DM"
+
+
+def test_symbologies_reject_bare_string_and_empty() -> None:
+    img = Image.new("RGB", (20, 20), "white")
+    engines: dict[str, Engine] = {"e": _StubEngine(())}
+    with pytest.raises(TypeError):
+        run_consensus(img, engines, min_votes=1, symbologies="qr")
+    with pytest.raises(TypeError):
+        run_consensus(img, engines, min_votes=1, symbologies=Symbology.QR)
+    with pytest.raises(ValueError):
+        run_consensus(img, engines, min_votes=1, symbologies=[])
+    with pytest.raises(ValueError):
+        run_consensus(img, engines, min_votes=1, symbologies={"not-a-symbology"})

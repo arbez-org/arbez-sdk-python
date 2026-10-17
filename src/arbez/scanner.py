@@ -37,6 +37,10 @@ Other constructor shapes
 * ``Scanner(engines=["arbez", "zxing"])`` — union over just that subset.
 * ``Scanner(engine=<Engine instance>)`` — a pre-configured engine (S-015),
   e.g. ``ZXingEngine(formats={Symbology.QR})``.
+* ``Scanner(symbologies={"qr"})`` — allow-list. Mapped onto zxing and
+  Apple Vision requests, then applied after consensus to the decoding
+  engine's symbology (S-099). Micro QR and rMQR stay opt-in
+  (``micro_qr=`` / ``rmqr=``).
 
 The 0.1.x ``engine="auto"`` and ``consensus="off"/"vote"`` + ``min_votes``
 API were removed in 0.2.0 (S-093).
@@ -47,6 +51,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -76,7 +81,7 @@ from arbez.engines._pool import (
 from arbez.engines.base import Engine
 from arbez.engines.helpers import coerce_to_pil
 from arbez.exceptions import EngineRuntimeError, EngineUnavailable
-from arbez.types import Detection, Result
+from arbez.types import Detection, Result, Symbology
 
 # S-022: preprocess modes. Locked in v0.0.8 (additive; new modes may
 # be added in future releases, existing values stay valid).
@@ -104,9 +109,7 @@ _log = logging.getLogger(__name__)
 # Public set of single-engine name strings ``Scanner(engine=...)`` accepts;
 # each maps 1:1 to a built-in engine class. ``"auto"`` was removed in 0.2.0
 # (S-093) — bare ``Scanner()`` now runs all installed engines for max yield.
-_KNOWN_ENGINE_NAMES: frozenset[str] = frozenset(
-    {"arbez", "apple_vision", "zxing", "wechat"}
-)
+_KNOWN_ENGINE_NAMES: frozenset[str] = frozenset({"arbez", "apple_vision", "zxing", "wechat"})
 
 
 # S-038: ``resolve_auto_engine`` is re-exported from
@@ -119,13 +122,50 @@ _KNOWN_ENGINE_NAMES: frozenset[str] = frozenset(
 # + S-034 rationale.
 
 
-def _resolve_engine(name: str) -> Engine:
+def _apple_request_formats(
+    symbologies: frozenset[Symbology] | None,
+    *,
+    micro_qr: bool,
+) -> frozenset[Symbology] | None:
+    """Vision formats for a Scanner-built Apple engine (S-099).
+
+    ``None`` means Vision's own "all symbologies" and is used only when
+    Micro QR is opted in with no allow-list, so MSI Plessey (reported as
+    ``OTHER_1D``) stays available. Otherwise the request is an explicit
+    list: the default list omits Micro QR. An empty frozenset means
+    match nothing — it must not be turned into ``None``.
+    """
+    from arbez.engines.apple_vision import _arbez_to_vision_names
+
+    requestable = _arbez_to_vision_names()
+    if symbologies is None:
+        if micro_qr:
+            return None
+        return frozenset(sym for sym in requestable if sym is not Symbology.MICRO_QR)
+    selected = set(symbologies)
+    if micro_qr and Symbology.MICRO_QR in requestable:
+        selected.add(Symbology.MICRO_QR)
+    return frozenset(sym for sym in selected if sym in requestable)
+
+
+def _resolve_engine(
+    name: str,
+    *,
+    symbologies: frozenset[Symbology] | None = None,
+    micro_qr: bool = False,
+    rmqr: bool = False,
+) -> Engine:
     """Map an engine name to an instance.
 
     Lazy imports so importing ``arbez`` doesn't pull in every consensus extra at startup.
 
     ``"auto"`` is resolved by ``Scanner.__init__`` (not here) so that the final engine name is
     captured in ``self._engine_name`` for ``repr()``.
+
+    ``symbologies`` is already coerced. Unsupported names are stripped
+    per engine so one symbology the engine cannot request does not fail
+    the whole Scanner (S-099). ``None`` means the engine's safe default,
+    not "pass no format argument".
     """
     # Order mirrors the canonical S-034 engine order: arbez,
     # apple_vision, zxing, wechat. Cosmetic — name dispatch is
@@ -134,15 +174,35 @@ def _resolve_engine(name: str) -> Engine:
         # S-034 (v0.0.20): default auto-pick. First-party YOLOX-s +
         # zxing-cpp pipeline; v0.0.1 production-tier weights bundled.
         from arbez.engines.arbez import ArbezEngine
-        return ArbezEngine()
+
+        return ArbezEngine(
+            symbologies=symbologies,
+            micro_qr=micro_qr,
+            rmqr=rmqr,
+        )
     if name == "apple_vision":
         from arbez.engines.apple_vision import AppleVisionEngine
-        return AppleVisionEngine()
+
+        return AppleVisionEngine(
+            formats=_apple_request_formats(symbologies, micro_qr=micro_qr),
+        )
     if name == "zxing":
-        from arbez.engines.zxing import ZXingEngine
-        return ZXingEngine()
+        from arbez.engines.zxing import ZXingEngine, _get_tables
+
+        if symbologies is None:
+            return ZXingEngine(micro_qr=micro_qr, rmqr=rmqr)
+        # OTHER_1D is not requestable. Drop it instead of raising, and
+        # pass an empty iterable (match nothing) rather than None (all)
+        # when nothing zxing can read remains.
+        table, _, _, _ = _get_tables()
+        requested = frozenset(sym for sym in symbologies if sym in table)
+        return ZXingEngine(formats=requested, micro_qr=micro_qr, rmqr=rmqr)
     if name == "wechat":
+        # QR-only, and kept in the voter set even when QR is not allowed.
+        # Dropping it would change consensus denominators; the allow-list
+        # drops its results after the vote (S-099).
         from arbez.engines.wechat import WeChatEngine
+
         return WeChatEngine()
     raise EngineUnavailable(
         f"Unknown engine name {name!r}. Expected one of: "
@@ -203,8 +263,7 @@ def _validate_consensus_subset(
     for i, name in enumerate(engines):
         if not isinstance(name, str):
             raise TypeError(
-                f"engines entries must be strings; got "
-                f"{type(name).__name__} in position {i}."
+                f"engines entries must be strings; got {type(name).__name__} in position {i}."
             )
         if name in seen:
             raise ValueError(
@@ -226,10 +285,7 @@ def _validate_consensus_subset(
                         "with `pip install --force-reinstall arbez`."
                     )
                 else:
-                    hint = (
-                        "Install with `pip install "
-                        f"'arbez[{name.replace('_', '-')}]'`."
-                    )
+                    hint = f"Install with `pip install 'arbez[{name.replace('_', '-')}]'`."
                 raise EngineUnavailable(
                     f"engine {name!r} is not installed on this host. "
                     f"Installed: {sorted(installed)}. {hint}"
@@ -350,9 +406,7 @@ def _rescale_detection(
 
     new_polygon: tuple[tuple[float, float], ...] | None = None
     if detection.polygon is not None:
-        new_polygon = tuple(
-            (x * inv_scale_x, y * inv_scale_y) for x, y in detection.polygon
-        )
+        new_polygon = tuple((x * inv_scale_x, y * inv_scale_y) for x, y in detection.polygon)
 
     return replace(detection, bbox_xyxy=new_bbox, polygon=new_polygon)
 
@@ -432,6 +486,20 @@ class Scanner:
         Consensus bbox-grouping threshold (S-032). Two detections whose
         bboxes overlap with IoU >= this value are treated as the same
         physical barcode and merged. Default ``0.5``; validated in ``[0, 1]``.
+    symbologies:
+        Allow-list of :class:`~arbez.Symbology` members or value strings
+        (S-099). ``None`` (default) does not filter. Mapped onto zxing
+        formats and Apple Vision's request, then enforced after consensus
+        on the decoding engine's symbology — not the voted cluster label.
+        A prebuilt ``engine=`` instance is not rebuilt; ``scan`` still
+        filters its results. Keyword-only.
+    micro_qr:
+        Also request Micro QR. With an allow-list, ``MICRO_QR`` is
+        unioned in. Keyword-only. Default ``False``.
+    rmqr:
+        Also request rMQR from zxing and the arbez crop decoder. Reported
+        as ``Symbology.QR``. Ignored when the allow-list excludes QR.
+        Apple Vision has no rMQR symbology. Keyword-only. Default ``False``.
 
     Raises
     ------
@@ -441,12 +509,15 @@ class Scanner:
         isn't installed; or no installed engines at all (broken install).
     TypeError
         ``engine=`` is neither a string nor an Engine instance; ``engines=``
-        is neither None nor a tuple/list; or ``consensus=`` is not an int.
+        is neither None nor a tuple/list; ``consensus=`` is not an int;
+        ``micro_qr`` / ``rmqr`` are not bools; or ``symbologies`` is a bare
+        string or a single ``Symbology``.
     ValueError
         ``consensus < 1``; ``consensus`` greater than the number of engines;
         ``iou_threshold`` outside ``[0, 1]``; ``engine=`` combined with
-        ``engines=`` or with ``consensus > 1``; or an empty / invalid
-        ``engines=`` sequence.
+        ``engines=`` or with ``consensus > 1``; an empty / invalid
+        ``engines=`` sequence; an empty ``symbologies`` allow-list; or an
+        unknown symbology value string.
     NotImplementedError
         ``model=`` is anything other than ``None``.
     """
@@ -459,6 +530,9 @@ class Scanner:
         consensus: int = 1,
         model: Path | None = None,
         iou_threshold: float = 0.5,
+        symbologies: Iterable[Symbology | str] | None = None,
+        micro_qr: bool = False,
+        rmqr: bool = False,
     ) -> None:
         # S-093 (0.2.0): engine-selection model.
         #
@@ -486,9 +560,7 @@ class Scanner:
                 f"``engine=`` (or in ``engines=`` for consensus voting)."
             )
         if not (0.0 <= iou_threshold <= 1.0):
-            raise ValueError(
-                f"iou_threshold must be in [0, 1]; got {iou_threshold}"
-            )
+            raise ValueError(f"iou_threshold must be in [0, 1]; got {iou_threshold}")
         # ``bool`` is an int subclass — reject it so ``Scanner(consensus=True)``
         # isn't silently read as 1.
         if not isinstance(consensus, int) or isinstance(consensus, bool):
@@ -499,6 +571,18 @@ class Scanner:
             )
         if consensus < 1:
             raise ValueError(f"consensus must be >= 1; got {consensus}")
+        if not isinstance(micro_qr, bool) or not isinstance(rmqr, bool):
+            raise TypeError(
+                f"micro_qr and rmqr must be bools; got micro_qr={micro_qr!r}, rmqr={rmqr!r}."
+            )
+        # Imported here so scanner and consensus don't cycle at import.
+        # Coerce before any early return so every construction path
+        # stores the allow-list scan() filters on (S-099).
+        from arbez.consensus import _coerce_symbology_allowlist
+
+        allow = _coerce_symbology_allowlist(symbologies)
+        if allow is not None and micro_qr:
+            allow = allow | frozenset((Symbology.MICRO_QR,))
 
         # Shared attributes (set concretely in the branches below). S-012
         # thread-safety: ``_get_engine`` / ``_get_consensus_engines`` are
@@ -511,6 +595,9 @@ class Scanner:
         self._engines: tuple[str, ...] | None = None
         self._is_consensus = False
         self._consensus_min_votes = 1
+        self._symbology_allow: frozenset[Symbology] | None = allow
+        self._micro_qr = micro_qr
+        self._rmqr = rmqr
 
         # ── Single-engine path: ``engine=`` was given ────────────────────
         if engine is not None:
@@ -541,7 +628,8 @@ class Scanner:
                 self._engine = engine
                 _log.debug(
                     "Scanner: accepted user-supplied engine instance %r (name=%r)",
-                    engine, self._engine_name,
+                    engine,
+                    self._engine_name,
                 )
                 return
             if engine == "auto":
@@ -566,8 +654,7 @@ class Scanner:
         # every installed engine (max-yield bare ``Scanner()``).
         self._engines = _validate_consensus_subset(engines)
         vote_names: tuple[str, ...] = (
-            self._engines if self._engines is not None
-            else _ed_installed_consensus_engines()
+            self._engines if self._engines is not None else _ed_installed_consensus_engines()
         )
         if not vote_names:
             # arbez + zxing are core deps, so this only happens on a broken
@@ -642,15 +729,7 @@ class Scanner:
 
     def scan(
         self,
-        image: (
-            PILImage
-            | npt.NDArray[Any]
-            | str
-            | Path
-            | bytes
-            | bytearray
-            | IO[bytes]
-        ),
+        image: (PILImage | npt.NDArray[Any] | str | Path | bytes | bytearray | IO[bytes]),
         *,
         preprocess: PreprocessMode = "off",
     ) -> Result:
@@ -718,9 +797,7 @@ class Scanner:
             pil_image, scale_inv_x, scale_inv_y = _auto_preprocess(pil_image)
             preprocess_ms = (time.perf_counter() - t0) * 1_000.0
         elif preprocess != "off":
-            raise ValueError(
-                f"preprocess must be 'off' or 'auto'; got {preprocess!r}"
-            )
+            raise ValueError(f"preprocess must be 'off' or 'auto'; got {preprocess!r}")
 
         # S-097: Scanner is maximum recall in this release (S-093), so the
         # pool deadline is 10 s. Attach after preprocess: that step can
@@ -766,13 +843,23 @@ class Scanner:
                 self._get_consensus_engines(),
                 min_votes=self._consensus_min_votes,
                 iou_threshold=self._consensus_iou_threshold,
+                symbologies=self._symbology_allow,
             )
+            # Do not filter again on the voted label. run_consensus
+            # already applied the allow-list to the decoding symbology,
+            # and a second pass would revive the T4 mis-keep (S-099).
             detections = cr.detections
             per_engine = dict(cr.per_engine)
             timing_label = "consensus"
         else:
             engine = self._get_engine()
             detections = engine.detect_and_decode(pil_image)
+            # Single-engine detections are already decoder-authoritative
+            # (S-094 for arbez; native for the others), so the allow-list
+            # can use Detection.symbology directly. A prebuilt engine is
+            # not rebuilt; this filter is what enforces the list.
+            if self._symbology_allow is not None:
+                detections = tuple(d for d in detections if d.symbology in self._symbology_allow)
             # Single engine: the per_engine breakdown is just that engine's
             # own detections under its name (S-093).
             per_engine = {self._engine_name: detections}
@@ -784,15 +871,10 @@ class Scanner:
         # (the common case — either preprocess=off OR a small input
         # that didn't hit the long-axis cap).
         if scale_inv_x != 1.0 or scale_inv_y != 1.0:
-            detections = tuple(
-                _rescale_detection(d, scale_inv_x, scale_inv_y)
-                for d in detections
-            )
+            detections = tuple(_rescale_detection(d, scale_inv_x, scale_inv_y) for d in detections)
             # Rescale the per-engine breakdown to the same original coords.
             per_engine = {
-                name: tuple(
-                    _rescale_detection(d, scale_inv_x, scale_inv_y) for d in dets
-                )
+                name: tuple(_rescale_detection(d, scale_inv_x, scale_inv_y) for d in dets)
                 for name, dets in per_engine.items()
             }
 
@@ -938,9 +1020,9 @@ class Scanner:
                     eng_close()
                 except Exception as e:
                     _log.warning(
-                        "Scanner.close: engine %s.close() raised %r; "
-                        "continuing teardown.",
-                        type(engine_snapshot).__name__, e,
+                        "Scanner.close: engine %s.close() raised %r; continuing teardown.",
+                        type(engine_snapshot).__name__,
+                        e,
                     )
 
         # Consensus engines (S-032) — same snapshot-and-swap for each
@@ -967,7 +1049,9 @@ class Scanner:
                     except Exception as e:
                         _log.warning(
                             "Scanner.close: consensus engine %s.close() "
-                            "raised %r; continuing teardown.", name, e,
+                            "raised %r; continuing teardown.",
+                            name,
+                            e,
                         )
 
     def __enter__(self) -> Scanner:
@@ -1004,7 +1088,12 @@ class Scanner:
             # Re-check inside the lock — another thread may have raced
             # us to the assignment while we were waiting.
             if self._engine is None:
-                self._engine = _resolve_engine(self._engine_name)
+                self._engine = _resolve_engine(
+                    self._engine_name,
+                    symbologies=self._symbology_allow,
+                    micro_qr=self._micro_qr,
+                    rmqr=self._rmqr,
+                )
             return self._engine
 
     def _resolve_consensus_engine_names(self) -> tuple[str, ...]:
@@ -1031,7 +1120,13 @@ class Scanner:
             if self._consensus_engines is None:
                 names = self._resolve_consensus_engine_names()
                 self._consensus_engines = {
-                    name: _resolve_engine(name) for name in names
+                    name: _resolve_engine(
+                        name,
+                        symbologies=self._symbology_allow,
+                        micro_qr=self._micro_qr,
+                        rmqr=self._rmqr,
+                    )
+                    for name in names
                 }
                 _log.debug(
                     "Scanner: built consensus engine pool: %s",
@@ -1045,10 +1140,20 @@ class Scanner:
         # model= is intentionally omitted (only None is accepted). Single-
         # engine shows just the engine; the multi-engine consensus path
         # surfaces the threshold, the resolved engine set, and iou_threshold.
+        # Allow-list / opt-in flags are appended only when set, so the
+        # default repr stays stable (S-099).
+        extra = ""
+        if self._symbology_allow is not None:
+            names = sorted(sym.value for sym in self._symbology_allow)
+            extra += f", symbologies={names!r}"
+        if self._micro_qr:
+            extra += ", micro_qr=True"
+        if self._rmqr:
+            extra += ", rmqr=True"
         if not self._is_consensus:
-            return f"Scanner(engine={self._engine_name!r})"
+            return f"Scanner(engine={self._engine_name!r}{extra})"
         return (
             f"Scanner(consensus={self._consensus_min_votes}, "
             f"engines={self._engines!r}, "
-            f"iou_threshold={self._consensus_iou_threshold})"
+            f"iou_threshold={self._consensus_iou_threshold}{extra})"
         )

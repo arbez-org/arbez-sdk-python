@@ -11,6 +11,89 @@ ID prefix is `S-` (for SDK).
 
 ---
 
+## S-099 — Safe QR decode defaults and post-consensus allow-list (2026-10-17)
+
+**Context.** zxing-cpp's `BarcodeFormat.QRCode` is a family bit. It
+reads Model 2, Model 1, Micro QR, and rMQR. Every QR-family misread
+measured in this project was a Micro QR read. Requesting
+`QRCodeModel2` removed those misreads and lost no true Model 2 reads
+on the BoofCV photo set (testing-B T4, testing-C §6).
+
+A symbology allow-list cannot trust the consensus cluster label.
+3 of 2,200 negatives had a correct Data Matrix or Aztec payload
+labelled `qr`: an undecoded arbez box overlapped another engine's
+read, and the vote took the detector's label with the other engine's
+payload. Filtering on the voted `qr` label keeps that payload.
+
+0.2.1 also ran libdmtx on QR and Micro QR proposals. libdmtx decodes
+Data Matrix only, and it has emitted a Data Matrix payload
+(`5` + `0x11` + `29`) for a QR polygon. Aztec is not a QR-class
+proposal and stays on the fallback.
+
+zxing-cpp 3.1.1 still labels a Model 2 read as `BarcodeFormat.QRCode`.
+An empty `BarcodeFormats` and Apple Vision's `setSymbologies_([])`
+both mean "every symbology", not none.
+
+**Decision.** QR requests `QRCodeModel2` only. Micro QR is opt-in via
+`micro_qr=True` or by naming `Symbology.MICRO_QR`. rMQR is opt-in via
+`rmqr=True` and is reported as `Symbology.QR` (no new enum member;
+`types.py` is unchanged). The inverse map keeps the `QRCode` family
+tag, Model 1, and `RMQRCode`, all pointing at `Symbology.QR`, so a
+successful read is not dropped. `RMQRCode` leaves `drop_matrix`.
+The family bit is never requested. A missing `QRCodeModel2` raises
+`EngineUnavailable` instead of falling back to the family bit.
+
+`Scanner(symbologies=...)` accepts `Symbology` members or value
+strings. A bare string or a single member is a `TypeError` (both are
+iterable). An empty list is a `ValueError`. `micro_qr=True` unions
+`MICRO_QR` into an explicit list. The list is mapped onto zxing
+formats and onto Apple Vision's request. Symbologies an engine cannot
+request are stripped; an empty intersection is an empty format set,
+which short-circuits to no reads. It is not `None` (that means all).
+
+The allow-list is enforced after consensus on the symbology of the
+member that supplied the winning payload — the same selection as the
+payload vote. If nobody decoded, the voted label is used, so an
+undecoded QR box survives a QR allow-list and an undecoded Code 128
+does not. The merged `Detection.symbology` is not relabelled.
+`per_engine` stays raw. A single-engine `Scanner` filters
+`Detection.symbology`, which is already decoder-authoritative. A
+prebuilt `engine=` instance is not rebuilt; `scan` still filters.
+`run_consensus` / `run_consensus_detailed` gain a keyword-only
+`symbologies` argument, default `None`.
+
+libdmtx runs only for `DATA_MATRIX` and `AZTEC`, and only when the
+allow-list is unset or contains `DATA_MATRIX`.
+
+Scanner-built Apple Vision, with Micro QR off, gets an explicit
+symbology list that omits Micro QR. That also drops MSI Plessey,
+which Vision reports as `OTHER_1D` and which only appears when the
+request is "all". `micro_qr=True` with no allow-list passes
+`formats=None` so Micro QR and MSI both stay. Bare
+`AppleVisionEngine()` is unchanged. WeChat stays in the voter set
+when QR is not allowed; the filter drops its results. Dropping the
+engine would change consensus denominators.
+
+**Alternatives.**
+
+* Keep the family bit and filter Micro QR after the read. The
+  misread-prone reader still runs, and a later failure-only ladder
+  stops on the first read, so the bad Micro QR payload would stick.
+* Filter on the voted cluster label. That keeps the 3/2,200 Data
+  Matrix and Aztec payloads labelled `qr`.
+* Add `Symbology.RMQR`. That needs `types.py`, which this change
+  does not touch. rMQR is reported as QR until a later enum change.
+
+**Consequences.** Default scans no longer read Micro QR or rMQR.
+Callers who want them pass `micro_qr=True` or `rmqr=True`. Data
+Matrix symbols the detector filed as QR or Micro QR are no longer
+recovered by libdmtx; that loss is accepted. Scanner-built Apple
+Vision may stop emitting MSI Plessey unless `micro_qr=True` leaves
+the request unrestricted. `ZXingEngine(formats=[])` and
+`AppleVisionEngine(formats=[])` match nothing.
+
+---
+
 ## S-097 — Native engines run in a spawned worker (2026-10-17)
 
 **Context.** A Python thread cannot stop a native crash or a native hang.

@@ -14,13 +14,15 @@ What's locked here:
 2. **Crop decode helper.** ``_dmtx_decode_one`` returns the UTF-8 payload from
    an injected libdmtx ``decode`` callable, and returns ``None`` on an empty
    result, a raised exception, or a degenerate bbox — never propagates.
-3. **Square-2D routing.** The fallback fires for square-2D detector classes
-   (DATA_MATRIX, QR, Micro QR, Aztec) when zxing-cpp failed — covering Data
-   Matrix crops the detector mislabeled as QR. Linear 1D symbologies are not
-   routed to libdmtx.
+3. **Square-2D routing.** The fallback fires for DATA_MATRIX and Aztec
+   when zxing-cpp failed. S-099: QR and Micro QR proposals are not
+   offered to libdmtx, even when the detector misfiled a Data Matrix
+   as QR. Linear 1D symbologies are not routed to libdmtx. An
+   allow-list that omits DATA_MATRIX skips the fallback entirely.
 4. **No redundant work.** When zxing-cpp already decoded the crop, libdmtx is
    not invoked at all (``decoder="zxing"``).
 """
+
 from __future__ import annotations
 
 import sys
@@ -36,6 +38,7 @@ from arbez.engines.arbez import ArbezEngine
 #   0 -> QR, 2 -> DATA_MATRIX. Used to drive routing without ONNX inference.
 _CLASS_QR = 0
 _CLASS_DATAMATRIX = 2
+_CLASS_MICRO_QR = 8
 
 
 class _FakeDmtxResult:
@@ -85,14 +88,13 @@ def test_decode_off_never_probes_or_invokes_libdmtx() -> None:
     engine._dmtx_decode = fake_dmtx
 
     img = Image.new("RGB", (300, 300), "white")
-    dm = RawDetection(x1=20.0, y1=20.0, x2=140.0, y2=140.0,
-                      score=0.9, class_id=_CLASS_DATAMATRIX)
+    dm = RawDetection(x1=20.0, y1=20.0, x2=140.0, y2=140.0, score=0.9, class_id=_CLASS_DATAMATRIX)
     (dm_out,) = engine._decode_detections([dm], img)
 
     assert dm_out.payload is None
     assert dm_out.extras["decoder"] == "none"
     assert engine._dmtx_probed is False  # probe never ran
-    assert calls == []                   # libdmtx never invoked
+    assert calls == []  # libdmtx never invoked
 
 
 def test_dmtx_decode_one_happy_path() -> None:
@@ -105,8 +107,7 @@ def test_dmtx_decode_one_happy_path() -> None:
         return [_FakeDmtxResult(b"DM-PAYLOAD-123")]
 
     img = Image.new("RGB", (200, 200), "white")
-    det = RawDetection(x1=20.0, y1=20.0, x2=120.0, y2=120.0,
-                       score=0.9, class_id=_CLASS_DATAMATRIX)
+    det = RawDetection(x1=20.0, y1=20.0, x2=120.0, y2=120.0, score=0.9, class_id=_CLASS_DATAMATRIX)
     out = ArbezEngine._dmtx_decode_one(fake_decode, img, det)
     assert out == "DM-PAYLOAD-123"
     assert calls == [{"max_count": 1, "timeout": 300}]
@@ -115,8 +116,7 @@ def test_dmtx_decode_one_happy_path() -> None:
 def test_dmtx_decode_one_empty_result_returns_none() -> None:
     """An empty libdmtx result (no decode) yields None, not an error."""
     img = Image.new("RGB", (200, 200), "white")
-    det = RawDetection(x1=20.0, y1=20.0, x2=120.0, y2=120.0,
-                       score=0.9, class_id=_CLASS_DATAMATRIX)
+    det = RawDetection(x1=20.0, y1=20.0, x2=120.0, y2=120.0, score=0.9, class_id=_CLASS_DATAMATRIX)
     out = ArbezEngine._dmtx_decode_one(lambda *a, **k: [], img, det)
     assert out is None
 
@@ -124,12 +124,12 @@ def test_dmtx_decode_one_empty_result_returns_none() -> None:
 def test_dmtx_decode_one_exception_returns_none() -> None:
     """A decoder that raises must be swallowed -> None (never propagates into
     the scan)."""
+
     def boom(*_a: object, **_k: object) -> list[_FakeDmtxResult]:
         raise RuntimeError("libdmtx blew up")
 
     img = Image.new("RGB", (200, 200), "white")
-    det = RawDetection(x1=20.0, y1=20.0, x2=120.0, y2=120.0,
-                       score=0.9, class_id=_CLASS_DATAMATRIX)
+    det = RawDetection(x1=20.0, y1=20.0, x2=120.0, y2=120.0, score=0.9, class_id=_CLASS_DATAMATRIX)
     assert ArbezEngine._dmtx_decode_one(boom, img, det) is None
 
 
@@ -143,8 +143,7 @@ def test_dmtx_decode_one_degenerate_bbox_returns_none() -> None:
         return [_FakeDmtxResult(b"x")]
 
     img = Image.new("RGB", (200, 200), "white")
-    degen = RawDetection(x1=50.0, y1=50.0, x2=50.0, y2=50.0,
-                         score=0.5, class_id=_CLASS_DATAMATRIX)
+    degen = RawDetection(x1=50.0, y1=50.0, x2=50.0, y2=50.0, score=0.5, class_id=_CLASS_DATAMATRIX)
     assert ArbezEngine._dmtx_decode_one(fake_decode, img, degen) is None
     assert called is False
 
@@ -165,8 +164,9 @@ def test_dmtx_decode_one_tiny_clamped_crop_returns_none() -> None:
     img = Image.new("RGB", (200, 200), "white")
     # x1=205 on a 200px image -> crop left=max(0,197)=197, right=min(200,214)=200
     # -> width 3 (<4) -> guard returns None.
-    edge = RawDetection(x1=205.0, y1=205.0, x2=206.0, y2=206.0,
-                        score=0.5, class_id=_CLASS_DATAMATRIX)
+    edge = RawDetection(
+        x1=205.0, y1=205.0, x2=206.0, y2=206.0, score=0.5, class_id=_CLASS_DATAMATRIX
+    )
     assert ArbezEngine._dmtx_decode_one(fake_decode, img, edge) is None
     assert called is False
 
@@ -175,17 +175,19 @@ def test_dmtx_decode_one_non_utf8_uses_replacement() -> None:
     """Non-UTF-8 payload bytes are decoded with errors='replace' (U+FFFD), not
     raised — locking the documented contract."""
     img = Image.new("RGB", (200, 200), "white")
-    det = RawDetection(x1=20.0, y1=20.0, x2=120.0, y2=120.0,
-                       score=0.9, class_id=_CLASS_DATAMATRIX)
+    det = RawDetection(x1=20.0, y1=20.0, x2=120.0, y2=120.0, score=0.9, class_id=_CLASS_DATAMATRIX)
     out = ArbezEngine._dmtx_decode_one(
-        lambda *a, **k: [_FakeDmtxResult(b"\xff\xfeDM")], img, det,
+        lambda *a, **k: [_FakeDmtxResult(b"\xff\xfeDM")],
+        img,
+        det,
     )
     # b"\xff" and b"\xfe" are each invalid UTF-8 lead bytes -> one U+FFFD each.
     assert out == "��DM"
 
 
 def _engine_with_failing_zxing_and_fake_dmtx(
-    monkeypatch: pytest.MonkeyPatch, dmtx_calls: list[RawDetection],
+    monkeypatch: pytest.MonkeyPatch,
+    dmtx_calls: list[RawDetection],
 ) -> ArbezEngine:
     """An engine wired so zxing-cpp 'fails' on every crop and a fake libdmtx
     records which detections it was asked to decode."""
@@ -194,8 +196,12 @@ def _engine_with_failing_zxing_and_fake_dmtx(
     engine._zxing_module = object()
     engine._zxing_probed = True
     monkeypatch.setattr(
-        engine, "_decode_one", lambda *_a, **_k: (None, None, None), raising=True,
+        engine,
+        "_decode_one",
+        lambda *_a, **_k: (None, None, None),
+        raising=True,
     )
+
     # Inject a fake libdmtx decoder, pre-probed so _get_dmtx returns it.
     def fake_dmtx(crop: object, max_count: int = 0, timeout: int = 0) -> list[_FakeDmtxResult]:
         return [_FakeDmtxResult(b"DM-FROM-LIBDMTX")]
@@ -216,41 +222,58 @@ def _engine_with_failing_zxing_and_fake_dmtx(
 def test_routing_square_2d_when_zxing_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The libdmtx fallback fires for DATA_MATRIX and QR (mislabeled DM) when
-    zxing failed; linear 1D detections are not routed to libdmtx."""
+    """The libdmtx fallback fires for DATA_MATRIX when zxing failed.
+
+    S-099: QR and Micro QR proposals are not offered to libdmtx, and
+    linear 1D detections are not routed either.
+    """
     dmtx_calls: list[RawDetection] = []
     engine = _engine_with_failing_zxing_and_fake_dmtx(monkeypatch, dmtx_calls)
 
     img = Image.new("RGB", (300, 300), "white")
-    dm = RawDetection(x1=20.0, y1=20.0, x2=140.0, y2=140.0,
-                      score=0.9, class_id=_CLASS_DATAMATRIX)
-    qr = RawDetection(x1=160.0, y1=160.0, x2=280.0, y2=280.0,
-                      score=0.9, class_id=_CLASS_QR)
+    dm = RawDetection(x1=20.0, y1=20.0, x2=140.0, y2=140.0, score=0.9, class_id=_CLASS_DATAMATRIX)
+    qr = RawDetection(x1=160.0, y1=20.0, x2=280.0, y2=140.0, score=0.9, class_id=_CLASS_QR)
+    micro = RawDetection(x1=20.0, y1=160.0, x2=140.0, y2=280.0, score=0.9, class_id=_CLASS_MICRO_QR)
     # Legacy 9-class: 1 -> CODE_128 (linear 1D — not square-2D routed).
-    code128 = RawDetection(x1=10.0, y1=200.0, x2=290.0, y2=240.0,
-                           score=0.9, class_id=1)
-    dets = engine._decode_detections([dm, qr, code128], img)
+    code128 = RawDetection(x1=160.0, y1=200.0, x2=290.0, y2=240.0, score=0.9, class_id=1)
+    dets = engine._decode_detections([dm, qr, micro, code128], img)
 
     by_class = {d.extras["model_class_id"]: d for d in dets}
     dm_out = by_class[_CLASS_DATAMATRIX]
     qr_out = by_class[_CLASS_QR]
+    micro_out = by_class[_CLASS_MICRO_QR]
     c128_out = by_class[1]
 
-    # DATA_MATRIX and QR-labeled (mislabeled DM) recovered via libdmtx.
     assert dm_out.payload == "DM-FROM-LIBDMTX"
     assert dm_out.extras["decoder"] == "libdmtx"
     assert dm_out.symbology == Symbology.DATA_MATRIX
-    assert qr_out.payload == "DM-FROM-LIBDMTX"
-    assert qr_out.extras["decoder"] == "libdmtx"
-    # S-094: libdmtx rescue reports DATA_MATRIX; detector's QR guess preserved.
-    assert qr_out.symbology == Symbology.DATA_MATRIX
-    assert qr_out.extras["detector_symbology"] == "QR"
-    # Linear 1D: libdmtx not invoked; stays undecoded.
+    # QR-class proposals stay undecoded rather than risk a libdmtx misread.
+    assert qr_out.payload is None
+    assert qr_out.extras["decoder"] == "none"
+    assert qr_out.symbology == Symbology.QR
+    assert micro_out.payload is None
+    assert micro_out.extras["decoder"] == "none"
+    assert micro_out.symbology == Symbology.MICRO_QR
     assert c128_out.payload is None
     assert c128_out.extras["decoder"] == "none"
-    assert sorted(d.class_id for d in dmtx_calls) == sorted(
-        [_CLASS_DATAMATRIX, _CLASS_QR],
-    )
+    assert [d.class_id for d in dmtx_calls] == [_CLASS_DATAMATRIX]
+
+
+def test_routing_skips_libdmtx_when_data_matrix_not_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An allow-list without DATA_MATRIX does not call libdmtx at all."""
+    dmtx_calls: list[RawDetection] = []
+    engine = _engine_with_failing_zxing_and_fake_dmtx(monkeypatch, dmtx_calls)
+    engine._symbology_allow = frozenset({Symbology.QR})
+
+    img = Image.new("RGB", (200, 200), "white")
+    dm = RawDetection(x1=20.0, y1=20.0, x2=140.0, y2=140.0, score=0.9, class_id=_CLASS_DATAMATRIX)
+    (dm_out,) = engine._decode_detections([dm], img)
+
+    assert dm_out.payload is None
+    assert dm_out.extras["decoder"] == "none"
+    assert dmtx_calls == []
 
 
 def test_no_libdmtx_call_when_zxing_succeeds(
@@ -264,8 +287,10 @@ def test_no_libdmtx_call_when_zxing_succeeds(
     engine._zxing_probed = True
     # zxing succeeds on the crop (S-094: 3-tuple — payload, stage, decoded symbology).
     monkeypatch.setattr(
-        engine, "_decode_one",
-        lambda *_a, **_k: ("ZXING-DECODED", "tight", Symbology.DATA_MATRIX), raising=True,
+        engine,
+        "_decode_one",
+        lambda *_a, **_k: ("ZXING-DECODED", "tight", Symbology.DATA_MATRIX),
+        raising=True,
     )
 
     def fake_dmtx(*_a: object, **_k: object) -> list[_FakeDmtxResult]:
@@ -276,8 +301,7 @@ def test_no_libdmtx_call_when_zxing_succeeds(
     engine._dmtx_probed = True
 
     img = Image.new("RGB", (300, 300), "white")
-    dm = RawDetection(x1=20.0, y1=20.0, x2=140.0, y2=140.0,
-                      score=0.9, class_id=_CLASS_DATAMATRIX)
+    dm = RawDetection(x1=20.0, y1=20.0, x2=140.0, y2=140.0, score=0.9, class_id=_CLASS_DATAMATRIX)
     (dm_out,) = engine._decode_detections([dm], img)
 
     assert dm_out.payload == "ZXING-DECODED"

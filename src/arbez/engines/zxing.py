@@ -12,8 +12,9 @@ native load, and a missing/broken zxing-cpp raises
 Public surface:
 
     >>> from arbez.engines.zxing import ZXingEngine
-    >>> engine = ZXingEngine()                       # detect every symbology
-    >>> engine = ZXingEngine(formats={Symbology.QR}) # QR only — ~3x faster
+    >>> engine = ZXingEngine()                       # every symbology except Micro QR / rMQR
+    >>> engine = ZXingEngine(formats={Symbology.QR}) # QR Model 2 only — ~3x faster
+    >>> engine = ZXingEngine(micro_qr=True)          # also read Micro QR
 
     >>> from PIL import Image
     >>> detections = engine.detect_and_decode(Image.open("photo.jpg"))
@@ -24,6 +25,7 @@ The return tuple is sorted by descending score (ZXing doesn't expose a
 numeric confidence, so we treat ``valid=True`` as 1.0 and skip invalid
 results entirely — they're noise more often than not).
 """
+
 from __future__ import annotations
 
 import functools
@@ -70,10 +72,10 @@ if TYPE_CHECKING:
 
 
 def _build_format_table() -> tuple[
-    Mapping[Symbology, Any],   # arbez → zxingcpp.BarcodeFormat (read-only)
-    Mapping[Any, Symbology],   # zxingcpp.BarcodeFormat → arbez (read-only)
-    frozenset[Any],            # ZXing 1D formats we map to OTHER_1D
-    frozenset[Any],            # ZXing matrix formats we *drop*
+    Mapping[Symbology, Any],  # arbez → zxingcpp.BarcodeFormat (read-only)
+    Mapping[Any, Symbology],  # zxingcpp.BarcodeFormat → arbez (read-only)
+    frozenset[Any],  # ZXing 1D formats we map to OTHER_1D
+    frozenset[Any],  # ZXing matrix formats we *drop*
 ]:
     """Build the lookup tables once, on first use.
 
@@ -104,8 +106,18 @@ def _build_format_table() -> tuple[
     # forward map ``arbez_to_zxing`` records the SDK->zxing mapping for
     # the ``formats=`` ctor argument (which restricts what zxing tries
     # to decode); only entries with a real zxing equivalent appear.
+    # S-099: QR requests Model 2, never the QRCode family bit (that
+    # bit also turns on Micro QR and rMQR). A build without Model 2
+    # is below the 3.1.1 floor — fail here instead of silently
+    # requesting the family bit.
+    model2 = _opt("QRCodeModel2")
+    if model2 is None:
+        raise EngineUnavailable(
+            "ZXingEngine requires zxing-cpp BarcodeFormat.QRCodeModel2 "
+            "(arbez requires zxing-cpp >= 3.1.1)."
+        )
     arbez_to_zxing: dict[Symbology, Any] = {
-        Symbology.QR: bf.QRCode,
+        Symbology.QR: model2,
         Symbology.AZTEC: bf.Aztec,
         Symbology.DATA_MATRIX: bf.DataMatrix,
         Symbology.PDF417: bf.PDF417,
@@ -175,13 +187,28 @@ def _build_format_table() -> tuple[
         "DataBarOmni",
         "DataBarStk",
         "DataBarStkOmni",
-        "DataBarLtd", "DataBarLimited",
-        "DataBarExp", "DataBarExpanded",
-        "DataBarExpStk", "DataBarExpandedStacked",
+        "DataBarLtd",
+        "DataBarLimited",
+        "DataBarExp",
+        "DataBarExpanded",
+        "DataBarExpStk",
+        "DataBarExpandedStacked",
     ):
         v = _opt(variant_name)
         if v is not None:
             zxing_to_arbez[v] = Symbology.GS1_DATABAR
+
+    # S-099: zxing-cpp 3.1.1 returns BarcodeFormat.QRCode for a read
+    # that was requested as QRCodeModel2. Dropping the family tag on
+    # the inverse path would discard every successful QR. Model 1 is
+    # mapped the same way so a stray specific tag is not dropped;
+    # it is never requested. rMQR has no Symbology member — an
+    # opted-in read is reported as QR, so it must not stay in
+    # drop_matrix.
+    for qr_alias in ("QRCode", "QRCodeModel1", "RMQRCode"):
+        alias = _opt(qr_alias)
+        if alias is not None:
+            zxing_to_arbez[alias] = Symbology.QR
 
     # 1D codes ZXing recognizes that we still don't have a dedicated
     # enum for — surface as OTHER_1D rather than dropping them.
@@ -195,14 +222,16 @@ def _build_format_table() -> tuple[
     # S-036 promoted MicroQRCode out of this list (now first-class
     # Symbology.MICRO_QR via arbez_to_zxing above).
     # S-076 (2026-05-17): MaxiCode promoted out of this list; now
-    # first-class Symbology.MAXICODE. MicroPDF417 / RMQRCode /
-    # DXFilmEdge stay dropped (low real-world use, niche formats).
+    # first-class Symbology.MAXICODE. MicroPDF417 / DXFilmEdge stay
+    # dropped. S-099 took RMQRCode out of this set: opted-in reads
+    # map to Symbology.QR above.
     drop_matrix: frozenset[Any] = frozenset(
-        v for v in (
+        v
+        for v in (
             _opt("MicroPDF417"),
-            _opt("RMQRCode"),
             _opt("DXFilmEdge"),
-        ) if v is not None
+        )
+        if v is not None
     )
     # S-025: return MappingProxyType wrappers around the dicts so the
     # @functools.cache-d tables can't be mutated by callers. Previously
@@ -263,6 +292,80 @@ def symbology_for_zxing_format(fmt: Any) -> Symbology | None:
     return None
 
 
+# Distinct from ``None`` ("use the safe default set") and from
+# ``BarcodeFormats([])`` (zxing-cpp reads every format, including the
+# QR family bit). Callers must short-circuit instead of passing this
+# to ``read_barcodes``.
+_NO_BARCODE_FORMATS = object()
+
+
+def barcode_formats_for(
+    symbologies: Iterable[Symbology] | None,
+    *,
+    micro_qr: bool = False,
+    rmqr: bool = False,
+) -> Any:
+    """Return the zxing-cpp formats to request.
+
+    ``symbologies is None`` requests every mapped symbology except
+    Micro QR and rMQR. Those two are opt-in via ``micro_qr`` /
+    ``rmqr`` or by naming ``Symbology.MICRO_QR``. QR is always
+    ``QRCodeModel2``, never the family bit.
+
+    Returns ``_NO_BARCODE_FORMATS`` when the resolved set is empty.
+    That is not ``BarcodeFormats([])``: an empty native set means
+    "read everything".
+    """
+    if not isinstance(micro_qr, bool) or not isinstance(rmqr, bool):
+        raise TypeError(
+            f"micro_qr and rmqr must be bools; got micro_qr={micro_qr!r}, rmqr={rmqr!r}."
+        )
+    arbez_to_zxing, _, _, _ = _get_tables()
+    import zxingcpp as _z
+
+    requested: frozenset[Symbology] | None
+    if symbologies is None:
+        requested = None
+    else:
+        requested = frozenset(symbologies)
+        unsupported = [s for s in requested if s not in arbez_to_zxing]
+        if unsupported:
+            raise ValueError(
+                f"ZXingEngine: {unsupported} not in the zxing format table; "
+                f"OTHER_1D is detect-only and can't be requested explicitly."
+            )
+
+    chosen: list[_z.BarcodeFormat] = []
+    if requested is None:
+        for sym, fmt in arbez_to_zxing.items():
+            if sym is Symbology.MICRO_QR and not micro_qr:
+                continue
+            chosen.append(fmt)
+    else:
+        for sym in requested:
+            chosen.append(arbez_to_zxing[sym])
+        if (
+            micro_qr
+            and Symbology.MICRO_QR in arbez_to_zxing
+            and Symbology.MICRO_QR not in requested
+        ):
+            chosen.append(arbez_to_zxing[Symbology.MICRO_QR])
+
+    # rMQR is reported as QR, so a list that excludes QR must not ask for it.
+    if rmqr and (requested is None or Symbology.QR in requested):
+        rmqr_fmt = getattr(_z.BarcodeFormat, "RMQRCode", None)
+        if rmqr_fmt is None:
+            raise ValueError(
+                "rmqr=True requires zxing-cpp BarcodeFormat.RMQRCode "
+                "(arbez requires zxing-cpp >= 3.1.1)."
+            )
+        chosen.append(rmqr_fmt)
+
+    if not chosen:
+        return _NO_BARCODE_FORMATS
+    return _z.BarcodeFormats(chosen)
+
+
 # ── Engine ─────────────────────────────────────────────────────────────────
 
 
@@ -272,7 +375,8 @@ class ZXingEngine:
     Symbology coverage
     ------------------
     Surfaces every member of the public ``Symbology`` enum that
-    zxing-cpp natively detects: QR, MicroQR, Aztec, DataMatrix,
+    zxing-cpp natively detects: QR (Model 2 only, S-099), MicroQR
+    (opt-in), Aztec, DataMatrix,
     PDF417, Code 128, Code 39, Code 93, EAN-13, EAN-8, UPC-A,
     UPC-E, GS1 DataBar (RSS family pooled), and — since S-076
     (2026-05-17) — Codabar, ITF, MaxiCode (promoted from
@@ -296,9 +400,19 @@ class ZXingEngine:
     ----------
     formats:
         Restrict detection to a subset of symbologies. ``None`` (default)
-        means every Arbez symbology + the OTHER_1D bucket. Passing a small
-        set (e.g. ``{Symbology.QR}``) is materially faster on busy images
-        because ZXing prunes its decoder cascade early.
+        means every requestable symbology except Micro QR and rMQR
+        (S-099). An empty iterable matches nothing — it does not mean
+        "all", which is what an empty native format set means.
+        Passing a small set (e.g. ``{Symbology.QR}``) is materially
+        faster on busy images because ZXing prunes its decoder cascade
+        early. QR requests ``QRCodeModel2``, not the QR family bit.
+    micro_qr:
+        Also read Micro QR. Implied by naming ``Symbology.MICRO_QR``
+        in ``formats``. Keyword-only.
+    rmqr:
+        Also read rMQR. Reported as ``Symbology.QR`` (there is no
+        separate enum member). Ignored when ``formats`` excludes QR.
+        Keyword-only.
 
     Notes
     -----
@@ -328,7 +442,14 @@ class ZXingEngine:
     def __init__(
         self,
         formats: Iterable[Symbology] | None = None,
+        *,
+        micro_qr: bool = False,
+        rmqr: bool = False,
     ) -> None:
+        if not isinstance(micro_qr, bool) or not isinstance(rmqr, bool):
+            raise TypeError(
+                f"micro_qr and rmqr must be bools; got micro_qr={micro_qr!r}, rmqr={rmqr!r}."
+            )
         # S-081/S-083 contract: probe zxing-cpp at construction —
         # unconditionally, not just on the ``formats=`` path — so a
         # missing/broken native extension raises ``EngineUnavailable``
@@ -336,23 +457,29 @@ class ZXingEngine:
         # leaking ``ImportError`` from the first ``detect_and_decode``.
         # ``_get_tables`` is ``@functools.cache``-d, so this is free
         # after the first ZXingEngine construction in the process.
-        arbez_to_zxing, _, _, _ = _get_tables()
-        # Validate up front; the alternative is a confusing zxing TypeError
-        # the first time scan() is called.
+        # ``barcode_formats_for`` validates ``formats`` and resolves
+        # the Model 2 request set (S-099).
+        _get_tables()
         if formats is not None:
-            unsupported = [s for s in formats if s not in arbez_to_zxing]
-            if unsupported:
-                raise ValueError(
-                    f"ZXingEngine: {unsupported} not in the zxing format table; "
-                    f"OTHER_1D is detect-only and can't be requested explicitly."
-                )
             self._formats: frozenset[Symbology] | None = frozenset(formats)
         else:
             self._formats = None
+        self._micro_qr = micro_qr
+        self._rmqr = rmqr
+        self._barcode_formats: Any = barcode_formats_for(
+            self._formats,
+            micro_qr=micro_qr,
+            rmqr=rmqr,
+        )
 
     def __repr__(self) -> str:
         fmts = "all" if self._formats is None else sorted(s.value for s in self._formats)
-        return f"ZXingEngine(formats={fmts})"
+        flags = ""
+        if self._micro_qr:
+            flags += ", micro_qr=True"
+        if self._rmqr:
+            flags += ", rmqr=True"
+        return f"ZXingEngine(formats={fmts}{flags})"
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -369,6 +496,7 @@ class ZXingEngine:
         ``_supported_input_formats`` on the first scan — that init now happens here.
         """
         from arbez.engines.helpers import prewarm_pil
+
         _get_tables()
         prewarm_pil()
 
@@ -386,15 +514,7 @@ class ZXingEngine:
 
     def detect_and_decode(
         self,
-        image: (
-            PILImage
-            | npt.NDArray[Any]
-            | str
-            | Path
-            | bytes
-            | bytearray
-            | IO[bytes]
-        ),
+        image: (PILImage | npt.NDArray[Any] | str | Path | bytes | bytearray | IO[bytes]),
     ) -> tuple[Detection, ...]:
         """Detect + decode every barcode in ``image``.
 
@@ -416,19 +536,12 @@ class ZXingEngine:
 
         pil_image = coerce_to_pil(image)
 
-        if self._formats is None:
-            raw_results = _z.read_barcodes(pil_image)
-        else:
-            arbez_to_zxing, _, _, _ = _get_tables()
-            # The 3.1 stub types ``formats`` as ``BarcodeFormats``. Build
-            # that set explicitly. Table values are Any (symbols are
-            # resolved with getattr), so append into a typed list rather
-            # than inferring list[Any]. Avoid the deprecated ``a | b``
-            # operator on BarcodeFormat.
-            chosen: list[_z.BarcodeFormat] = []
-            for sym in self._formats:
-                chosen.append(arbez_to_zxing[sym])
-            raw_results = _z.read_barcodes(pil_image, formats=_z.BarcodeFormats(chosen))
+        # S-099: never call read_barcodes without an explicit set.
+        # Omitting formats, or passing an empty BarcodeFormats, re-enables
+        # the QR family bit (Micro QR and rMQR included).
+        if self._barcode_formats is _NO_BARCODE_FORMATS:
+            return ()
+        raw_results = _z.read_barcodes(pil_image, formats=self._barcode_formats)
 
         detections: list[Detection] = []
         for r in raw_results:
@@ -441,7 +554,10 @@ class ZXingEngine:
         detections.sort(key=lambda d: d.score, reverse=True)
         _log.debug(
             "ZXing scan: raw=%d kept=%d image=%dx%d",
-            len(raw_results), len(detections), pil_image.width, pil_image.height,
+            len(raw_results),
+            len(detections),
+            pil_image.width,
+            pil_image.height,
         )
         return tuple(detections)
 

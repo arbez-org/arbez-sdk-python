@@ -61,12 +61,10 @@ def test_scanner_bare_default_is_consensus(qr_image: PILImage, qr_payload: str) 
     """
     s = Scanner()
     assert s.engine_name == "consensus", (
-        f"S-093 contract: Scanner() runs all-installed consensus; got "
-        f"engine_name={s.engine_name!r}"
+        f"S-093 contract: Scanner() runs all-installed consensus; got engine_name={s.engine_name!r}"
     )
     assert s.engines is not None and len(s.engines) >= 2, (
-        f"S-093 contract: default consensus runs the all-installed set; got "
-        f"{s.engines!r}"
+        f"S-093 contract: default consensus runs the all-installed set; got {s.engines!r}"
     )
     result = s.scan(qr_image)
     assert len(result) >= 1, "expected at least one detection on the QR fixture"
@@ -129,9 +127,7 @@ def test_scanner_repr_shows_resolved_engine() -> None:
     Never the removed placeholder ``"auto"`` regardless of path."""
     # S-093 multi-engine path: repr is the consensus shape, never "auto".
     s_default = Scanner()
-    assert "auto" not in repr(s_default), (
-        f"repr should not contain 'auto': {repr(s_default)!r}"
-    )
+    assert "auto" not in repr(s_default), f"repr should not contain 'auto': {repr(s_default)!r}"
     assert s_default.engine_name in repr(s_default)
     # Single-engine path: engine_name in repr is the resolved single engine.
     s_single = Scanner(engine="arbez")
@@ -152,9 +148,7 @@ def test_scanner_repr_shows_resolved_engine() -> None:
 
 
 @contextlib.contextmanager
-def _with_probed(
-    arbez: bool, apple_vision: bool, zxing: bool, wechat: bool
-) -> Iterator[None]:
+def _with_probed(arbez: bool, apple_vision: bool, zxing: bool, wechat: bool) -> Iterator[None]:
     """Context manager: force ``_probe_engines`` to a chosen boolean tuple and
     clear the dependent caches so the value takes effect this call.
 
@@ -164,7 +158,8 @@ def _with_probed(
     from arbez import _engine_discovery as ed
 
     with patch.object(
-        ed, "_probe_engines",
+        ed,
+        "_probe_engines",
         return_value=(arbez, apple_vision, zxing, wechat),
     ):
         ed._probe_engines.cache_clear()
@@ -191,8 +186,7 @@ def test_scanner_bare_single_engine_degrades() -> None:
     with _with_probed(True, False, False, False):
         s = Scanner()
         assert s.engine_name == "arbez", (
-            f"single-engine install should degrade to that engine; got "
-            f"{s.engine_name!r}"
+            f"single-engine install should degrade to that engine; got {s.engine_name!r}"
         )
         assert s.engines is None
         assert "consensus=" not in repr(s)
@@ -314,9 +308,7 @@ def test_resolve_auto_darwin_falls_back_to_apple_vision_without_arbez() -> None:
         patch.object(
             importlib.util,
             "find_spec",
-            side_effect=_find_spec_for(
-                {"Vision", "Foundation", "Quartz", "zxingcpp"}
-            ),
+            side_effect=_find_spec_for({"Vision", "Foundation", "Quartz", "zxingcpp"}),
         ),
     ):
         assert resolve_auto_engine() == "apple_vision"
@@ -364,9 +356,7 @@ def test_resolve_auto_linux_wechat_only_picks_wechat() -> None:
             "find_spec",
             side_effect=_find_spec_for({"cv2"}),
         ),
-        patch.dict(
-            sys.modules, {"cv2": types.SimpleNamespace(wechat_qrcode=object())}
-        ),
+        patch.dict(sys.modules, {"cv2": types.SimpleNamespace(wechat_qrcode=object())}),
     ):
         assert resolve_auto_engine() == "wechat"
 
@@ -461,3 +451,123 @@ def test_scanner_consensus_bool_raises_type_error() -> None:
     silently read as 1 — it raises TypeError."""
     with pytest.raises(TypeError, match="consensus must be an int"):
         Scanner(consensus=True)
+
+
+# ── S-099: symbology allow-list ────────────────────────────────────────────
+
+
+def test_scanner_qr_allow_list_keeps_qr_and_drops_code128(
+    qr_image: PILImage,
+    code128_image: PILImage,
+    qr_payload: str,
+) -> None:
+    from arbez import Symbology
+
+    scanner = Scanner(engine="zxing", symbologies={Symbology.QR})
+    qr = scanner.scan(qr_image)
+    assert len(qr.detections) == 1
+    assert qr.detections[0].payload == qr_payload
+    assert qr.detections[0].symbology is Symbology.QR
+    assert scanner.scan(code128_image).detections == ()
+
+    by_value = Scanner(engine="zxing", symbologies={"qr"})
+    assert len(by_value.scan(qr_image).detections) == 1
+    assert by_value.scan(code128_image).detections == ()
+
+
+def test_scanner_symbologies_reject_bad_shapes() -> None:
+    from arbez import Symbology
+
+    with pytest.raises(TypeError):
+        Scanner(symbologies="qr")
+    with pytest.raises(TypeError):
+        Scanner(symbologies=Symbology.QR)
+    with pytest.raises(ValueError):
+        Scanner(symbologies=set())
+    with pytest.raises(TypeError):
+        Scanner(micro_qr="yes")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        Scanner(rmqr=1)  # type: ignore[arg-type]
+
+
+def test_scanner_default_repr_omits_allow_list() -> None:
+    assert repr(Scanner(engine="zxing")) == "Scanner(engine='zxing')"
+    listed = repr(Scanner(engine="zxing", symbologies={"qr"}, micro_qr=True))
+    assert "symbologies=" in listed
+    assert "micro_qr=True" in listed
+
+
+def test_scanner_maxicode_allow_list_drops_qr(qr_image: PILImage) -> None:
+    from arbez import Symbology
+
+    scanner = Scanner(engine="zxing", symbologies={Symbology.MAXICODE})
+    assert scanner.scan(qr_image).detections == ()
+
+
+def test_prebuilt_engine_is_filtered_without_being_rebuilt(
+    qr_image: PILImage,
+    code128_image: PILImage,
+) -> None:
+    from arbez import Symbology
+    from arbez.engines.zxing import ZXingEngine
+
+    engine = ZXingEngine()
+    scanner = Scanner(engine=engine, symbologies={Symbology.QR})
+    assert scanner._get_engine() is engine
+    assert scanner.scan(code128_image).detections == ()
+    assert len(scanner.scan(qr_image).detections) == 1
+
+
+def test_consensus_receives_the_allow_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    from PIL import Image
+
+    from arbez import Symbology
+    from arbez.consensus import ConsensusResult
+
+    captured: dict[str, object] = {}
+
+    def fake(pil_image: object, engines: dict[str, object], **kwargs: object) -> ConsensusResult:
+        captured["symbologies"] = kwargs.get("symbologies")
+        return ConsensusResult(
+            detections=(),
+            per_engine={name: () for name in engines},
+        )
+
+    monkeypatch.setattr("arbez.consensus.run_consensus_detailed", fake)
+    scanner = Scanner(engines=("zxing", "arbez"), symbologies={Symbology.QR})
+    scanner.scan(Image.new("RGB", (32, 32), "white"))
+    assert captured["symbologies"] == frozenset({Symbology.QR})
+
+
+def test_apple_request_formats_exclude_micro_qr_by_default() -> None:
+    from arbez import Symbology
+    from arbez.scanner import _apple_request_formats
+
+    default = _apple_request_formats(None, micro_qr=False)
+    assert default is not None
+    assert Symbology.MICRO_QR not in default
+    assert Symbology.QR in default
+    assert _apple_request_formats(None, micro_qr=True) is None
+    qr_only = _apple_request_formats(frozenset({Symbology.QR}), micro_qr=False)
+    assert qr_only == frozenset({Symbology.QR})
+    # MaxiCode is not a Vision symbology. Empty means match nothing,
+    # which is distinct from None (Vision's "all symbologies").
+    assert (
+        _apple_request_formats(
+            frozenset({Symbology.MAXICODE}),
+            micro_qr=False,
+        )
+        == frozenset()
+    )
+    with_micro = _apple_request_formats(frozenset({Symbology.QR}), micro_qr=True)
+    assert with_micro == frozenset({Symbology.QR, Symbology.MICRO_QR})
+
+
+def test_apple_empty_formats_match_nothing(qr_image: PILImage) -> None:
+    pytest.importorskip("Vision")
+    from arbez import Symbology
+    from arbez.engines.apple_vision import AppleVisionEngine
+
+    assert AppleVisionEngine(formats=[]).detect_and_decode(qr_image) == ()
+    restricted = AppleVisionEngine(formats={Symbology.CODE_128})
+    assert restricted.detect_and_decode(qr_image) == ()

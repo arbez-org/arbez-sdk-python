@@ -65,6 +65,20 @@ the explicit maintainer act of tagging is the gate.
 
 ### Changed
 
+* **QR defaults are Model 2, and symbology allow-lists apply after consensus (S-099).**
+  ZXing and the arbez crop decoder request `QRCodeModel2` instead of
+  the QR family bit. Micro QR is off unless `micro_qr=True` or the
+  allow-list names `micro_qr`. rMQR is off unless `rmqr=True`, and a
+  successful rMQR read is reported as `Symbology.QR`.
+  `Scanner(symbologies=...)` restricts zxing formats and Apple Vision's
+  request, then drops a consensus cluster whose decoding engine
+  symbology is outside the set. The voted label is not used for that
+  check: an undecoded detector box can label a cluster `qr` while the
+  payload came from another symbology. libdmtx no longer runs on QR or
+  Micro QR proposals. `formats=[]` on `ZXingEngine` and
+  `AppleVisionEngine` matches nothing. Migration: pass `micro_qr=True`
+  to keep the old Micro QR behaviour; pass `symbologies={"qr"}` for a
+  QR-only scan instead of filtering the merged `qr` label yourself.
 * **Direct WeChat calls use the 2 s deadline (S-097).** `Scanner.scan`
   asks for 10 s, which covers the WeChat full-frame fallback (p95 about
   1.95 s). A direct `WeChatEngine.detect_and_decode` that exceeds 2 s

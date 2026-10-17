@@ -67,6 +67,8 @@ Scanner(engine="apple_vision")   # macOS-only, real confidence scores
 Scanner(engine="arbez")          # single-engine arbez (first-party YOLOX-s + zxing decoder)
 Scanner(engines=["arbez", "zxing"])  # union over just this subset
 Scanner(consensus=2)             # keep only codes >= 2 installed engines agree on
+Scanner(symbologies={"qr"})     # QR Model 2 only; Micro QR / rMQR stay off
+Scanner(micro_qr=True)           # also read Micro QR
 ```
 
 When to override:
@@ -140,6 +142,9 @@ Knobs:
 | `consensus` | `1` | Min unique engines that must agree on a bbox cluster. `1` = union (max recall), `len(engines)` = unanimous. Greater than the number of participating engines raises `ValueError`. |
 | `iou_threshold` | `0.5` | Bbox IoU >= this groups detections from different engines as the same physical barcode. |
 | `engines` | `None` (all installed) | Subset of engines that participate. Validated eagerly. |
+| `symbologies` | `None` (no filter) | Allow-list, enforced after the vote on the decoding engine's symbology (S-099). Also restricts zxing and Apple Vision requests. |
+| `micro_qr` | `False` | Opt in to Micro QR. |
+| `rmqr` | `False` | Opt in to rMQR. Reported as `qr`. |
 
 When to use it:
 

@@ -101,9 +101,7 @@ def test_blank_image_returns_empty(blank_image: PILImage) -> None:
     assert engine.detect_and_decode(blank_image) == ()
 
 
-def test_format_filter_restricts_decoding(
-    qr_image: PILImage, code128_image: PILImage
-) -> None:
+def test_format_filter_restricts_decoding(qr_image: PILImage, code128_image: PILImage) -> None:
     """When formats=QR only, a Code 128 image must yield zero detections — and a QR image must still
     decode normally."""
     qr_only = ZXingEngine(formats={Symbology.QR})
@@ -114,8 +112,7 @@ def test_format_filter_restricts_decoding(
 
     code128_detections = qr_only.detect_and_decode(code128_image)
     assert code128_detections == (), (
-        "expected the format filter to exclude Code 128, "
-        f"got {code128_detections!r}"
+        f"expected the format filter to exclude Code 128, got {code128_detections!r}"
     )
 
 
@@ -130,15 +127,15 @@ def test_construction_rejects_other_1d_in_formats() -> None:
 
 
 _DATABAR_VARIANT_NAMES = (
-    "DataBar",          # Family/union bit — what callers pass via formats=
-    "DataBarOmni",      # Decoded variant for treepoem 'databaromni' renders
-    "DataBarStk",       # RSS Stacked
-    "DataBarStkOmni",   # RSS Stacked Omnidirectional
-    "DataBarLtd",       # RSS Limited
-    "DataBarExp",       # RSS Expanded
-    "DataBarExpStk",    # RSS Expanded Stacked
+    "DataBar",  # Family/union bit — what callers pass via formats=
+    "DataBarOmni",  # Decoded variant for treepoem 'databaromni' renders
+    "DataBarStk",  # RSS Stacked
+    "DataBarStkOmni",  # RSS Stacked Omnidirectional
+    "DataBarLtd",  # RSS Limited
+    "DataBarExp",  # RSS Expanded
+    "DataBarExpStk",  # RSS Expanded Stacked
     "DataBarExpanded",  # Alias for DataBarExp on older zxing-cpp; same int
-    "DataBarLimited",   # Alias for DataBarLtd; same int
+    "DataBarLimited",  # Alias for DataBarLtd; same int
 )
 
 
@@ -167,8 +164,7 @@ def test_s082_every_databar_variant_maps_to_gs1_databar(variant_name: str) -> No
         # keeps the skip message and satisfies strict mypy (attr-defined).
         zxing_version = getattr(zxingcpp, "__version__", "unknown")
         pytest.skip(
-            f"BarcodeFormat.{variant_name} not exposed by zxing-cpp "
-            f"{zxing_version}; skipping"
+            f"BarcodeFormat.{variant_name} not exposed by zxing-cpp {zxing_version}; skipping"
         )
 
     _, zxing_to_arbez, _, _ = _get_tables()
@@ -178,8 +174,7 @@ def test_s082_every_databar_variant_maps_to_gs1_databar(variant_name: str) -> No
         "silently dropped"
     )
     assert zxing_to_arbez[bf_value] is Symbology.GS1_DATABAR, (
-        f"BarcodeFormat.{variant_name} maps to "
-        f"{zxing_to_arbez[bf_value]!r} instead of GS1_DATABAR"
+        f"BarcodeFormat.{variant_name} maps to {zxing_to_arbez[bf_value]!r} instead of GS1_DATABAR"
     )
 
 
@@ -194,15 +189,13 @@ def test_s082_translate_surfaces_databar_omni_detection() -> None:
 
     if not hasattr(zxingcpp.BarcodeFormat, "DataBarOmni"):
         zxing_version = getattr(zxingcpp, "__version__", "unknown")
-        pytest.skip(
-            f"BarcodeFormat.DataBarOmni not exposed by zxing-cpp "
-            f"{zxing_version}"
-        )
+        pytest.skip(f"BarcodeFormat.DataBarOmni not exposed by zxing-cpp {zxing_version}")
 
     class _FakePos:
         class _Pt:
             def __init__(self, x: float, y: float) -> None:
                 self.x, self.y = x, y
+
         top_left = _Pt(10, 10)
         top_right = _Pt(100, 10)
         bottom_right = _Pt(100, 40)
@@ -240,13 +233,16 @@ def test_s076_codabar_itf_maxicode_are_mapped_to_zxing_format() -> None:
     """
     # Pure construction smoke: if any of the three isn't mapped,
     # ZXingEngine raises during ctor validation.
-    eng = ZXingEngine(formats={
-        Symbology.CODABAR, Symbology.ITF, Symbology.MAXICODE,
-    })
+    eng = ZXingEngine(
+        formats={
+            Symbology.CODABAR,
+            Symbology.ITF,
+            Symbology.MAXICODE,
+        }
+    )
     r = repr(eng)
     assert "codabar" in r and "itf" in r and "maxicode" in r, (
-        f"Expected the three S-076 symbology names in the format summary; "
-        f"got {r!r}"
+        f"Expected the three S-076 symbology names in the format summary; got {r!r}"
     )
 
 
@@ -261,10 +257,12 @@ def test_s076_codabar_itf_no_longer_bucket_into_other_1d() -> None:
     contract; pinning it covers the user-visible behavior change.
     """
     from arbez.engines.zxing import _build_format_table
+
     _arbez_to_zxing, zxing_to_arbez, other_1d, drop_matrix = _build_format_table()
 
     # Resolve the zxing BarcodeFormat enum values.
     import zxingcpp  # type: ignore[import-untyped, import-not-found, unused-ignore]
+
     bf = zxingcpp.BarcodeFormat
 
     # Forward mapping: the three new members map to their zxing
@@ -279,8 +277,7 @@ def test_s076_codabar_itf_no_longer_bucket_into_other_1d() -> None:
     # the only members pre-S-076). If zxing-cpp adds a new 1D format
     # in the future, that new format would land here until we promote it.
     assert other_1d == frozenset(), (
-        f"S-076 expects OTHER_1D bucket empty after Codabar + ITF promoted; "
-        f"got {other_1d!r}"
+        f"S-076 expects OTHER_1D bucket empty after Codabar + ITF promoted; got {other_1d!r}"
     )
 
     # MaxiCode should be removed from drop_matrix — it's a real
@@ -351,3 +348,219 @@ def test_init_raises_engine_unavailable_when_zxingcpp_missing(
     monkeypatch.setitem(sys.modules, "zxingcpp", None)
     with pytest.raises(EngineUnavailable):
         ZXingEngine()
+
+
+# ── S-099: QRCodeModel2 default, Micro QR / rMQR opt-in ───────────────────
+
+
+def _capture_read_formats(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Replace ``zxingcpp.read_barcodes`` and record the ``formats`` argument.
+
+    The replacement returns no barcodes. Callers that need a real decode
+    do not use this helper.
+    """
+    import zxingcpp
+
+    captured: dict[str, object] = {}
+
+    def spy(image: object, formats: object = None, **_kwargs: object) -> list[object]:
+        del image
+        captured["formats"] = formats
+        captured["called"] = True
+        return []
+
+    monkeypatch.setattr(zxingcpp, "read_barcodes", spy)
+    return captured
+
+
+def _format_members(formats: object) -> set[object]:
+    """Membership via ``set``, not ``BarcodeFormats.__contains__`` (untyped)."""
+    from collections.abc import Iterable
+    from typing import cast
+
+    assert isinstance(formats, Iterable)
+    return set(cast(Iterable[object], formats))
+
+
+def _render_zxing(fmt_name: str, text: str) -> PILImage:
+    """Generate a symbol at runtime. No binary fixture is committed."""
+    import numpy as np
+    import zxingcpp
+    from PIL import Image
+
+    barcode = zxingcpp.create_barcode(text, getattr(zxingcpp.BarcodeFormat, fmt_name))
+    rendered = zxingcpp.write_barcode_to_image(barcode, scale=4)
+    return Image.fromarray(np.asarray(rendered)).convert("RGB")
+
+
+def test_default_request_is_model2_not_the_qr_family(
+    monkeypatch: pytest.MonkeyPatch,
+    qr_image: PILImage,
+) -> None:
+    """S-099: the default reader asks for Model 2, not the QR family bit.
+
+    The family bit also enables Micro QR and rMQR, which is where the
+    measured QR-family misreads came from.
+    """
+    import zxingcpp
+
+    captured = _capture_read_formats(monkeypatch)
+    ZXingEngine().detect_and_decode(qr_image)
+    members = _format_members(captured["formats"])
+    bf = zxingcpp.BarcodeFormat
+    assert bf.QRCodeModel2 in members
+    assert bf.QRCode not in members
+    assert bf.MicroQRCode not in members
+    assert bf.RMQRCode not in members
+    assert bf.Code128 in members
+
+
+def test_qr_only_formats_request_model2(
+    monkeypatch: pytest.MonkeyPatch,
+    qr_image: PILImage,
+) -> None:
+    import zxingcpp
+
+    captured = _capture_read_formats(monkeypatch)
+    ZXingEngine(formats={Symbology.QR}).detect_and_decode(qr_image)
+    members = _format_members(captured["formats"])
+    bf = zxingcpp.BarcodeFormat
+    assert members == {bf.QRCodeModel2}
+
+
+def test_micro_qr_and_rmqr_flags_add_opt_in_formats(
+    monkeypatch: pytest.MonkeyPatch,
+    qr_image: PILImage,
+) -> None:
+    import zxingcpp
+
+    bf = zxingcpp.BarcodeFormat
+    captured = _capture_read_formats(monkeypatch)
+    ZXingEngine(micro_qr=True).detect_and_decode(qr_image)
+    members = _format_members(captured["formats"])
+    assert bf.MicroQRCode in members
+    assert bf.RMQRCode not in members
+    assert bf.QRCodeModel2 in members
+
+    captured.clear()
+    ZXingEngine(rmqr=True).detect_and_decode(qr_image)
+    members = _format_members(captured["formats"])
+    assert bf.RMQRCode in members
+    assert bf.MicroQRCode not in members
+
+
+def test_explicit_micro_qr_is_opt_in_without_the_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    blank_image: PILImage,
+) -> None:
+    import zxingcpp
+
+    captured = _capture_read_formats(monkeypatch)
+    ZXingEngine(formats={Symbology.MICRO_QR}).detect_and_decode(blank_image)
+    members = _format_members(captured["formats"])
+    bf = zxingcpp.BarcodeFormat
+    assert bf.MicroQRCode in members
+    assert bf.QRCodeModel2 not in members
+    assert bf.QRCode not in members
+
+
+def test_rmqr_flag_without_qr_in_allow_list_does_not_request_rmqr(
+    monkeypatch: pytest.MonkeyPatch,
+    blank_image: PILImage,
+) -> None:
+    """An rMQR read is reported as QR, so it is not requested unless QR is allowed."""
+    import zxingcpp
+
+    captured = _capture_read_formats(monkeypatch)
+    ZXingEngine(formats={Symbology.CODE_128}, rmqr=True).detect_and_decode(blank_image)
+    members = _format_members(captured["formats"])
+    bf = zxingcpp.BarcodeFormat
+    assert bf.RMQRCode not in members
+    assert bf.Code128 in members
+
+
+def test_empty_formats_match_nothing_and_do_not_call_zxing(
+    monkeypatch: pytest.MonkeyPatch,
+    qr_image: PILImage,
+) -> None:
+    """``BarcodeFormats([])`` means every symbology. Empty must not reach it."""
+    captured = _capture_read_formats(monkeypatch)
+    assert ZXingEngine(formats=[]).detect_and_decode(qr_image) == ()
+    assert captured.get("called") is not True
+
+
+def test_bool_flags_rejected() -> None:
+    with pytest.raises(TypeError):
+        ZXingEngine(micro_qr=1)  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        ZXingEngine(rmqr=0)  # type: ignore[arg-type]
+
+
+def test_s099_forward_map_is_model2_and_inverse_keeps_family_label() -> None:
+    """zxing-cpp 3.1.1 labels a Model 2 read as ``BarcodeFormat.QRCode``.
+
+    The request uses Model 2. The inverse map must still accept the
+    family tag, or every successful QR is dropped.
+    """
+    import zxingcpp
+
+    from arbez.engines.zxing import _get_tables
+
+    forward, inverse, _other, drop = _get_tables()
+    bf = zxingcpp.BarcodeFormat
+    assert forward[Symbology.QR] is bf.QRCodeModel2
+    assert inverse[bf.QRCode] is Symbology.QR
+    assert inverse[bf.QRCodeModel2] is Symbology.QR
+    assert inverse[bf.RMQRCode] is Symbology.QR
+    assert bf.RMQRCode not in drop
+    assert bf.QRCode not in set(forward.values())
+
+
+def test_generated_micro_qr_is_opt_in() -> None:
+    image = _render_zxing("MicroQRCode", "M1")
+    assert ZXingEngine().detect_and_decode(image) == ()
+    hits = ZXingEngine(micro_qr=True).detect_and_decode(image)
+    assert len(hits) == 1
+    assert hits[0].symbology is Symbology.MICRO_QR
+    assert hits[0].payload == "M1"
+
+
+def test_generated_rmqr_is_opt_in_and_reported_as_qr() -> None:
+    image = _render_zxing("RMQRCode", "RM")
+    assert ZXingEngine().detect_and_decode(image) == ()
+    hits = ZXingEngine(rmqr=True).detect_and_decode(image)
+    assert len(hits) == 1
+    assert hits[0].symbology is Symbology.QR
+    assert hits[0].payload == "RM"
+
+
+def test_crop_reader_uses_model2_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Arbez crop reads must not call zxing with the QR family bit."""
+    import zxingcpp
+    from PIL import Image
+
+    from arbez.engines.arbez import ArbezEngine
+    from arbez.engines.zxing import barcode_formats_for
+
+    captured: dict[str, object] = {}
+
+    def spy(image: object, *args: object, **kwargs: object) -> list[object]:
+        captured["formats"] = kwargs.get("formats")
+        return []
+
+    monkeypatch.setattr(zxingcpp, "read_barcodes", spy)
+    formats = barcode_formats_for(None)
+    ArbezEngine._zxing_read_first_valid(zxingcpp, Image.new("RGB", (32, 32)), formats)
+    members = _format_members(captured["formats"])
+    bf = zxingcpp.BarcodeFormat
+    assert bf.QRCodeModel2 in members
+    assert bf.QRCode not in members
+    assert bf.MicroQRCode not in members
+    assert bf.RMQRCode not in members
+
+
+def test_opt_in_flags_appear_in_repr() -> None:
+    assert "all" in repr(ZXingEngine(micro_qr=True))
+    assert "micro_qr=True" in repr(ZXingEngine(micro_qr=True))
+    assert "rmqr=True" in repr(ZXingEngine(rmqr=True))
+    assert "micro_qr" not in repr(ZXingEngine())
