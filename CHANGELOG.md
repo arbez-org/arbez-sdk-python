@@ -212,6 +212,14 @@ the explicit maintainer act of tagging is the gate.
   The classical pass is not started when the net pass was the call
   that raised.
 
+### Fixed
+
+* **A libdmtx failure no longer drops barcodes already decoded on that
+  image (S-097).** A Python error from the pooled decoder is a miss for
+  that crop. A worker that dies or is not ready while loading is a
+  crash or a timeout on `Result.extras`, and is not run in the caller.
+  Creating the shared-memory segment can fail the same way.
+
 ### Security
 
 * **A zxing-cpp native hang no longer takes down the host** when the

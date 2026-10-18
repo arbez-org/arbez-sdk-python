@@ -1202,9 +1202,12 @@ class ArbezEngine:
         except Exception as e:
             _log.debug("ArbezEngine: libdmtx fallback failed: %r", e)
             return None
-        # Outside the swallow. A crash or a deadline is a miss. An init
-        # failure, a startup deadline, and a Python error from decode
-        # still propagate, and the pool does not retry those in-process.
+        # Outside the swallow. A crash or a deadline, including a worker
+        # that dies or is not ready while loading, is a PoolResult and a
+        # miss. A Python error from decode still propagates from this
+        # helper, and the pool does not retry a failed init in-process.
+        # The detection loop catches that error so one crop does not
+        # discard barcodes already decoded on the image.
         outcome = libdmtx_pool().call(array)
         if outcome.status != "ok" or not isinstance(outcome.value, str):
             return None
@@ -1285,7 +1288,17 @@ class ArbezEngine:
                         allow=self._symbology_allow,
                     )
                 ):
-                    dmtx_payload = self._dmtx_decode_one(dmtx_decode, pil_image, d)
+                    try:
+                        dmtx_payload = self._dmtx_decode_one(dmtx_decode, pil_image, d)
+                    except Exception as exc:
+                        # One crop. Earlier zxing hits in ``out`` stay, and
+                        # later boxes still decode. The helper itself still
+                        # raises, so a startup error is not retried here.
+                        _log.warning(
+                            "ArbezEngine: libdmtx fallback failed on one crop: %r",
+                            exc,
+                        )
+                        dmtx_payload = None
                     if dmtx_payload is not None:
                         payload = dmtx_payload
                         decode_stage = "libdmtx"
