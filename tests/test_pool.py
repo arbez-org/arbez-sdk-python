@@ -1420,7 +1420,7 @@ def test_replacement_ready_wait_uses_the_call_deadline() -> None:
     pool._ready = False
     try:
         result = pool.call(_image(0), deadline=2.0)
-        assert seen["timeout"] == 2.0
+        assert 1.5 < seen["timeout"] <= 2.0
         assert result.status == "timeout"
         assert result.isolation == "process"
         assert pool.last_was_startup_fault is True
@@ -1452,11 +1452,11 @@ def test_libdmtx_startup_fault_is_not_paid_on_the_next_crop(
                 value=None,
                 detail="worker was not ready within 120s",
                 isolation="process",
+                startup_fault=True,
             )
 
     pool = _Startup()
     monkeypatch.setattr("arbez.engines.arbez.libdmtx_pool", lambda: pool)
-    monkeypatch.setattr("arbez.engines.arbez.libdmtx_pool_if_any", lambda: pool)
 
     engine = ArbezEngine(decode=True)
     engine._zxing_module = object()
@@ -1481,6 +1481,101 @@ def test_libdmtx_startup_fault_is_not_paid_on_the_next_crop(
     dets = engine._decode_detections([first, second], img)
     assert calls["n"] == 1
     assert [d.payload for d in dets] == [None, None]
+
+
+def test_libdmtx_python_error_does_not_skip_the_next_crop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raised decode leaves the worker up, so the next crop still runs."""
+    from arbez.engines._yolox import RawDetection
+    from arbez.engines.arbez import ArbezEngine
+    from arbez.exceptions import EngineRuntimeError
+
+    calls = {"n": 0}
+
+    class _RaisesOnce:
+        def call(self, _image_arg: object, deadline: float | None = None) -> PoolResult:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise EngineRuntimeError("decode blew up")
+            return PoolResult(
+                status="ok",
+                value="SECOND",
+                detail="",
+                isolation="process",
+            )
+
+    pool = _RaisesOnce()
+    monkeypatch.setattr("arbez.engines.arbez.libdmtx_pool", lambda: pool)
+
+    engine = ArbezEngine(decode=True)
+    engine._zxing_module = object()
+    engine._zxing_probed = True
+
+    def decode_one(*_a: object, **_k: object) -> tuple[None, None, None]:
+        return (None, None, None)
+
+    monkeypatch.setattr(engine, "_decode_one", decode_one)
+
+    def real_decode(*_a: object, **_k: object) -> None:
+        raise AssertionError("libdmtx ran in-process")
+
+    real_decode.__module__ = "arbez_dmtx._libdmtx.pylibdmtx"
+    real_decode.__name__ = "decode"
+    engine._dmtx_decode = real_decode
+    engine._dmtx_probed = True
+
+    img = Image.new("RGB", (300, 300), "white")
+    first = RawDetection(20.0, 20.0, 140.0, 140.0, 0.9, 2)
+    second = RawDetection(160.0, 160.0, 280.0, 280.0, 0.9, 2)
+    dets = engine._decode_detections([first, second], img)
+    assert calls["n"] == 2
+    assert [d.payload for d in dets] == [None, "SECOND"]
+
+
+def test_ready_frame_shares_the_startup_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial ready frame is the same timeout, not an unbounded recv."""
+    import arbez.engines._pool as pool_mod
+
+    pool = _pool()
+
+    class _Conn:
+        def poll(self, _timeout: float) -> bool:
+            return True
+
+    class _Alive:
+        exitcode = None
+
+        def is_alive(self) -> bool:
+            return True
+
+    def _stall(_conn: object, _deadline_at: float) -> None:
+        raise pool_mod._ReplyTimeout
+
+    monkeypatch.setattr(pool_mod, "_recv_reply", _stall)
+    with pytest.raises(pool_mod._WorkerStartupFault) as raised:
+        pool._wait_ready(_Conn(), _Alive(), 30.0)  # type: ignore[arg-type]
+    assert raised.value.kind == "timeout"
+
+
+def test_worker_exits_when_the_parent_death_pipe_closes() -> None:
+    """SIGKILL of the parent closes this end. The child must exit too."""
+    _require_process_pools()
+    pool = _pool()
+    try:
+        pool.start()
+        proc = pool._proc
+        death = pool._death_send
+        assert proc is not None and proc.is_alive()
+        assert death is not None
+        death.close()
+        pool._death_send = None
+        proc.join(3)
+        assert proc.is_alive() is False
+    finally:
+        pool.close()
 
 
 def test_libdmtx_timeout_is_recorded_on_the_scan(

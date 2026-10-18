@@ -135,6 +135,9 @@ class PoolResult:
     value: Any
     detail: str
     isolation: str
+    # Set under the pool lock. Callers must read this, not a flag on the
+    # pool, because the next call clears pool state after the lock drops.
+    startup_fault: bool = False
 
 
 def active_deadline() -> float:
@@ -469,8 +472,31 @@ def _die_on_access_violation() -> None:
     os._exit(3)
 
 
-def _worker_main(entrypoint: str, conn: Connection) -> None:
+def _arm_parent_death(death: Connection) -> None:
+    """Exit when the parent closes its end, including after SIGKILL.
+
+    ``daemon=True`` is a Python flag. It does not kill the child when the
+    parent is SIGKILL'd, and the child holds the resource-tracker fd until
+    it exits. This thread stays blocked in ``recv`` while the worker is
+    inside a native call, so ``os._exit`` still runs.
+    """
+
+    def _watch() -> None:
+        with contextlib.suppress(Exception):
+            death.recv()
+        os._exit(1)
+
+    threading.Thread(target=_watch, name="arbez-parent-death", daemon=True).start()
+
+
+def _worker_main(
+    entrypoint: str,
+    conn: Connection,
+    death: Connection | None = None,
+) -> None:
     """Spawn target. Top-level so the child pickles a string, not a closure."""
+    if death is not None:
+        _arm_parent_death(death)
     import faulthandler
 
     import numpy as np
@@ -707,6 +733,7 @@ class EnginePool:
         self._lock = threading.RLock()
         self._proc: mp.Process | None = None
         self._conn: Connection | None = None
+        self._death_send: Connection | None = None
         self._inprocess_fn: Callable[[Any], Any] | None = None
         _live_pools.add(self)
         _log_choice(self.isolation, self.fallback_reason)
@@ -749,14 +776,17 @@ class EnginePool:
             if self.isolation == "inprocess":
                 self._load_inprocess()
                 return
+            self.last_was_startup_fault = False
             try:
                 self._ensure_worker()
             except _PoolUnavailable:
                 # Spawn failed. Do not load the native engine here.
                 return
             except _WorkerStartupFault:
-                # Died or still loading. The next call records that.
-                # Do not load the native engine in this process.
+                # Died or still loading. Do not load the native engine
+                # in this process. The failure is not sticky: the next
+                # call may use the cold-start budget again.
+                self.last_was_startup_fault = True
                 return
 
     def call(self, image: npt.NDArray[Any], deadline: float | None = None) -> PoolResult:
@@ -853,6 +883,7 @@ class EnginePool:
                 value=None,
                 detail=exc.detail,
                 isolation="process",
+                startup_fault=True,
             )
         conn = self._conn
         proc = self._proc
@@ -988,9 +1019,12 @@ class EnginePool:
     def _spawn_worker(self) -> None:
         ctx = _spawn_context()
         parent, child = ctx.Pipe(duplex=True)
+        # Unidirectional: the parent keeps the send end. The child blocks
+        # on the recv end and exits when that end closes.
+        death_recv, death_send = ctx.Pipe(duplex=False)
         proc: mp.Process = ctx.Process(
             target=_worker_main,
-            args=(self._entrypoint, child),
+            args=(self._entrypoint, child, death_recv),
             daemon=True,
             name=f"arbez-{self.engine}",
         )
@@ -999,10 +1033,15 @@ class EnginePool:
         except OSError as exc:
             parent.close()
             child.close()
+            death_recv.close()
+            death_send.close()
             # Leave isolation as process. call() records a crash result
             # instead of running this engine in the parent.
             raise _PoolUnavailable(f"spawn failed: {exc}") from exc
         child.close()
+        death_recv.close()
+        self._close_death_send()
+        self._death_send = death_send
         self._proc = proc
         self._conn = parent
         self._ready = False
@@ -1023,7 +1062,11 @@ class EnginePool:
         self._ever_ready = True
 
     def _wait_ready(self, conn: Connection, proc: mp.Process, budget: float) -> None:
-        if not conn.poll(budget):
+        # poll and the frame read share one budget. poll returns as soon
+        # as the first byte arrives; recv() with no deadline would then
+        # wait forever for the rest of the pickle.
+        deadline_at = time.monotonic() + budget
+        if not conn.poll(max(0.0, deadline_at - time.monotonic())):
             if not proc.is_alive():
                 raise _WorkerStartupFault(
                     "crash",
@@ -1034,7 +1077,17 @@ class EnginePool:
                 f"engine {self.engine} worker was not ready within {budget:.0f}s",
             )
         try:
-            message: Any = conn.recv()
+            message: Any = _recv_reply(conn, deadline_at)
+        except _ReplyTimeout:
+            if not proc.is_alive():
+                raise _WorkerStartupFault(
+                    "crash",
+                    f"engine {self.engine} worker died during init exit {proc.exitcode}",
+                ) from None
+            raise _WorkerStartupFault(
+                "timeout",
+                f"engine {self.engine} worker was not ready within {budget:.0f}s",
+            ) from None
         except (EOFError, OSError) as exc:
             raise _WorkerStartupFault(
                 "crash",
@@ -1058,7 +1111,15 @@ class EnginePool:
             raise EngineRuntimeError(str(text))
         raise EngineRuntimeError(f"engine {self.engine} worker sent {message!r} during init")
 
+    def _close_death_send(self) -> None:
+        death = self._death_send
+        self._death_send = None
+        if death is not None:
+            with contextlib.suppress(Exception):
+                death.close()
+
     def _stop_worker(self) -> None:
+        self._close_death_send()
         proc = self._proc
         conn = self._conn
         self._proc = None
@@ -1078,6 +1139,7 @@ class EnginePool:
             conn.close()
 
     def _kill_worker(self) -> None:
+        self._close_death_send()
         proc = self._proc
         conn = self._conn
         self._proc = None
