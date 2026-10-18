@@ -63,6 +63,34 @@ the explicit maintainer act of tagging is the gate.
   `if __name__ == "__main__"` guard runs the engine in-process. That
   choice is logged once.
 
+### Security
+
+* **Decompression-bomb pixel limit (S-101).** `coerce_to_pil` rejects
+  an image whose width times height is above 89,478,485 pixels
+  (Pillow's default `Image.MAX_IMAGE_PIXELS`). The error is
+  `InvalidInputError` and names the size and the limit. The check uses
+  the container header, before the pixels are decoded, and it still
+  applies when `Image.MAX_IMAGE_PIXELS` is `None`. Pillow itself only
+  raises above twice that limit. WebP and ICO are rejected from the
+  container header before those plugins allocate or `load()` inside
+  `Image.open`. The ICO size is the last embedded PNG `IHDR` before
+  the first IDAT, fdAT, or IEND, including when another chunk or an
+  earlier `IHDR` precedes it. An ICO whose frame size cannot be
+  read, or whose chunk walk hits its cap before one of those three,
+  is rejected instead of opened. An oversize array shape is
+  rejected the same way.
+  When Pillow's own check raises, the error quotes that limit (twice
+  the process global), not this constant.
+
+### Deprecated
+
+* **`Scanner.scan(..., preprocess="auto")` (S-101).** Emits
+  `DeprecationWarning` and behaves as `"off"`. The long-axis downscale
+  and autocontrast are not applied, and `timings_ms` no longer gains a
+  `"preprocess"` key. Removed in 0.4.0. Omit the argument, or pass
+  `"off"`. Callers who wanted the downscale should resize before
+  `scan`.
+
 ### Changed
 
 * **QR defaults are Model 2, and symbology allow-lists apply after consensus (S-099).**
@@ -91,6 +119,36 @@ the explicit maintainer act of tagging is the gate.
   1.95 s). A direct `WeChatEngine.detect_and_decode` that exceeds 2 s
   comes back empty and sets `engine_faults` when a `Scanner` bound the
   call. Scan through `Scanner` when that frame matters.
+
+* **EXIF orientation is applied on load (S-101).** `coerce_to_pil`
+  transposes orientations 2–8 and clears the tag, so a second coerce
+  does not rotate again. `Result.image_size` and detection coordinates
+  are that oriented frame. A missing tag, or orientation 1, is
+  unchanged, including the no-copy path for an RGB PIL image. An
+  already-open TIFF is oriented from a private copy of its bytes at
+  the caller's current frame, so the caller's image is not loaded
+  and an earlier frame is not substituted. The path is tried first;
+  a failed open reads the live file pointer. If the bytes or that
+  frame cannot be reread, `coerce_to_pil` raises `InvalidInputError`
+  instead of returning the caller's TIFF. XMP-only
+  `tiff:Orientation` uses the same source as the bytes path, on
+  that private image, before `image_size` is recorded. A closed
+  TIFF raises `InvalidInputError`.
+
+* **Per-stage and per-engine timings (S-101).** `Result.timings_ms`
+  now includes `"coerce"` on every scan and `"engine.<name>"` for each
+  engine that ran. `"engine"` (single-engine total) and `"consensus"`
+  (multi-engine wall clock) are unchanged. On the parallel path each
+  `"engine.<name>"` is that engine's own time, not a slice of
+  `"consensus"`. The key is written only when `detect_and_decode`
+  returns. On the single-engine path the clock starts after the
+  engine object exists, so the first scan's lazy construction is not
+  included.
+
+* **`Result.extras["stage_hit"]` (S-101).** Tuple of engine names that
+  returned a non-empty payload, in engine-set order, or `()` when
+  nothing decoded. `None` and `""` are not hits. `extras` is
+  read-only, same as `timings_ms`.
 
 * **WeChatEngine loads the vendored WeChat QR nets (S-096).**
   `detect.onnx` and `sr.onnx` ship in the package and are passed to

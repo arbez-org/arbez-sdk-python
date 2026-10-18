@@ -11,6 +11,151 @@ ID prefix is `S-` (for SDK).
 
 ---
 
+## S-101 — EXIF on load, a hard pixel limit, per-stage timings (2026-10-17)
+
+**Context.** `coerce_to_pil` decoded whatever Pillow stored. A JPEG with
+EXIF orientation 6 (the usual phone "rotate me 90 degrees" tag) was
+scanned as the sideways buffer, so `Result.image_size` and detection
+coordinates were not the frame a viewer sees. Pillow does not apply
+that tag in `Image.open`.
+
+The same function trusted Pillow's decompression-bomb check.
+`Image.MAX_IMAGE_PIXELS` defaults to 89,478,485. That many 24-bit
+pixels is 256 MiB, a quarter gigabyte, not a gigabyte. Pillow only
+warns above that and raises
+`DecompressionBombError` above twice that, and any other library can
+set the global to `None` and turn the check off. A header that claims
+a huge size is enough; the pixels do not have to be present.
+
+`Result.timings_ms` carried one number: `"engine"` or `"consensus"`,
+plus `"preprocess"` when `scan(..., preprocess="auto")` downscaled.
+There was no per-engine time and no record of which engine produced a
+payload. `preprocess="auto"` (long-axis cap 2000 px, plus autocontrast)
+is the mode S-053 measured as a decode regression on every built-in
+engine. S-022 left it in place.
+
+**Decision.**
+
+* Apply EXIF orientations 2–8 in `coerce_to_pil`, for paths, bytes,
+  file-like objects, and an already-open PIL image. Use Pillow's
+  transpose, which clears the tag, so a second coerce does not rotate
+  again. Orientation missing or 1 returns the same object when the
+  image is already RGB (the no-copy fast path stays). Do not mutate
+  the caller's image. An unreadable tag is left as stored and logged
+  at debug: failing the scan would drop photos whose pixels still
+  decode. `Result.image_size` and detection coordinates are this
+  oriented frame.
+* Reject `width * height > 89_478_485` with `InvalidInputError` that
+  names the size and the limit. The constant is inlined
+  (`MAX_IMAGE_PIXELS` in `engines/helpers.py`); it does not read
+  `Image.MAX_IMAGE_PIXELS`, so setting that global to `None` or to a
+  larger number does not disable it. The check runs on the container
+  header, before `convert` allocates pixels. Pillow's
+  `DecompressionBombError` (above twice the limit) is still wrapped in
+  `InvalidInputError`. Pillow's warning in the band between the limit
+  and twice the limit is swallowed on this path, because the same
+  image raises. A numpy-like `shape` is checked before `fromarray`.
+* `Result.timings_ms` gains `"coerce"` on every scan, keeps `"engine"`
+  (single-engine total) and `"consensus"` (multi-engine wall clock,
+  including the merge), and adds `"engine.<name>"` for each engine
+  that ran. On the single-engine path `"engine.<name>"` equals
+  `"engine"`. On the multi-engine path the engines run in parallel, so
+  each `"engine.<name>"` is that call's own time, not a slice of
+  `"consensus"`. The vote does not return per-engine times; `scan`
+  wraps the engines for that one call. `"preprocess"` is no longer
+  written.
+* `Result.extras` is a read-only mapping, same freezing rule as
+  `timings_ms` (S-016). `extras["stage_hit"]` is the tuple of engine
+  names that returned at least one non-empty payload, in the Scanner's
+  engine order. `None` and `""` are not hits. Completion order is not
+  stable under the parallel vote. The tuple is empty when nothing
+  decoded. Today the entries are engine names. The mapping is open
+  for later stage names.
+* `preprocess="auto"` emits `DeprecationWarning` and behaves as
+  `"off"`. The literal stays in `PreprocessMode` until removal in
+  0.4.0 so existing callers still type-check. The private downscale
+  helper stays until that removal; `scan` does not call it.
+
+**Alternatives considered.**
+
+* Delete `"auto"` in this release. Callers would raise. A warning plus
+  the old default is the migration; 0.4.0 removes the value.
+* Keep the downscale behind the warning. S-053 already measured it as
+  a regression, and a deprecated mode that still changes pixels is a
+  trap.
+* Read `Image.MAX_IMAGE_PIXELS` at call time. That honours a stricter
+  setting and also honours `None`, which is how the guard gets turned
+  off. The SDK limit has to hold for untrusted images either way.
+* Put `stage_hit` only on `Detection.extras`. That field is per code
+  and already carries engine metadata. The scan-level list is what a
+  caller compares to `timings_ms`, and `Result` had nowhere else to
+  put it.
+* Time the engines inside `run_consensus_detailed`. That records the
+  same numbers, and it changes the vote module for a measurement the
+  caller can take by wrapping `detect_and_decode`.
+
+**Consequences.**
+
+* Photos with an orientation tag change `image_size` and coordinates.
+  Images without one do not, which is the paired-decode gate (difference
+  0 except EXIF-rotated fixtures). This PR does not run QR-Bench; the
+  gate is the generated fixtures in `tests/test_input_types.py`.
+* A second `coerce_to_pil` on the returned RGB image is identity when
+  the tag was cleared. Callers who orient the pixels themselves and
+  also leave the tag on will be oriented twice. That is the tag's
+  meaning; strip it if the pixels are already upright.
+* `AppleVisionEngine`'s direct-path loader
+  (`to_cgimage_from_path`) still does not apply EXIF. `Scanner.scan`
+  does, because it coerces to a PIL image before any engine runs.
+  Passing a path straight to that engine bypasses this decision.
+* The pixel-limit error is `InvalidInputError`. Above twice the limit
+  the cause is Pillow's `DecompressionBombError`. Between the limit
+  and twice that, and for an oversize array shape, there is no cause.
+* `"engine"` remains absent on the multi-engine path, so existing
+  checks that distinguish `"engine"` from `"consensus"` still hold.
+* `preprocess="auto"` no longer changes a bbox. Code that depended on
+  the 2000 px downscale needs to resize before `scan`.
+* An already-open TIFF is oriented from a private reopen at the
+  caller's current frame. Pillow applies the tag inside `load()`,
+  in place, and `Image.copy()` loads, so the caller's image is not
+  loaded. The reopen seeks to that frame before the pixel check, so
+  an oversize earlier frame is not returned for a later small one
+  and is not a reason to reject the small frame. `Image.open` still
+  warns when that earlier frame is above the limit and below twice
+  the limit; the warning is Pillow's, and those pixels are not
+  decoded. The path is tried
+  first; a failed path open reads the live file pointer. If neither
+  source can be read, or the current frame cannot be selected, the
+  result is `InvalidInputError`, not the caller's object.
+  Orientations 2–8 are applied only to the private image. A closed
+  TIFF raises `InvalidInputError`: `getexif()` asserts on a null
+  file pointer (`AttributeError` under `-O`) while `mode` is still
+  RGB.
+* The orientation source is the root IFD tag when it is present,
+  otherwise XMP `tiff:Orientation`, the same source Pillow's
+  `getexif` uses on the bytes path. That read happens on the private
+  image, before `Result.image_size` is recorded, so a later `load()`
+  is not what rotates the caller's TIFF.
+* WebP and ICO sizes are read from the container header before
+  `Image.open`. Those plugins allocate or `load()` inside `_open`,
+  and Pillow's check does nothing when `Image.MAX_IMAGE_PIXELS` is
+  `None`. The ICO's embedded PNG size is the last `IHDR` before the
+  first IDAT, fdAT, or IEND. Pillow overwrites the size on every
+  earlier `IHDR` and decodes that last one. An ICO whose frame size
+  cannot be read, or whose chunk walk hits its cap before one of
+  those three, is rejected instead of opened. The parser does not call
+  `Image._decompression_bomb_check`. JPEG, PNG, and PPM stay lazy
+  and are still checked after open.
+* When Pillow's own bomb error fires (a stricter process global, at
+  twice that global), the wrapped `InvalidInputError` quotes that
+  limit. The inlined constant is quoted only when our check fired.
+* `stage_hit` ignores `None` and `""`. `"engine.<name>"` is recorded
+  only when `detect_and_decode` returns. The single-engine clock
+  starts after the engine object exists, so the first scan's lazy
+  construction is not part of that key.
+
+---
+
 ## S-099 — Safe QR decode defaults and post-consensus allow-list (2026-10-17)
 
 **Context.** zxing-cpp's `BarcodeFormat.QRCode` is a family bit. It
