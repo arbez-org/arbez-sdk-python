@@ -154,7 +154,16 @@ go through `Scanner`. The first time a worker loads, that wait uses a
 decode deadline. A worker started to replace one that already loaded
 waits only for the call's deadline. A spawn that fails does not run the
 native engine in the caller. One startup failure is not paid again for
-later crops of the same image. `Result.extras` is read-only and additive:
+later crops of the same image. That fact rides on the returned result,
+so another scan cannot clear it. A Python error from one libdmtx crop
+propagates out of the pool call and is a miss for that crop only; the
+detection loop catches it so barcodes already decoded stay, and later
+crops of the same image still call libdmtx. The ready wait's poll and
+its frame read share one budget. The worker exits when the parent dies,
+including after SIGKILL, so the child does not keep the resource-tracker
+fd. A cold start that fails is not sticky: `start` does not run the
+engine in this process, and the next call may use the 120 s budget
+again. `Result.extras` is read-only and additive:
 `isolation`, `isolation_reason` (only for a fallback), and
 `engine_faults` (`crash` or `timeout`).
 
