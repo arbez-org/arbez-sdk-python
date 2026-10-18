@@ -32,6 +32,7 @@ from PIL import Image
 
 from arbez import Scanner
 from arbez.engines._pool import (
+    _STARTUP_S,
     DEFAULT_DEADLINE_S,
     MAX_RECALL_DEADLINE_S,
     START_METHOD,
@@ -125,6 +126,7 @@ def test_default_deadline_without_a_scan_is_two_seconds() -> None:
     assert active_deadline() == DEFAULT_DEADLINE_S
     assert DEFAULT_DEADLINE_S == 2.0
     assert MAX_RECALL_DEADLINE_S == 10.0
+    assert _STARTUP_S == 120.0
 
 
 def test_engine_loaded_once_per_worker(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1171,7 +1173,7 @@ def test_libdmtx_pool_roundtrip_and_blank_crop_uses_it() -> None:
         2,
     )
     try:
-        assert ArbezEngine._dmtx_decode_one(decode, canvas, det) == "POOL-DM"
+        assert ArbezEngine._dmtx_decode_one(decode, canvas, det) == ("POOL-DM", False)
         pool = libdmtx_pool_if_any()
         assert pool is not None
         assert pool.isolation == "process"
@@ -1254,7 +1256,25 @@ def test_libdmtx_startup_error_propagates_and_a_timeout_is_a_miss(
             )
 
     monkeypatch.setattr("arbez.engines.arbez.libdmtx_pool", lambda: _TimedOut())
-    assert ArbezEngine._dmtx_decode_one(decode, image, det) is None
+    assert ArbezEngine._dmtx_decode_one(decode, image, det) == (None, False)
+
+    class _Startup:
+        def call(self, _image_arg: object, deadline: float | None = None) -> PoolResult:
+            del deadline
+            return PoolResult(
+                status="timeout",
+                value=None,
+                detail="worker was not ready within 120s",
+                isolation="process",
+                startup_fault=True,
+            )
+
+    monkeypatch.setattr("arbez.engines.arbez.libdmtx_pool", lambda: _Startup())
+    assert ArbezEngine._dmtx_decode_one(decode, image, det) == (None, True)
+    # The fault is the return value. The next crop, even one that never
+    # reaches the pool, does not still report it.
+    degen = RawDetection(0.0, 0.0, 0.0, 0.0, 0.9, 2)
+    assert ArbezEngine._dmtx_decode_one(decode, image, degen) == (None, False)
 
 
 class _DiesDuringReady:
@@ -1294,6 +1314,31 @@ class _AliveUntilKill:
 class _SilentConn:
     def poll(self, _timeout: float) -> bool:
         return False
+
+    def close(self) -> None:
+        return None
+
+
+class _BudgetConn:
+    """Records the ready-poll timeout and never becomes ready."""
+
+    def __init__(self, seen: dict[str, float]) -> None:
+        self._seen = seen
+
+    def poll(self, timeout: float) -> bool:
+        self._seen["timeout"] = timeout
+        return False
+
+    def send(self, _message: object) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+class _SendConn:
+    def send(self, _message: object) -> None:
+        return None
 
     def close(self) -> None:
         return None
@@ -1409,34 +1454,112 @@ def test_spawn_failure_is_a_crash_and_does_not_run_in_process(
         pool.close()
 
 
-def test_replacement_ready_wait_uses_the_call_deadline() -> None:
-    """After one successful load, the next worker waits for this call only."""
+def test_replacement_ready_wait_uses_the_startup_budget() -> None:
+    """A killed worker's replacement loads with the 120 s budget.
+
+    The call that lost the worker does not wait. The next call does,
+    and that wait is the model load, not the 2 s decode deadline.
+    """
     _require_process_pools()
     pool = _pool()
     seen: dict[str, float] = {}
+    previous = _AliveUntilKill()
+    pool._proc = previous  # type: ignore[assignment]
+    pool._conn = _SilentConn()  # type: ignore[assignment]
+    pool._ready = True
+    pool._kill_worker()
+    assert previous.is_alive() is False
+    assert pool._proc is None
+    assert pool._ready is False
 
-    class _BudgetConn:
-        def poll(self, timeout: float) -> bool:
-            seen["timeout"] = timeout
-            return False
-
-        def close(self) -> None:
-            return None
-
-    pool._ever_ready = True
     proc = _AliveUntilKill()
     pool._proc = proc  # type: ignore[assignment]
-    pool._conn = _BudgetConn()  # type: ignore[assignment]
+    pool._conn = _BudgetConn(seen)  # type: ignore[assignment]
     pool._ready = False
     try:
         result = pool.call(_image(0), deadline=2.0)
-        # ``monotonic() + 2.0`` minus a later reading can sit a few
-        # ulps over 2. The 120 s cold-start budget is still rejected.
-        assert 1.5 < seen["timeout"] <= 2.0 + 1e-6
+        assert seen["timeout"] > DEFAULT_DEADLINE_S
+        # poll(monotonic()+120 - monotonic()) can sit a few ulps over 120.
+        assert _STARTUP_S - 1.0 < seen["timeout"] <= _STARTUP_S + 1e-6
         assert result.status == "timeout"
+        assert result.startup_fault is True
         assert result.isolation == "process"
         assert pool.last_was_startup_fault is True
         assert proc.is_alive() is False
+        assert pool.isolation == "process"
+        assert pool._ready is False
+    finally:
+        pool._proc = None
+        pool._conn = None
+        pool.close()
+
+
+def test_dead_worker_reloads_with_the_startup_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker that died after loading is a cold load on this call."""
+    _require_process_pools()
+    pool = _pool()
+    seen: dict[str, float] = {}
+    replacement = _AliveUntilKill()
+
+    def _spawn() -> None:
+        pool._proc = replacement  # type: ignore[assignment]
+        pool._conn = _BudgetConn(seen)  # type: ignore[assignment]
+        pool._ready = False
+
+    monkeypatch.setattr(pool, "_spawn_worker", _spawn)
+    dead = _AliveUntilKill()
+    dead.kill()
+    pool._proc = dead  # type: ignore[assignment]
+    pool._conn = _SilentConn()  # type: ignore[assignment]
+    pool._ready = True
+    try:
+        result = pool.call(_image(0), deadline=2.0)
+        assert _STARTUP_S - 1.0 < seen["timeout"] <= _STARTUP_S + 1e-6
+        assert result.status == "timeout"
+        assert result.startup_fault is True
+        assert pool.last_was_startup_fault is True
+        assert result.isolation == "process"
+        assert replacement.is_alive() is False
+        assert pool.isolation == "process"
+    finally:
+        pool._proc = None
+        pool._conn = None
+        pool.close()
+
+
+def test_ready_worker_reply_uses_the_call_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loaded worker waits the call deadline for the image, not 120 s."""
+    _require_process_pools()
+    import arbez.engines._pool as pool_mod
+
+    pool = _pool()
+    seen: dict[str, float] = {}
+
+    def _capture(_conn: object, deadline_at: float) -> None:
+        seen["left"] = deadline_at - time.monotonic()
+        raise pool_mod._ReplyTimeout
+
+    monkeypatch.setattr(pool_mod, "_recv_reply", _capture)
+    # The timeout replaces the worker. Do not start a real process.
+    monkeypatch.setattr(pool, "_spawn_worker", lambda: None)
+    proc = _AliveUntilKill()
+    pool._proc = proc  # type: ignore[assignment]
+    pool._conn = _SendConn()  # type: ignore[assignment]
+    pool._ready = True
+    try:
+        result = pool.call(_image(0), deadline=2.0)
+        # monotonic()+2.0 can sit a few ulps over 2. The 120 s budget still fails.
+        assert 1.0 < seen["left"] <= 2.0 + 1e-6
+        assert result.status == "timeout"
+        assert result.startup_fault is False
+        assert pool.last_was_startup_fault is False
+        assert result.detail == "deadline 2.0s exceeded"
+        assert proc.is_alive() is False
+        assert pool._ready is False
         assert pool.isolation == "process"
     finally:
         pool._proc = None
@@ -1543,6 +1666,143 @@ def test_libdmtx_python_error_does_not_skip_the_next_crop(
     dets = engine._decode_detections([first, second], img)
     assert calls["n"] == 2
     assert [d.payload for d in dets] == [None, "SECOND"]
+
+
+def _engine_whose_crops_use_pool(monkeypatch: pytest.MonkeyPatch, pool: object) -> Any:
+    """ArbezEngine whose Data Matrix crops call ``pool`` and nothing in-process."""
+    from arbez.engines.arbez import ArbezEngine
+
+    monkeypatch.setattr("arbez.engines.arbez.libdmtx_pool", lambda: pool)
+    engine = ArbezEngine(decode=True)
+    engine._zxing_module = object()
+    engine._zxing_probed = True
+    monkeypatch.setattr(engine, "_decode_one", lambda *_a, **_k: (None, None, None))
+
+    def real_decode(*_a: object, **_k: object) -> None:
+        raise AssertionError("libdmtx ran in-process")
+
+    real_decode.__module__ = "arbez_dmtx._libdmtx.pylibdmtx"
+    real_decode.__name__ = "decode"
+    engine._dmtx_decode = real_decode
+    engine._dmtx_probed = True
+    return engine
+
+
+def test_libdmtx_startup_fault_does_not_stick_when_the_next_crop_returns_early(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Image 2's first crop returns before the pool. A later box still runs.
+
+    A startup fault used to live in a ContextVar set only on the pool path.
+    The next image's degenerate crop returned first, the caller read the
+    old true, and the real box never called libdmtx.
+    """
+    from arbez.engines._yolox import RawDetection
+
+    calls = {"n": 0}
+
+    class _ThenOk:
+        def call(self, _image_arg: object, deadline: float | None = None) -> PoolResult:
+            del deadline
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return PoolResult(
+                    status="timeout",
+                    value=None,
+                    detail="worker was not ready within 120s",
+                    isolation="process",
+                    startup_fault=True,
+                )
+            return PoolResult(
+                status="ok",
+                value="NEXT-IMAGE",
+                detail="",
+                isolation="process",
+            )
+
+    engine = _engine_whose_crops_use_pool(monkeypatch, _ThenOk())
+    img = Image.new("RGB", (300, 300), "white")
+    real = RawDetection(20.0, 20.0, 140.0, 140.0, 0.9, 2)
+    degen = RawDetection(20.0, 20.0, 20.0, 20.0, 0.9, 2)
+    later = RawDetection(160.0, 160.0, 280.0, 280.0, 0.9, 2)
+    first = engine._decode_detections([real], img)
+    assert calls["n"] == 1
+    assert [detection.payload for detection in first] == [None]
+    second = engine._decode_detections([degen, later], img)
+    assert calls["n"] == 2
+    assert [detection.payload for detection in second] == [None, "NEXT-IMAGE"]
+
+
+def test_libdmtx_startup_fault_does_not_stick_on_the_next_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new image calls libdmtx again after the previous image's startup fault."""
+    from arbez.engines._yolox import RawDetection
+
+    calls = {"n": 0}
+
+    class _ThenOk:
+        def call(self, _image_arg: object, deadline: float | None = None) -> PoolResult:
+            del deadline
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return PoolResult(
+                    status="crash",
+                    value=None,
+                    detail="exit -11",
+                    isolation="process",
+                    startup_fault=True,
+                )
+            return PoolResult(
+                status="ok",
+                value="SECOND-IMAGE",
+                detail="",
+                isolation="process",
+            )
+
+    engine = _engine_whose_crops_use_pool(monkeypatch, _ThenOk())
+    img = Image.new("RGB", (300, 300), "white")
+    box = RawDetection(20.0, 20.0, 140.0, 140.0, 0.9, 2)
+    assert [detection.payload for detection in engine._decode_detections([box], img)] == [None]
+    assert [detection.payload for detection in engine._decode_detections([box], img)] == [
+        "SECOND-IMAGE"
+    ]
+    assert calls["n"] == 2
+
+
+def test_libdmtx_deadline_does_not_skip_the_next_crop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A decode deadline is a miss for that crop. The next crop still calls."""
+    from arbez.engines._yolox import RawDetection
+
+    calls = {"n": 0}
+
+    class _TimeoutThenOk:
+        def call(self, _image_arg: object, deadline: float | None = None) -> PoolResult:
+            del deadline
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return PoolResult(
+                    status="timeout",
+                    value=None,
+                    detail="deadline 2.0s exceeded",
+                    isolation="process",
+                )
+            return PoolResult(
+                status="ok",
+                value="SECOND",
+                detail="",
+                isolation="process",
+            )
+
+    engine = _engine_whose_crops_use_pool(monkeypatch, _TimeoutThenOk())
+    img = Image.new("RGB", (300, 300), "white")
+    first = RawDetection(20.0, 20.0, 140.0, 140.0, 0.9, 2)
+    second = RawDetection(160.0, 160.0, 280.0, 280.0, 0.9, 2)
+    dets = engine._decode_detections([first, second], img)
+    assert calls["n"] == 2
+    assert [detection.payload for detection in dets] == [None, "SECOND"]
 
 
 def test_ready_frame_shares_the_startup_deadline(
