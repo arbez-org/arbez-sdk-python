@@ -51,7 +51,6 @@ Removed in v0.0.17 (S-031)
 
 from __future__ import annotations
 
-import contextvars
 import logging
 import threading
 from collections.abc import Iterable
@@ -192,12 +191,6 @@ if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
 
 _log = logging.getLogger(__name__)
-# Set by ``_dmtx_decode_one`` for the crop that just returned. A pool
-# flag would be cleared by the next scan before this thread could read it.
-_dmtx_crop_startup: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "arbez_dmtx_crop_startup",
-    default=False,
-)
 
 
 def _probe_onnxruntime_or_raise() -> None:
@@ -1165,19 +1158,22 @@ class ArbezEngine:
         dmtx_decode: Any,
         pil_image: PILImage,
         det: RawDetection,
-    ) -> str | None:
+    ) -> tuple[str | None, bool]:
         """Fallback Data Matrix decode via libdmtx on the detected crop (S-092).
 
         Only invoked when zxing-cpp failed on a DATA_MATRIX-class detection.
         Crops the bbox (with pad), upscales small crops (libdmtx benefits), and
-        runs libdmtx with a short timeout. Returns the payload or ``None``.
-        The real decoder runs in the isolation pool (S-097); a crash or a
-        deadline is a miss. Injected callables stay in this process.
+        runs libdmtx with a short timeout. Returns ``(payload, startup_fault)``.
+        ``startup_fault`` is true only when the pool worker died or was not
+        ready while loading. The caller then skips later crops of this image.
+        An early return is ``(None, False)``. The real decoder runs in the
+        isolation pool (S-097); a crash or a deadline is a miss. Injected
+        callables stay in this process.
         """
         try:
             bmin = min(det.x2 - det.x1, det.y2 - det.y1)
             if bmin <= 0:
-                return None
+                return (None, False)
             pad = max(8.0, 0.25 * bmin)
             iw, ih = pil_image.width, pil_image.height
             crop = pil_image.crop(
@@ -1190,7 +1186,7 @@ class ArbezEngine:
             ).convert("RGB")
             cw, ch = crop.size
             if cw < 4 or ch < 4:
-                return None
+                return (None, False)
             if min(cw, ch) < 300:  # libdmtx decodes upscaled crops far better
                 s = 300.0 / min(cw, ch)
                 crop = crop.resize((max(1, int(cw * s)), max(1, int(ch * s))))
@@ -1199,8 +1195,8 @@ class ArbezEngine:
                 if res:
                     # str(...) because dmtx_decode is Any-typed (optional dep), so
                     # mypy can't see that .data is bytes / .decode() returns str.
-                    return str(res[0].data.decode("utf-8", "replace"))
-                return None
+                    return (str(res[0].data.decode("utf-8", "replace")), False)
+                return (None, False)
             import numpy as np
 
             array = np.ascontiguousarray(np.asarray(crop))
@@ -1208,22 +1204,20 @@ class ArbezEngine:
             raise
         except Exception as e:
             _log.debug("ArbezEngine: libdmtx fallback failed: %r", e)
-            return None
+            return (None, False)
         # Outside the swallow. A crash or a deadline, including a worker
         # that dies or is not ready while loading, is a PoolResult and a
         # miss. A Python error from decode still propagates from this
         # helper. The pool does not retry a failed init in-process.
-        # ``startup_fault`` is on that result. Reading it off the pool
-        # after ``call`` returns races the next scan, which clears the
-        # flag under the lock.
-        _dmtx_crop_startup.set(False)
+        # ``startup_fault`` returns with this crop. A flag on the pool is
+        # cleared by the next scan, and a flag set only on this path stays
+        # set when the next image returns before the pool is called.
         outcome = libdmtx_pool().call(array)
         if outcome.startup_fault:
-            _dmtx_crop_startup.set(True)
-            return None
+            return (None, True)
         if outcome.status != "ok" or not isinstance(outcome.value, str):
-            return None
-        return outcome.value
+            return (None, False)
+        return (outcome.value, False)
 
     def _decode_detections(
         self,
@@ -1242,7 +1236,8 @@ class ArbezEngine:
         # arbez-dmtx companion isn't installed -> behaviour unchanged).
         dmtx_decode = self._get_dmtx() if self._decode_enabled else None
         # One startup failure per image. The next crop must not pay
-        # another cold-start budget for a worker that just died.
+        # another cold-start budget for a worker that just died. The
+        # flag is that crop's return value, so the next image starts clear.
         dmtx_startup_failed = False
 
         # S-035 perf: materialize the image once as a numpy view so the
@@ -1305,7 +1300,11 @@ class ArbezEngine:
                     )
                 ):
                     try:
-                        dmtx_payload = self._dmtx_decode_one(dmtx_decode, pil_image, d)
+                        dmtx_payload, startup_fault = self._dmtx_decode_one(
+                            dmtx_decode,
+                            pil_image,
+                            d,
+                        )
                     except Exception as exc:
                         # The pool raised. One crop stays a miss so earlier
                         # hits in ``out`` survive. The worker is still in its
@@ -1317,7 +1316,7 @@ class ArbezEngine:
                         )
                         dmtx_payload = None
                     else:
-                        if _dmtx_crop_startup.get():
+                        if startup_fault:
                             dmtx_startup_failed = True
                     if dmtx_payload is not None:
                         payload = dmtx_payload

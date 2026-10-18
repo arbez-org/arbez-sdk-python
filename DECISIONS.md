@@ -367,11 +367,12 @@ zxing-cpp is unchanged here.
 nothing for a frame whose full-frame fallback exceeds 2 s. The same
 frame through `Scanner` gets 10 s. The measured fallback p95 is about
 1.95 s, under 10 s and close to 2 s. Callers who need the longer budget
-go through `Scanner`. The first time a worker loads, that wait uses a
-120 s startup budget so a cold model import is not cut off by the 2 s
-decode deadline. A worker started to replace one that already loaded
-waits only for the call's deadline. A spawn that fails does not run the
-native engine in the caller. One startup failure is not paid again for
+go through `Scanner`. The first time a worker loads, and every time
+a replacement loads, that wait uses a 120 s startup budget so a cold
+model import is not cut off by the 2 s decode deadline. The call that
+lost the worker returns after the kill. The next call pays the startup
+budget. A spawn that fails does not run the native engine in the caller.
+One startup failure is not paid again for
 later crops of the same image. That fact rides on the returned result,
 so another scan cannot clear it. A Python error from one libdmtx crop
 propagates out of the pool call and is a miss for that crop only; the

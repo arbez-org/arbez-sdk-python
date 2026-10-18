@@ -742,9 +742,6 @@ class EnginePool:
         self.last_deadline_s = self._deadline
         self._closed = False
         self._ready = False
-        # True after a worker has loaded once. A replacement then waits
-        # only for the call's deadline, not the cold-start budget.
-        self._ever_ready = False
         self.last_was_startup_fault = False
         self._lock = threading.RLock()
         self._proc: mp.Process | None = None
@@ -907,7 +904,7 @@ class EnginePool:
         if not math.isfinite(deadline) or deadline < 0:
             return self._timeout_result(deadline)
         try:
-            self._ensure_worker(deadline)
+            self._ensure_worker()
         except _WorkerStartupFault as exc:
             self.last_was_startup_fault = True
             return PoolResult(
@@ -1022,9 +1019,10 @@ class EnginePool:
     def _replace_worker(self) -> None:
         """Kill the current worker and start the next one.
 
-        Ready is the next call's wait, and that wait uses the call's
-        deadline once a worker has loaded. This call already missed its
-        deadline or lost the worker.
+        This call does not wait for the replacement to load. The next
+        call treats that worker as a cold start and may use the 120 s
+        startup budget. The image reply, once the worker is ready, still
+        uses the call deadline.
         """
         self._kill_worker()
         if self._gave_up:
@@ -1036,17 +1034,19 @@ class EnginePool:
         except Exception:
             _log.warning("engine %s worker respawn failed", self.engine, exc_info=True)
 
-    def _ensure_worker(self, ready_budget: float = _STARTUP_S) -> None:
-        # The first load may take the cold-start budget. A replacement
-        # for a worker that already loaded waits only for this call.
-        budget = ready_budget if self._ever_ready else _STARTUP_S
-        if self._proc is not None and self._proc.is_alive() and self._conn is not None:
-            if not self._ready:
-                self._finish_ready(budget)
-            return
-        self._kill_worker()
-        self._spawn_worker()
-        self._finish_ready(budget)
+    def _ensure_worker(self) -> None:
+        """Load the worker when it is not ready.
+
+        The model load uses the 120 s startup budget, including a
+        replacement for a worker that already loaded. The call deadline
+        applies to the image reply after this returns, not to this wait.
+        A reload slower than 2 s must not be killed again.
+        """
+        if self._proc is None or not self._proc.is_alive() or self._conn is None:
+            self._kill_worker()
+            self._spawn_worker()
+        if not self._ready:
+            self._finish_ready(_STARTUP_S)
 
     def _spawn_worker(self) -> None:
         ctx = _spawn_context()
@@ -1091,7 +1091,6 @@ class EnginePool:
             self._kill_worker()
             raise
         self._ready = True
-        self._ever_ready = True
 
     def _wait_ready(self, conn: Connection, proc: mp.Process, budget: float) -> None:
         # poll and the frame read share one budget. poll returns as soon
