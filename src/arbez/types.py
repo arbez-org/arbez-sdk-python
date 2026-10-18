@@ -260,6 +260,10 @@ class Result:
       wall-clock. On the single-engine path this equals ``"engine"``.
       On the multi-engine path the engines run in parallel, so each
       value is that engine's time, not a slice of ``"consensus"``.
+    * ``"ladder.<rung>"`` — milliseconds for the ZXing failure rung
+      that produced the hit. ``rung`` is ``clahe``, ``up``, ``gh``, or
+      ``adclose``. Present only for that rung. A base-read success and
+      a total miss do not add it, and neither do rungs that missed.
 
     ``"preprocess"`` is no longer written. ``preprocess="auto"`` is
     deprecated and behaves as ``"off"`` (S-101, removed in 0.4.0).
@@ -280,8 +284,10 @@ class Result:
     * ``"stage_hit"`` — ``tuple[str, ...]`` of engine names that
       returned at least one non-empty payload, in the Scanner's engine
       order (not thread-completion order). ``None`` and ``""`` are not
-      hits. ``()`` when nothing decoded. Today the entries are engine
-      names. Later stages may append other stage names to the same tuple.
+      hits. ``()`` when nothing decoded. When a whole-frame ZXing miss
+      was recovered by a failure rung, that rung name is appended:
+      ``clahe``, ``up``, ``gh``, or ``adclose``. A base-read hit does
+      not append one.
     * ``"isolation"`` — ``{engine_name: "process" | "inprocess"}``.
       ``"process"`` means a spawned worker. ``"inprocess"`` means the
       engine ran in the caller because a pool could not.

@@ -137,9 +137,11 @@ schedule + macOS's malloc-reclamation timing.
   `extras["stage_hit"]`. Timing keys: `"coerce"` (load, EXIF, pixel
   limit, RGB conversion), `"engine"` (the single-engine path only),
   `"consensus"` (the multi-engine path — bare `Scanner()` or
-  `consensus=N`), and `"engine.<name>"` for each engine that ran
+  `consensus=N`), `"engine.<name>"` for each engine that ran
   (that engine's own `detect_and_decode` time; on the parallel path
-  these are not slices of `"consensus"`).
+  these are not slices of `"consensus"`), and `"ladder.<rung>"`
+  (`clahe`, `up`, `gh`, or `adclose`) when a whole-frame ZXing miss
+  was recovered by that rung. `stage_hit` appends the same rung name.
 
 - **`warmup() -> None`** — pre-load the engine. Useful in
   latency-sensitive paths; the first `scan()` otherwise has to import
@@ -280,8 +282,8 @@ The full output of one `Scanner.scan()` call. Immutable.
 | `detections` | `tuple[Detection, ...]` | The merged, **per-code** result, descending by score. On the multi-engine path each `Detection` carries `extras["voted_by"]` (the engines that agreed on that code); for bare `Scanner()` (threshold `1`) this is the full union. On the single-engine path it's that engine's detections verbatim. |
 | `image_size` | `(width, height)` int | Input image dimensions in pixels, after EXIF orientation. This is the frame detection coordinates use. |
 | `per_engine` | `Mapping[str, tuple[Detection, ...]]` | Each engine's **own raw detections** — what it independently saw, before the merge — keyed by engine name. Always populated for every engine that ran (on the single-engine path, the one engine's key). Use it to see which engine contributed what, independent of the consensus merge. Read-only `MappingProxyType` view. |
-| `timings_ms` | `dict[str, float]` | Per-stage wall-clock. Keys: `"coerce"` (every scan), `"engine"` (the single-engine path), `"consensus"` (the multi-engine path — bare `Scanner()` or `consensus=N`), `"engine.<name>"` (that engine's own `detect_and_decode` time). Read-only `MappingProxyType` view. |
-| `extras` | `Mapping[str, object]` | Scan-level metadata. `"stage_hit"` is a `tuple[str, ...]` of engine names that returned a non-empty payload, in engine-set order, or `()` when nothing decoded. `None` and `""` are not hits. `isolation`, `isolation_reason`, and `engine_faults` record worker mode and a contained crash or deadline (S-097). `wechat_full_frame_fallback` is `True` or `False` when a WeChat call finished, saying whether the classical full-frame pass ran (S-100). Absent when WeChat did not finish a call. Read-only `MappingProxyType` view. |
+| `timings_ms` | `dict[str, float]` | Per-stage wall-clock. Keys: `"coerce"` (every scan), `"engine"` (the single-engine path), `"consensus"` (the multi-engine path — bare `Scanner()` or `consensus=N`), `"engine.<name>"` (that engine's own `detect_and_decode` time), `"ladder.<rung>"` (`clahe`, `up`, `gh`, or `adclose` — only the ZXing failure rung that hit). Read-only `MappingProxyType` view. |
+| `extras` | `Mapping[str, object]` | Scan-level metadata. `"stage_hit"` is a `tuple[str, ...]` of engine names that returned a non-empty payload, in engine-set order, or `()` when nothing decoded. A winning ZXing failure rung (`clahe`, `up`, `gh`, `adclose`) is appended. `None` and `""` are not hits. `isolation`, `isolation_reason`, and `engine_faults` record worker mode and a contained crash or deadline (S-097). `wechat_full_frame_fallback` is `True` or `False` when a WeChat call finished, saying whether the classical full-frame pass ran (S-100). Absent when WeChat did not finish a call. Read-only `MappingProxyType` view. |
 
 `len(result)` returns `len(result.detections)`.
 

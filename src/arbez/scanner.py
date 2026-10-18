@@ -77,6 +77,7 @@ from arbez._engine_discovery import (
     # ``from arbez.scanner import resolve_auto_engine`` as before.
     resolve_auto_engine as resolve_auto_engine,
 )
+from arbez.engines._ladder import LADDER_EXTRA, LADDER_MS_EXTRA, RUNG_NAMES, as_rung_ms
 from arbez.engines._pool import (
     MAX_RECALL_DEADLINE_S,
     ScanDiagnostics,
@@ -459,6 +460,31 @@ class _TimedEngine:
         return detections
 
 
+def _stage_hit_with_rung(
+    stage_hit: tuple[str, ...],
+    per_engine: dict[str, tuple[Detection, ...]],
+    order: tuple[str, ...],
+    timings: dict[str, float],
+) -> tuple[str, ...]:
+    """Append the winning failure rung, when a payload came from one.
+
+    Read ``per_engine``, not the merged detections. Consensus rebuilds
+    extras and would drop the rung. One ``ladder.<rung>`` key, for the
+    rung that hit. Rungs that missed are not recorded.
+    """
+    for name in order:
+        for detection in per_engine.get(name, ()):
+            if not detection.payload:
+                continue
+            rung = detection.extras.get(LADDER_EXTRA)
+            elapsed = as_rung_ms(detection.extras.get(LADDER_MS_EXTRA))
+            if not isinstance(rung, str) or rung not in RUNG_NAMES or elapsed is None:
+                continue
+            timings[f"ladder.{rung}"] = elapsed
+            return (*stage_hit, rung)
+    return stage_hit
+
+
 # ── Scanner ────────────────────────────────────────────────────────────────
 
 
@@ -837,12 +863,15 @@ class Scanner:
         descending score, the input image size after EXIF orientation
         (S-101; that is the frame the engine saw), per-stage timings
         in ``timings_ms`` (``"coerce"``, ``"engine"`` or
-        ``"consensus"``, and ``"engine.<name>"``), and
-        ``extras["stage_hit"]``. ``extras`` also records engine
-        isolation (S-097): whether a native engine ran in a worker,
-        and any crash or deadline that was contained. When a WeChat
-        call finishes, ``wechat_full_frame_fallback`` says whether the
-        classical full-frame pass ran (S-100).
+        ``"consensus"``, ``"engine.<name>"``, and ``"ladder.<rung>"``
+        when a ZXing failure rung produced the hit), and
+        ``extras["stage_hit"]``. A winning rung name (``clahe``,
+        ``up``, ``gh``, or ``adclose``) is appended to that tuple.
+        ``extras`` also records engine isolation (S-097): whether a
+        native engine ran in a worker, and any crash or deadline that
+        was contained. When a WeChat call finishes,
+        ``wechat_full_frame_fallback`` says whether the classical
+        full-frame pass ran (S-100).
         """
         # Delegate to the public ``coerce_to_pil`` helper — same code
         # path the engines themselves use. Previously Scanner had a
@@ -963,6 +992,8 @@ class Scanner:
             for name in order
             if any(detection.payload for detection in per_engine.get(name, ()))
         )
+        # per_engine still has the rung. The voted Detection does not.
+        stage_hit = _stage_hit_with_rung(stage_hit, per_engine, order, timings)
         extras = diag.to_extras()
         extras["stage_hit"] = stage_hit
         return Result(

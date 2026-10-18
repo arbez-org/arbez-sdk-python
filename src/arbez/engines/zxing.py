@@ -32,12 +32,24 @@ import functools
 import logging
 import math
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
 from contextvars import ContextVar
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import IO, TYPE_CHECKING, Any
 
+from arbez.engines._ladder import (
+    LADDER_EXTRA,
+    LADDER_MS_EXTRA,
+    RUNG_NAMES,
+    adaptive_close,
+    apply_clahe,
+    as_rung_ms,
+    gray_for_rungs,
+    try_cv2,
+    upscale,
+)
 from arbez.engines._pool import (
     EnginePool,
     PoolResult,
@@ -402,12 +414,20 @@ def barcode_formats_for(
 #
 # The reply is plain tuples. A zxing Result is not a safe pickle, and it
 # must not keep a view of the shared-memory segment the parent unlinks.
+# S-102: a whole-frame pool passes ladder=True. ``run`` then retries a
+# miss under the same deadline. Crop pools leave the flag false, so a
+# crop miss stays one read for the Arbez pad ladder.
+#
+# A base hit is five fields. A rung hit appends the rung name and that
+# rung's elapsed milliseconds. The parent rejects any other shape.
 
 _WORKER_ENTRY = "arbez.engines.zxing:_zxing_worker_init"
 _Corner = tuple[float, float]
 _Corners = tuple[_Corner, _Corner, _Corner, _Corner]
 # text, format name, corners (TL, TR, BR, BL) or None, symbology id, ec level
 _PackedHit = tuple[str, str, _Corners | None, str | None, str | None]
+_LadderHit = tuple[str, str, _Corners | None, str | None, str | None, str, float]
+_WorkerHit = _PackedHit | _LadderHit
 
 _crop_guard = threading.Lock()
 _crop_pools: dict[tuple[str, ...], EnginePool] = {}
@@ -476,8 +496,112 @@ def _pack_results(raw_results: Any) -> tuple[_PackedHit, ...]:
     return tuple(hits)
 
 
+def _stamp(hits: tuple[_PackedHit, ...], rung: str, elapsed_ms: float) -> tuple[_LadderHit, ...]:
+    """Append the rung name and its milliseconds to each packed hit."""
+    stamped: list[_LadderHit] = []
+    for text, fmt, corners, sym, ec in hits:
+        stamped.append((text, fmt, corners, sym, ec, rung, elapsed_ms))
+    return tuple(stamped)
+
+
+def _divide_corners(hits: tuple[_PackedHit, ...], scale: float) -> tuple[_PackedHit, ...]:
+    """Map upscaled corners back onto the frame the pool was given."""
+    divided: list[_PackedHit] = []
+    for text, fmt, corners, sym, ec in hits:
+        adjusted: _Corners | None
+        if corners is None:
+            adjusted = None
+        else:
+            adjusted = (
+                (corners[0][0] / scale, corners[0][1] / scale),
+                (corners[1][0] / scale, corners[1][1] / scale),
+                (corners[2][0] / scale, corners[2][1] / scale),
+                (corners[3][0] / scale, corners[3][1] / scale),
+            )
+        divided.append((text, fmt, adjusted, sym, ec))
+    return tuple(divided)
+
+
+def _rung(
+    zxing: Any,
+    formats: Any,
+    prepare: Callable[[], Any],
+    rung: str,
+    **kwargs: Any,
+) -> tuple[_LadderHit, ...] | None:
+    """One rung, including its preprocess. None when the read is empty."""
+    started = time.perf_counter()
+    prepared = prepare()
+    hits = _pack_results(zxing.read_barcodes(prepared, formats=formats, **kwargs))
+    if not hits:
+        return None
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    return _stamp(hits, rung, elapsed_ms)
+
+
+def _rung_up(
+    zxing: Any,
+    formats: Any,
+    gray: Any,
+    cv2: Any,
+) -> tuple[_LadderHit, ...] | None:
+    """Capped x2, or None when the scale is below 1.3 or the read misses."""
+    started = time.perf_counter()
+    scaled = upscale(gray, cv2)
+    if scaled is None:
+        return None
+    resized, scale = scaled
+    hits = _pack_results(zxing.read_barcodes(resized, formats=formats))
+    if not hits:
+        return None
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    return _stamp(_divide_corners(hits, scale), "up", elapsed_ms)
+
+
+def _read_failure_ladder(zxing: Any, image: Any, formats: Any) -> tuple[_LadderHit, ...]:
+    """Retry a miss. The base read already returned nothing.
+
+    An exception leaves this function, so later rungs of the call do
+    not run. A missing cv2 skips the OpenCV rungs and still tries
+    GlobalHistogram on ``image``.
+    """
+    cv2 = try_cv2()
+    if cv2 is None:
+        gray = image
+    else:
+        gray = gray_for_rungs(image, cv2)
+        found = _rung(zxing, formats, lambda: apply_clahe(gray, cv2), "clahe")
+        if found is not None:
+            return found
+        found = _rung_up(zxing, formats, gray, cv2)
+        if found is not None:
+            return found
+    found = _rung(
+        zxing,
+        formats,
+        lambda: gray,
+        "gh",
+        binarizer=zxing.Binarizer.GlobalHistogram,
+    )
+    if found is not None:
+        return found
+    if cv2 is None:
+        return ()
+    found = _rung(
+        zxing,
+        formats,
+        lambda: adaptive_close(gray, cv2),
+        "adclose",
+        binarizer=zxing.Binarizer.BoolCast,
+    )
+    if found is not None:
+        return found
+    return ()
+
+
 def _zxing_worker_init(
     format_member_names: tuple[str, ...] | None = None,
+    ladder: bool = False,
 ) -> Any:
     """Load zxing-cpp once and bind the S-099 format set.
 
@@ -485,6 +609,11 @@ def _zxing_worker_init(
     An empty tuple is the match-nothing sentinel. Neither path calls
     ``read_barcodes`` without an explicit set, and neither passes
     ``BarcodeFormats([])``.
+
+    ``ladder`` is true only for a whole-frame :class:`ZXingEngine` pool.
+    Crop pools leave it false: a miss there belongs to the Arbez pad
+    ladder. The flag is an init arg because ``EnginePool.call`` cannot
+    carry a per-call parameter.
     """
     import zxingcpp as zxing
 
@@ -504,10 +633,14 @@ def _zxing_worker_init(
             chosen.append(members[name])
         formats = zxing.BarcodeFormats(chosen)
 
-    def run(image: Any) -> tuple[_PackedHit, ...]:
+    def run(image: Any) -> tuple[_WorkerHit, ...]:
         if formats is _NO_BARCODE_FORMATS:
             return ()
-        return _pack_results(zxing.read_barcodes(image, formats=formats))
+        hits = _pack_results(zxing.read_barcodes(image, formats=formats))
+        # A deadline kills this process. The parent must not resume.
+        if hits or not ladder:
+            return hits
+        return _read_failure_ladder(zxing, image, formats)
 
     return run
 
@@ -536,15 +669,30 @@ def _whole_frame_bgr(image: Any) -> Any:
     return np.ascontiguousarray(array)
 
 
-def _parse_hit(item: object) -> _PackedHit | None:
+def _without_rung(hit: _WorkerHit) -> _PackedHit:
+    """The five fields crop callers already unpack. Drops a rung suffix."""
+    if len(hit) == 5:
+        return hit
+    text, fmt, corners, sym, ec, _rung, _elapsed = hit
+    return (text, fmt, corners, sym, ec)
+
+
+def _parse_hit(item: object) -> _WorkerHit | None:
     """Accept one worker hit. Reject anything that is not that shape.
 
-    The worker is another process. A truncated or substituted reply must
-    not be walked as if it were a zxing Result.
+    Five fields is a base read. Seven is a rung hit: the same five, then
+    the rung name and its elapsed milliseconds. The worker is another
+    process. A truncated or substituted reply must not be walked as if
+    it were a zxing Result.
     """
-    if not isinstance(item, tuple) or len(item) != 5:
+    if not isinstance(item, tuple) or len(item) not in (5, 7):
         return None
-    text, fmt, corners, sym, ec = item
+    if len(item) == 7:
+        text, fmt, corners, sym, ec, rung_raw, elapsed_raw = item
+    else:
+        text, fmt, corners, sym, ec = item
+        rung_raw = None
+        elapsed_raw = None
     if not isinstance(text, str) or not isinstance(fmt, str):
         return None
     parsed: _Corners | None
@@ -574,20 +722,26 @@ def _parse_hit(item: object) -> _PackedHit | None:
         parsed = (points[0], points[1], points[2], points[3])
     else:
         return None
-    return (
+    core: _PackedHit = (
         text,
         fmt,
         parsed,
         sym if isinstance(sym, str) else None,
         ec if isinstance(ec, str) and ec else None,
     )
+    if len(item) == 5:
+        return core
+    elapsed = as_rung_ms(elapsed_raw)
+    if not isinstance(rung_raw, str) or rung_raw not in RUNG_NAMES or elapsed is None:
+        return None
+    return (core[0], core[1], core[2], core[3], core[4], rung_raw, elapsed)
 
 
-def _parse_hits(value: object) -> tuple[_PackedHit, ...]:
+def _parse_hits(value: object) -> tuple[_WorkerHit, ...]:
     """Require a tuple of hits. A bad reply is ``EngineRuntimeError``."""
     if not isinstance(value, tuple):
         raise EngineRuntimeError("zxing worker returned a non-tuple")
-    hits: list[_PackedHit] = []
+    hits: list[_WorkerHit] = []
     for item in value:
         hit = _parse_hit(item)
         if hit is None:
@@ -660,12 +814,22 @@ def _crop_reusable(pool: EnginePool, mode: str | None) -> bool:
     return pool.fallback_reason == mode
 
 
-def _new_zxing_pool(format_member_names: tuple[str, ...] | None) -> EnginePool:
-    """One worker whose ``init_args`` are the S-099 format member names."""
+def _new_zxing_pool(
+    format_member_names: tuple[str, ...] | None,
+    *,
+    ladder: bool = False,
+) -> EnginePool:
+    """One worker whose ``init_args`` are the S-099 format member names.
+
+    ``ladder`` is the whole-frame failure path. Crop pools leave it false.
+    """
+    init_args: tuple[Any, ...] = (format_member_names,)
+    if ladder:
+        init_args = (format_member_names, True)
     return EnginePool(
         _WORKER_ENTRY,
         engine="zxing",
-        init_args=(format_member_names,),
+        init_args=init_args,
     )
 
 
@@ -766,7 +930,7 @@ def _isolated_hits(image: Any, formats: Any = None) -> tuple[_PackedHit, ...]:
     outcome = pool.call(_as_array(image))
     if outcome.status != "ok":
         raise _LadderHalt
-    return _parse_hits(outcome.value)
+    return tuple(_without_rung(hit) for hit in _parse_hits(outcome.value))
 
 
 # ── Engine ─────────────────────────────────────────────────────────────────
@@ -826,6 +990,10 @@ class ZXingEngine:
     and ``try_invert`` — there's no separate "try harder" knob to expose.
     If a future caller needs to *disable* one of those for latency, we'll
     add a parameter then; YAGNI for the v0 surface.
+
+    A whole-frame miss retries inside the same worker (S-102): CLAHE,
+    one capped x2 upscale, GlobalHistogram, then an adaptive threshold
+    closed with a 3x3 kernel. The first hit wins. Crop reads do not.
     """
 
     # S-015: every engine carries a stable string ``name`` so
@@ -1018,9 +1186,17 @@ class ZXingEngine:
         hits = _parse_hits(outcome.value)
         detections: list[Detection] = []
         for hit in hits:
-            if hit[2] is None:
+            ladder_meta: tuple[str, float] | None
+            if len(hit) == 7:
+                text, fmt, corners, sym, ec, rung, elapsed = hit
+                core: _PackedHit = (text, fmt, corners, sym, ec)
+                ladder_meta = (rung, elapsed)
+            else:
+                core = hit
+                ladder_meta = None
+            if core[2] is None:
                 continue
-            translated = self._translate(_raw_from_hit(hit))
+            translated = self._translate(_raw_from_hit(core), ladder=ladder_meta)
             if translated is not None:
                 detections.append(translated)
         # Stable sort: keep ZXing's own ordering for equal scores; ours
@@ -1048,14 +1224,18 @@ class ZXingEngine:
         pool = self._pool
         if pool is not None and _crop_reusable(pool, mode):
             return pool, None
-        fresh = _new_zxing_pool(self._format_names)
+        fresh = _new_zxing_pool(self._format_names, ladder=True)
         self._pool = fresh
         return fresh, pool
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _translate(raw: Any) -> Detection | None:
+    def _translate(
+        raw: Any,
+        *,
+        ladder: tuple[str, float] | None = None,
+    ) -> Detection | None:
         """Convert one zxingcpp.Result → arbez.Detection, or None to drop it."""
         if not raw.valid:
             return None
@@ -1103,6 +1283,9 @@ class ZXingEngine:
         ec = getattr(raw, "ec_level", None)
         if ec:
             extras["ec_level"] = ec
+        if ladder is not None:
+            extras[LADDER_EXTRA] = ladder[0]
+            extras[LADDER_MS_EXTRA] = ladder[1]
 
         return Detection(
             bbox_xyxy=bbox,

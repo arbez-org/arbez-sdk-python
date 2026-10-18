@@ -52,6 +52,14 @@ the explicit maintainer act of tagging is the gate.
 
 ### Added
 
+* **Failure-only ZXing ladder (S-102).** A whole-frame ZXing read that
+  finds nothing retries inside the same worker: CLAHE, one capped ×2
+  upscale, GlobalHistogram, then an adaptive threshold closed with a
+  3×3 kernel. The first hit wins. A crash or a deadline does not
+  continue. When a rung wins, `extras["stage_hit"]` appends `clahe`,
+  `up`, `gh`, or `adclose`, and `timings_ms` gains `ladder.<rung>`
+  for that rung only.
+
 * **The WeChat classical fallback is switchable (S-100).**
   `WeChatEngine(full_frame_fallback=True)` and
   `Scanner(full_frame_fallback=True)`. The default stays on, which is

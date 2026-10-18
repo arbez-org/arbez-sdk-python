@@ -11,6 +11,78 @@ ID prefix is `S-` (for SDK).
 
 ---
 
+## S-102 — Failure-only ZXing ladder inside the existing worker (2026-10-17)
+
+**Context.** A whole-frame zxing-cpp read that returns nothing can still
+decode after a fixed preprocess. Running that preprocess on every image
+loses codes the base read already had. The retry has to stay under the
+deadline S-098 already applies (2 s direct, 10 s on `Scanner.scan`). A
+kill cannot be resumed in the parent: the parent must not walk the
+remaining rungs after a crash or a timeout. `EnginePool.call` sends only
+the shared-memory name, shape, and dtype. There is no per-call argument.
+Crop reads already have the Arbez pad ladder (0.05 / 0.15 / 0.30, then
+the full image). This change does not replace that.
+
+**Decision.** On a whole-frame `ZXingEngine` miss only — the read
+returned and there are no valid hits — the same worker `run()` tries,
+in order, and stops at the first valid hit:
+
+1. CLAHE, clip limit 2.0, tile grid 8×8.
+2. One upscale, `scale = min(2.0, 3000.0 / max(gray.shape))`, skipped
+   when `scale < 1.3`, `INTER_CUBIC`. Not a second scale, and not ×3.
+   Corners are divided by `scale` so they match the original frame.
+3. `Binarizer.GlobalHistogram` on that gray image. No OpenCV.
+4. Adaptive Gaussian threshold
+   (`block = max(15, (min(side) // 40) | 1)`, C = 5), invert, 3×3
+   close, read with `Binarizer.BoolCast`.
+
+3-channel input is BGR and is converted with `COLOR_BGR2GRAY` for the
+rungs only. The base read stays on the array the pool delivered. A
+non-3-channel image is the rung input as-is. Every `read_barcodes`
+uses the same `formats` object the worker already built. The empty
+format tuple still returns before any read.
+
+The whole-frame pool passes `ladder=True` as an init arg. Crop pools
+do not, so `_isolated_hits` and the pad ladder stay a single read.
+`_crop_zxing_pool()` stays zero-arg.
+
+A missing `cv2` (`ImportError`) skips CLAHE, the upscale, and the
+adaptive rung, and still tries GlobalHistogram on the image in hand.
+Any other exception from a rung leaves `run()`. The pool reports a
+fault. Later rungs of that call do not run. A deadline or a crash is
+the existing empty result. The parent does not continue the ladder.
+
+Parameters above are locked. They are not re-tuned in this change.
+
+A base hit is still a 5-tuple. A rung hit is that tuple plus the rung
+name (`clahe`, `up`, `gh`, `adclose`) and that rung's elapsed
+milliseconds. The parent stores those on `Detection.extras`. Scanner
+reads them from `per_engine` (consensus replaces extras on the merged
+detection) and appends the rung to `extras["stage_hit"]`. `timings_ms`
+gains one `ladder.<rung>` key for the rung that hit. A base hit adds
+neither. A miss adds no ladder key. Rungs that ran and missed are not
+timed. The consensus result is not filtered a second time.
+
+**Alternatives considered.** A run-always ladder. Rejected: it loses
+codes the base read already returned. A ×3 cap, copied from an earlier
+note that used `min(3.0, ...)`. Rejected: one capped ×3 loses
+`curved/image016`. The locked cap is ×2. A second `pool.call` per rung
+in the parent. Rejected: a kill would return to the parent, and
+continuing there is the in-process path this design forbids. The
+deadline would also restart. A second pool class. Rejected. Retuning
+2.0, 8, 3000.0, 1.3, 15, 40, 5, or the 3×3 kernel on BoofCV.
+Rejected: not this change. Putting the ladder on Arbez crops.
+Rejected: those misses already escalate through the pad ladder.
+
+**Consequences.** A clean code still costs one read. A miss can spend
+the rest of the same deadline on up to four more reads. The deadline,
+the pixel cap, and `recommended_workers("zxing")` are unchanged.
+OpenCV stays an extra; core dependencies do not gain it. `stage_hit`
+may now end with a rung name. `timings_ms` may contain `ladder.<rung>`.
+No QR-Bench numbers are claimed here.
+
+---
+
 ## S-100 — WeChat full-frame fallback is switchable (2026-10-18)
 
 **Context.** The vendored WeChat nets decode, and when they return no
