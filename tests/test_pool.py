@@ -1246,6 +1246,143 @@ def test_libdmtx_startup_error_propagates_and_a_timeout_is_a_miss(
     assert ArbezEngine._dmtx_decode_one(decode, image, det) is None
 
 
+class _DiesDuringReady:
+    """Alive for the ensure check, dead by the time the ready poll looks."""
+
+    def __init__(self) -> None:
+        self._checks = 0
+        self.exitcode: int | None = None
+
+    def is_alive(self) -> bool:
+        self._checks += 1
+        return self._checks == 1
+
+    def kill(self) -> None:
+        self.exitcode = -15
+
+    def join(self, _timeout: float | None = None) -> None:
+        return None
+
+
+class _AliveUntilKill:
+    def __init__(self) -> None:
+        self._alive = True
+        self.exitcode: int | None = None
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def kill(self) -> None:
+        self._alive = False
+        self.exitcode = -15
+
+    def join(self, _timeout: float | None = None) -> None:
+        return None
+
+
+class _SilentConn:
+    def poll(self, _timeout: float) -> bool:
+        return False
+
+    def close(self) -> None:
+        return None
+
+
+def _call_with_unready_worker(pool: EnginePool, proc: Any) -> Any:
+    pool._proc = proc
+    pool._conn = _SilentConn()  # type: ignore[assignment]
+    pool._ready = False
+    try:
+        return pool.call(_image(0))
+    finally:
+        pool._proc = None
+        pool._conn = None
+
+
+def test_worker_that_dies_during_init_is_a_crash_and_stays_out_of_process() -> None:
+    """A dead loader is a crash result. The parent does not run the engine."""
+    _require_process_pools()
+    pool = _pool()
+    ran: list[str] = []
+
+    def _refuse(_image: object) -> None:
+        ran.append("inprocess")
+        raise AssertionError("in-process fallback")
+
+    pool._inprocess_fn = _refuse
+    try:
+        result = _call_with_unready_worker(pool, _DiesDuringReady())
+        assert result.status == "crash"
+        assert result.isolation == "process"
+        assert "died during init" in result.detail
+        assert ran == []
+        assert pool.isolation == "process"
+        assert pool.gave_up is False
+    finally:
+        pool.close()
+
+
+def test_worker_that_is_not_ready_is_a_timeout_and_is_killed() -> None:
+    """The startup budget ends as a timeout. The loader is killed, not reused."""
+    _require_process_pools()
+    pool = _pool()
+    proc = _AliveUntilKill()
+    try:
+        result = _call_with_unready_worker(pool, proc)
+        assert result.status == "timeout"
+        assert result.isolation == "process"
+        assert "not ready" in result.detail
+        assert proc.is_alive() is False
+        assert pool.isolation == "process"
+    finally:
+        pool.close()
+
+
+def test_shared_memory_create_oserror_is_a_crash_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A segment OSError is a contained miss, same as a capacity error."""
+    _require_process_pools()
+    import arbez.engines._pool as pool_mod
+
+    pool = _pool()
+    monkeypatch.setattr(pool, "_ensure_worker", lambda: None)
+    pool._conn = _SilentConn()  # type: ignore[assignment]
+    pool._proc = _AliveUntilKill()  # type: ignore[assignment]
+
+    def _boom(_image: object) -> None:
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(pool_mod, "_create_shared_image", _boom)
+    try:
+        result = pool.call(_image(0))
+        assert result.status == "crash"
+        assert result.isolation == "process"
+        assert "No space left" in result.detail
+    finally:
+        pool._proc = None
+        pool._conn = None
+        pool.close()
+
+
+def test_dropped_wechat_engine_does_not_keep_its_pool_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The in-process factory must not cycle the engine back from the pool."""
+    import weakref
+
+    from arbez.engines import wechat as wechat_mod
+
+    monkeypatch.setattr(wechat_mod, "_probe_opencv_or_raise", lambda: None)
+    engine = wechat_mod.WeChatEngine()
+    with engine._lock:
+        pool = engine._pool_under_lock()
+    engine_ref = weakref.ref(engine)
+    del engine
+    assert engine_ref() is None
+    pool.close()
+
+
 def test_engine_close_drops_only_a_libdmtx_pool_that_gave_up() -> None:
     from arbez.engines._pool import libdmtx_pool
     from arbez.engines.arbez import ArbezEngine

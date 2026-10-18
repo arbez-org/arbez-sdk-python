@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import weakref
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
 
@@ -522,10 +523,20 @@ class WeChatEngine:
     def _pool_under_lock(self) -> EnginePool:
         """Build the isolation pool on first use. Caller holds ``self._lock``."""
         if self._pool is None:
+            # A bound method would cycle engine → pool → factory → engine,
+            # so a dropped Scanner keeps the worker until cyclic GC.
+            engine_ref = weakref.ref(self)
+
+            def factory() -> Any:
+                engine = engine_ref()
+                if engine is None:
+                    raise EngineRuntimeError("WeChatEngine was dropped")
+                return engine._inprocess_runner()
+
             self._pool = EnginePool(
                 "arbez.engines.wechat:_wechat_worker_init",
                 engine="wechat",
-                inprocess_factory=self._inprocess_runner,
+                inprocess_factory=factory,
             )
         return self._pool
 
