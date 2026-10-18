@@ -290,6 +290,10 @@ class Result:
       Linux, or no ``__main__`` guard).
     * ``"engine_faults"`` — tuple of ``{"engine", "kind", "detail"}``.
       ``kind`` is ``"crash"`` or ``"timeout"``. The scan does not raise.
+    * ``"wechat_full_frame_fallback"`` — ``True`` when the WeChat
+      classical full-frame pass ran, ``False`` when a finished WeChat
+      call did not run it (S-100). Absent when WeChat did not finish
+      a call (it was not in the scan, or the call crashed or timed out).
     """
 
     def __post_init__(self) -> None:

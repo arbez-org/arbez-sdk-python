@@ -99,6 +99,7 @@ schedule + macOS's malloc-reclamation timing.
 | `symbologies` | `None` | Allow-list of `Symbology` members or value strings (`{"qr"}`, `{Symbology.QR}`). `None` does not filter. Mapped onto zxing formats and Apple Vision's request, then enforced after consensus on the **decoding** engine's symbology, not the voted cluster label (S-099). A kept cluster is labelled with that symbology when a payload is present. A bare string or a single `Symbology` raises `TypeError`. An empty iterable raises `ValueError`. A prebuilt `engine=` instance is not rebuilt with these flags, including after `close()`; `scan` still filters. Keyword-only. |
 | `micro_qr` | `False` | Also read Micro QR. With an allow-list, `MICRO_QR` is unioned in. Keyword-only. |
 | `rmqr` | `False` | Also read rMQR (zxing and the arbez crop decoder). Reported as `Symbology.QR`. Ignored when the allow-list excludes QR. Apple Vision has no rMQR symbology. Keyword-only. |
+| `full_frame_fallback` | `True` | When this Scanner constructs a WeChat engine, decode the whole frame again if the ONNX nets return no payload (S-100). `False` keeps the net pass only. Ignored for other engines, and ignored when `engine=` is an already-built instance (that object's own flag stands, including the scan after `close()`). A non-bool raises `TypeError`. Keyword-only. |
 
 **Properties:**
 
@@ -148,9 +149,13 @@ schedule + macOS's malloc-reclamation timing.
 - **`close() -> None`** — release the engine's
   native handles (ORT session, cv2.wechat_qrcode detector, pyobjc
   Vision module). Idempotent — safe to call multiple times. After
-  `close()`, a subsequent `scan()` lazy-reinit's the engine. Most
-  callers treat `close()` as terminal; the lazy reinit makes the
-  API forgiving for test fixtures + context managers. Use via
+  `close()`, a subsequent `scan()` lazy-reinit's the engine. A
+  name-built engine is constructed again with this Scanner's flags. A
+  supplied WeChatEngine is that same object, so its
+  `full_frame_fallback` stands. Any other supplied engine is rebuilt
+  from its name without those flags. Most callers
+  treat `close()` as terminal; the lazy reinit makes the API
+  forgiving for test fixtures + context managers. Use via
   `with Scanner(...)` for the common case.
 
   Caveat: `close()` releases the *Python* references promptly; the
@@ -276,7 +281,7 @@ The full output of one `Scanner.scan()` call. Immutable.
 | `image_size` | `(width, height)` int | Input image dimensions in pixels, after EXIF orientation. This is the frame detection coordinates use. |
 | `per_engine` | `Mapping[str, tuple[Detection, ...]]` | Each engine's **own raw detections** — what it independently saw, before the merge — keyed by engine name. Always populated for every engine that ran (on the single-engine path, the one engine's key). Use it to see which engine contributed what, independent of the consensus merge. Read-only `MappingProxyType` view. |
 | `timings_ms` | `dict[str, float]` | Per-stage wall-clock. Keys: `"coerce"` (every scan), `"engine"` (the single-engine path), `"consensus"` (the multi-engine path — bare `Scanner()` or `consensus=N`), `"engine.<name>"` (that engine's own `detect_and_decode` time). Read-only `MappingProxyType` view. |
-| `extras` | `Mapping[str, object]` | Scan-level metadata. `"stage_hit"` is a `tuple[str, ...]` of engine names that returned a non-empty payload, in engine-set order, or `()` when nothing decoded. `None` and `""` are not hits. S-097 adds `isolation` (`"process"` or `"inprocess"`), `isolation_reason` (in-process fallback only), and `engine_faults` (`kind` `"crash"` or `"timeout"`). Empty keys are omitted. Read-only. |
+| `extras` | `Mapping[str, object]` | Scan-level metadata. `"stage_hit"` is a `tuple[str, ...]` of engine names that returned a non-empty payload, in engine-set order, or `()` when nothing decoded. `None` and `""` are not hits. `isolation`, `isolation_reason`, and `engine_faults` record worker mode and a contained crash or deadline (S-097). `wechat_full_frame_fallback` is `True` or `False` when a WeChat call finished, saying whether the classical full-frame pass ran (S-100). Absent when WeChat did not finish a call. Read-only `MappingProxyType` view. |
 
 `len(result)` returns `len(result.detections)`.
 
@@ -447,13 +452,19 @@ opt-ins.
 
 ```python
 class WeChatEngine:
+    def __init__(self, full_frame_fallback: bool = True) -> None: ...
     def detect_and_decode(self, image) -> tuple[Detection, ...]: ...
 ```
 
 Wraps OpenCV-contrib's WeChat QR detector. **QR-only.** Loads the
-vendored `detect.onnx` and `sr.onnx` nets, then decodes the full frame
-when those nets return no payload. Returns `score=1.0` per decode.
-Requires the `[wechat]` extra (`opencv-contrib-python>=5`).
+vendored `detect.onnx` and `sr.onnx` nets. When `full_frame_fallback`
+is `True` (the default), a net pass that returns no payload is decoded
+once more with the no-argument constructor. `False` keeps the net pass
+only. The flag is fixed at construction. A non-bool raises `TypeError`.
+Returns `score=1.0` per decode. A `UnicodeDecodeError` from
+`detectAndDecode` is no detection and one warning, not an exception.
+Requires the `[wechat]` extra (`opencv-contrib-python>=5`, `numpy>=2`).
+OpenCV 4 raises `EngineUnavailable`: that install has no WeChat engine.
 
 ### `arbez.engines.apple_vision.AppleVisionEngine`
 

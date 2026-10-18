@@ -52,6 +52,14 @@ the explicit maintainer act of tagging is the gate.
 
 ### Added
 
+* **The WeChat classical fallback is switchable (S-100).**
+  `WeChatEngine(full_frame_fallback=True)` and
+  `Scanner(full_frame_fallback=True)`. The default stays on, which is
+  maximum yield. `False` runs the ONNX pass only. A finished WeChat
+  call sets `Result.extras["wechat_full_frame_fallback"]` to whether
+  the classical pass ran. The key is absent when WeChat did not finish
+  the call. A pre-built `WeChatEngine` keeps its own flag.
+
 * **zxing-cpp reads run in the isolation pool (S-098).** Whole-frame
   `ZXingEngine` reads and `ArbezEngine` crop and full-image fallback
   reads use the S-097 worker. The format filter is applied inside the
@@ -186,9 +194,23 @@ the explicit maintainer act of tagging is the gate.
   without them, because a tiny code in a large frame can fall through
   the detector. The `[wechat]` extra and the dev extra require
   `opencv-contrib-python` 5 (pin `5.0.0.93`) and numpy 2 or newer.
-  OpenCV 4 no longer satisfies the extra. The core numpy floor stays
-  1.24. That pin and the OpenCV pin are installed separately, because
-  OpenCV 5.0.0.93 does not resolve against numpy 1.24.
+  An OpenCV 4 install loses the WeChat engine: `WeChatEngine()` raises
+  `EngineUnavailable`. The `[wechat]` extra requires numpy >= 2. The
+  core numpy floor stays 1.24. That pin and the OpenCV pin are installed
+  separately, because OpenCV 5.0.0.93 does not resolve against numpy 1.24.
+
+### Fixed
+
+* **A caller-supplied WeChatEngine keeps its fallback after `Scanner.close()` (S-100).**
+  The next scan uses that same object, so `full_frame_fallback` stays
+  the value on the engine. A name-built engine and a consensus WeChat
+  engine still take the Scanner flag.
+
+* **A non-UTF-8 WeChat payload no longer raises (S-100).**
+  `detectAndDecode` raising `UnicodeDecodeError` returns no detection
+  and logs one warning. `Scanner(engine="wechat")` does not raise.
+  The classical pass is not started when the net pass was the call
+  that raised.
 
 ### Fixed
 

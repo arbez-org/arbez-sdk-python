@@ -12,8 +12,9 @@ The engine is **QR-only** — no 1D barcodes, no Aztec, no Data Matrix.
 The nets are what recover a small or blurred QR that the full-frame
 decode misses. A tiny code in a very large frame can also fall through
 the detector's input scale, so a scan that returns no payload is decoded
-once more with the no-argument constructor. In the multi-engine
-consensus the WeChat engine contributes that QR recovery.
+once more with the no-argument constructor when ``full_frame_fallback``
+is true (the default, S-100). In the multi-engine consensus the WeChat
+engine contributes that QR recovery.
 
 Public surface:
 
@@ -38,9 +39,14 @@ import logging
 import threading
 import weakref
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any, NamedTuple
 
-from arbez.engines._pool import EnginePool, bind_diagnostics, reset_diagnostics
+from arbez.engines._pool import (
+    EnginePool,
+    bind_diagnostics,
+    note_wechat_fallback,
+    reset_diagnostics,
+)
 from arbez.engines.base import ThreadSafety
 from arbez.engines.helpers import coerce_to_pil
 from arbez.exceptions import EngineRuntimeError, EngineUnavailable
@@ -206,42 +212,119 @@ def _detach_points(points: Any) -> Any:
         return points
 
 
+class _WeChatRaw(NamedTuple):
+    """One WeChat call, pickled back from the worker.
+
+    ``undecodable`` means ``detectAndDecode`` raised ``UnicodeDecodeError``.
+    The payloads are empty in that case. ``fallback_ran`` is whether the
+    no-argument constructor was called.
+    """
+
+    payloads: list[Any]
+    points: list[Any]
+    fallback_ran: bool
+    undecodable: bool
+
+
+def _detect_or_undecodable(
+    detector: Any,
+    bgr: Any,
+) -> tuple[list[Any], list[Any], bool]:
+    """Run ``detectAndDecode``. The third value is a Unicode failure.
+
+    Lists are copied before the caller checks emptiness. The 5.0.0.93
+    binding returns tuples, which can be walked twice; a one-shot
+    sequence would lose its tail after ``any()``.
+    """
+    try:
+        payloads, points_list = detector.detectAndDecode(bgr)
+    except UnicodeDecodeError:
+        return [], [], True
+    return list(payloads), list(points_list), False
+
+
 def _wechat_invoke(
     holder: WeChatEngine,
     bgr: Any,
     *,
     full_frame: bool = True,
-) -> tuple[list[Any], list[Any]]:
+) -> _WeChatRaw:
     """Net pass, then the no-argument full frame when that pass has no payload.
 
     One call so both constructors share a single pool deadline. A crash
     here kills the worker; the parent must not run the fallback itself.
     ``full_frame=False`` is the pre-seeded detector path: that object
     stays in the parent, and the no-argument constructor must not.
+    A ``UnicodeDecodeError`` is a finished no-read. The classical pass
+    is not started after one, because that pass uses the same binding
+    and this call is already empty (S-100).
     """
-    detector = holder._get_detector()
-    payloads, points_list = detector.detectAndDecode(bgr)
-    # Copy before the emptiness check. The 5.0.0.93 binding returns
-    # tuples, which can be walked twice; a one-shot sequence would
-    # lose its tail after any().
-    payloads = list(payloads)
-    points_list = list(points_list)
-    if full_frame and not any(payloads):
-        payloads, points_list = holder._get_full_frame_detector().detectAndDecode(bgr)
-        payloads = list(payloads)
-        points_list = list(points_list)
-    return payloads, [_detach_points(pts) for pts in points_list]
+    payloads, points_list, undecodable = _detect_or_undecodable(
+        holder._get_detector(), bgr
+    )
+    fallback_ran = False
+    # The constructor flag is the caller's switch. ``full_frame`` is the
+    # injected-detector path, which must not build the second object.
+    if (
+        full_frame
+        and holder.full_frame_fallback
+        and not undecodable
+        and not any(payloads)
+    ):
+        fallback_ran = True
+        payloads, points_list, undecodable = _detect_or_undecodable(
+            holder._get_full_frame_detector(), bgr
+        )
+    if undecodable:
+        return _WeChatRaw([], [], fallback_ran, True)
+    return _WeChatRaw(
+        payloads,
+        [_detach_points(pts) for pts in points_list],
+        fallback_ran,
+        False,
+    )
 
 
-def _wechat_worker_init() -> Any:
-    """Load the nets once in the worker. The parent keeps no detector."""
-    engine = WeChatEngine()
+def _accept_raw(raw: object) -> tuple[list[Any], list[Any]] | None:
+    """Record the fallback flag. ``None`` is a Unicode no-read.
+
+    The warning is logged here, in the parent, so a spawned worker does
+    not emit a second one.
+    """
+    if not isinstance(raw, _WeChatRaw):
+        raise EngineRuntimeError("WeChatEngine: worker returned an unexpected result")
+    note_wechat_fallback(raw.fallback_ran)
+    if raw.undecodable:
+        _log.warning(
+            "WeChatEngine: detectAndDecode raised UnicodeDecodeError; returning no read"
+        )
+        return None
+    return raw.payloads, raw.points
+
+
+def _wechat_worker(full_frame_fallback: bool) -> Any:
+    """Load the nets once. The parent keeps no detector."""
+    engine = WeChatEngine(full_frame_fallback=full_frame_fallback)
     engine._get_detector()
 
-    def run(image: Any) -> tuple[list[Any], list[Any]]:
+    def run(image: Any) -> _WeChatRaw:
         return _wechat_invoke(engine, image)
 
     return run
+
+
+def _wechat_worker_init() -> Any:
+    """Worker entrypoint with the classical fallback on."""
+    return _wechat_worker(True)
+
+
+def _wechat_worker_init_no_fallback() -> Any:
+    """Worker entrypoint with the classical fallback off.
+
+    The pool entrypoint takes no arguments, so the flag is which
+    function was spawned (S-100).
+    """
+    return _wechat_worker(False)
 
 
 # ── Engine ─────────────────────────────────────────────────────────────────
@@ -250,7 +333,14 @@ def _wechat_worker_init() -> Any:
 class WeChatEngine:
     """WeChat QR consensus engine.
 
-    No constructor parameters — WeChat is QR-only with no format filter.
+    QR-only, with no format filter. ``full_frame_fallback`` (default
+    ``True``, S-100) decodes the frame again with the no-argument
+    constructor when the vendored nets return no payload. ``False``
+    keeps the net pass only. The flag is fixed at construction: the
+    worker is loaded with it, and changing the attribute later does not
+    retarget a worker that has already started. An instance passed to
+    ``Scanner`` keeps its own flag.
+
     The detector and super-resolution nets are the vendored ONNX files,
     not weights baked into the OpenCV wheel. The wrapper instance is
     cheap to construct and safe to reuse across many
@@ -300,7 +390,15 @@ class WeChatEngine:
     # examples/ demonstrates the pattern. See S-018.
     thread_safety: ThreadSafety = "per-thread"
 
-    def __init__(self) -> None:
+    def __init__(self, full_frame_fallback: bool = True) -> None:
+        # S-100: reject a non-bool before the OpenCV probe, so a bad
+        # argument is not reported as a missing extra.
+        if not isinstance(full_frame_fallback, bool):
+            raise TypeError(
+                "full_frame_fallback must be a bool; "
+                f"got {type(full_frame_fallback).__name__}"
+            )
+        self.full_frame_fallback = full_frame_fallback
         # S-083 (generalises S-081): probe ``cv2`` +
         # ``cv2.wechat_qrcode`` at construction so callers using a
         # fallback engine chain catch ``EngineUnavailable`` cleanly
@@ -321,7 +419,8 @@ class WeChatEngine:
         # defense-in-depth against sys.modules mutation mid-process.
         # ``_detector`` is the ONNX-backed instance. ``_full_frame``
         # is the no-argument instance, built only after the nets
-        # return no payload (S-096).
+        # return no payload and only when full_frame_fallback is true
+        # (S-096, S-100).
         self._detector: Any | None = None
         self._full_frame: Any | None = None
         # S-097: one worker per instance. None until the first scan or warmup.
@@ -342,7 +441,9 @@ class WeChatEngine:
         self._lock = threading.Lock()
 
     def __repr__(self) -> str:
-        return "WeChatEngine()"
+        if self.full_frame_fallback:
+            return "WeChatEngine()"
+        return "WeChatEngine(full_frame_fallback=False)"
 
     # ── Public API ─────────────────────────────────────────────────────────
 
@@ -416,7 +517,10 @@ class WeChatEngine:
         descending bbox area (larger codes first — there's no per-detection score from the detector,
         so area is a reasonable proxy for "salience"). Empty tuple if WeChat found nothing
         decodable. A native crash or a deadline (S-097) is also an empty tuple; ``Scanner`` records
-        it on ``Result.extras`` instead of raising.
+        it on ``Result.extras`` instead of raising. A ``UnicodeDecodeError`` from ``detectAndDecode``
+        is an empty tuple and one warning (S-100), not an exception. When this call finishes inside
+        a ``Scanner`` scan, ``Result.extras["wechat_full_frame_fallback"]`` says whether the
+        classical pass ran.
         """
         pil_image = coerce_to_pil(image)
         token = bind_diagnostics(pil_image)
@@ -455,13 +559,17 @@ class WeChatEngine:
         # builds one inside the pool.
         with self._lock:
             if self._pool is None and self._detector is not None:
-                payloads, points_list = _wechat_invoke(self, bgr, full_frame=False)
+                raw: object = _wechat_invoke(self, bgr, full_frame=False)
             else:
                 pool = self._pool_under_lock()
                 outcome = pool.call(bgr)
                 if outcome.status != "ok":
                     return ()
-                payloads, points_list = outcome.value
+                raw = outcome.value
+        accepted = _accept_raw(raw)
+        if accepted is None:
+            return ()
+        payloads, points_list = accepted
 
         detections: list[Detection] = []
         # H3 (S-016): strict=True catches upstream length mismatches.
@@ -525,6 +633,13 @@ class WeChatEngine:
     def _pool_under_lock(self) -> EnginePool:
         """Build the isolation pool on first use. Caller holds ``self._lock``."""
         if self._pool is None:
+            # The entrypoint takes no arguments. The flag is which
+            # function the worker imports (S-100).
+            entrypoint = (
+                "arbez.engines.wechat:_wechat_worker_init"
+                if self.full_frame_fallback
+                else "arbez.engines.wechat:_wechat_worker_init_no_fallback"
+            )
             # A bound method would cycle engine → pool → factory → engine,
             # so a dropped Scanner keeps the worker until cyclic GC.
             engine_ref = weakref.ref(self)
@@ -536,7 +651,7 @@ class WeChatEngine:
                 return engine._inprocess_runner()
 
             self._pool = EnginePool(
-                "arbez.engines.wechat:_wechat_worker_init",
+                entrypoint,
                 engine="wechat",
                 inprocess_factory=factory,
             )
@@ -545,7 +660,7 @@ class WeChatEngine:
     def _inprocess_runner(self) -> Any:
         engine = self
 
-        def run(image: Any) -> tuple[list[Any], list[Any]]:
+        def run(image: Any) -> _WeChatRaw:
             return _wechat_invoke(engine, image)
 
         return run

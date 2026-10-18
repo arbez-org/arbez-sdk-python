@@ -79,6 +79,8 @@ class ScanDiagnostics:
     isolation: dict[str, str] = field(default_factory=dict)
     isolation_reason: str | None = None
     engine_faults: list[dict[str, str]] = field(default_factory=list)
+    # None until a WeChat call finishes. A crash or a timeout leaves it unset.
+    wechat_full_frame_fallback: bool | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def _note_mode(self, engine: str, mode: str, reason: str | None) -> None:
@@ -91,6 +93,10 @@ class ScanDiagnostics:
         with self._lock:
             self.engine_faults.append({"engine": engine, "kind": kind, "detail": detail})
 
+    def _note_wechat_fallback(self, ran: bool) -> None:
+        with self._lock:
+            self.wechat_full_frame_fallback = ran
+
     def to_extras(self) -> dict[str, object]:
         """Return the ``Result.extras`` fragment. Empty keys are omitted."""
         with self._lock:
@@ -101,6 +107,8 @@ class ScanDiagnostics:
                 extras["isolation_reason"] = self.isolation_reason
             if self.engine_faults:
                 extras["engine_faults"] = tuple(dict(item) for item in self.engine_faults)
+            if self.wechat_full_frame_fallback is not None:
+                extras["wechat_full_frame_fallback"] = self.wechat_full_frame_fallback
             return extras
 
 
@@ -174,6 +182,18 @@ def bind_diagnostics(image: object) -> contextvars.Token[ScanDiagnostics | None]
 def reset_diagnostics(token: contextvars.Token[ScanDiagnostics | None]) -> None:
     """Restore the diagnostics token from :func:`bind_diagnostics`."""
     _current.reset(token)
+
+
+def note_wechat_fallback(ran: bool) -> None:
+    """Record whether this scan's WeChat classical pass ran.
+
+    No-op when no scan diagnostics are bound, which is a direct engine
+    call. A crash or a timeout never calls this, so the key stays absent.
+    """
+    diag = _current.get()
+    if diag is None:
+        return
+    diag._note_wechat_fallback(ran)
 
 
 def _source_has_main_guard(source: str) -> bool:

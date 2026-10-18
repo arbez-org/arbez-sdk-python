@@ -153,7 +153,9 @@ from `Detection.extras`. Keys are omitted when empty. `isolation` maps
 an engine name to `"process"` (a spawned worker) or `"inprocess"`.
 `isolation_reason` is set only for an in-process fallback.
 `engine_faults` lists contained crashes and deadlines; the scan still
-returns.
+returns. `wechat_full_frame_fallback` is `true` when the WeChat
+classical full-frame pass ran and `false` when a finished WeChat call
+did not run it. It is absent when WeChat did not finish a call.
 
 ## Native crashes stay in a worker
 
