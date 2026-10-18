@@ -11,9 +11,11 @@ What's locked here:
 
 1. **Graceful absence.** When ``arbez_dmtx`` can't be imported, ``_get_dmtx()``
    returns ``None``, caches that, and the engine still constructs/decodes.
-2. **Crop decode helper.** ``_dmtx_decode_one`` returns the UTF-8 payload from
-   an injected libdmtx ``decode`` callable, and returns ``None`` on an empty
-   result, a raised exception, or a degenerate bbox — never propagates.
+2. **Crop decode helper.** ``_dmtx_decode_one`` returns ``(payload, startup_fault)``.
+   ``payload`` is the UTF-8 string from an injected libdmtx ``decode`` callable,
+   or ``None`` on an empty result, a raised exception, a degenerate bbox, or a
+   pool miss. ``startup_fault`` is true only when the pool reports one. The
+   helper does not propagate those misses.
 3. **Square-2D routing.** The fallback fires for DATA_MATRIX and Aztec
    when zxing-cpp failed. S-099: QR and Micro QR proposals are not
    offered to libdmtx, even when the detector misfiled a Data Matrix
@@ -98,8 +100,11 @@ def test_decode_off_never_probes_or_invokes_libdmtx() -> None:
 
 
 def test_dmtx_decode_one_happy_path() -> None:
-    """``_dmtx_decode_one`` returns the UTF-8 payload from the injected decoder
-    and passes the documented (max_count, timeout) kwargs."""
+    """``_dmtx_decode_one`` returns the UTF-8 payload and no startup fault.
+
+    The injected decoder is called with the documented ``max_count`` and
+    ``timeout`` kwargs.
+    """
     calls: list[dict[str, object]] = []
 
     def fake_decode(crop: object, max_count: int = 0, timeout: int = 0) -> list[_FakeDmtxResult]:
@@ -109,7 +114,7 @@ def test_dmtx_decode_one_happy_path() -> None:
     img = Image.new("RGB", (200, 200), "white")
     det = RawDetection(x1=20.0, y1=20.0, x2=120.0, y2=120.0, score=0.9, class_id=_CLASS_DATAMATRIX)
     out = ArbezEngine._dmtx_decode_one(fake_decode, img, det)
-    assert out == "DM-PAYLOAD-123"
+    assert out == ("DM-PAYLOAD-123", False)
     assert calls == [{"max_count": 1, "timeout": 300}]
 
 
@@ -118,7 +123,7 @@ def test_dmtx_decode_one_empty_result_returns_none() -> None:
     img = Image.new("RGB", (200, 200), "white")
     det = RawDetection(x1=20.0, y1=20.0, x2=120.0, y2=120.0, score=0.9, class_id=_CLASS_DATAMATRIX)
     out = ArbezEngine._dmtx_decode_one(lambda *a, **k: [], img, det)
-    assert out is None
+    assert out == (None, False)
 
 
 def test_dmtx_decode_one_exception_returns_none() -> None:
@@ -130,7 +135,7 @@ def test_dmtx_decode_one_exception_returns_none() -> None:
 
     img = Image.new("RGB", (200, 200), "white")
     det = RawDetection(x1=20.0, y1=20.0, x2=120.0, y2=120.0, score=0.9, class_id=_CLASS_DATAMATRIX)
-    assert ArbezEngine._dmtx_decode_one(boom, img, det) is None
+    assert ArbezEngine._dmtx_decode_one(boom, img, det) == (None, False)
 
 
 def test_dmtx_decode_one_degenerate_bbox_returns_none() -> None:
@@ -144,7 +149,7 @@ def test_dmtx_decode_one_degenerate_bbox_returns_none() -> None:
 
     img = Image.new("RGB", (200, 200), "white")
     degen = RawDetection(x1=50.0, y1=50.0, x2=50.0, y2=50.0, score=0.5, class_id=_CLASS_DATAMATRIX)
-    assert ArbezEngine._dmtx_decode_one(fake_decode, img, degen) is None
+    assert ArbezEngine._dmtx_decode_one(fake_decode, img, degen) == (None, False)
     assert called is False
 
 
@@ -167,7 +172,7 @@ def test_dmtx_decode_one_tiny_clamped_crop_returns_none() -> None:
     edge = RawDetection(
         x1=205.0, y1=205.0, x2=206.0, y2=206.0, score=0.5, class_id=_CLASS_DATAMATRIX
     )
-    assert ArbezEngine._dmtx_decode_one(fake_decode, img, edge) is None
+    assert ArbezEngine._dmtx_decode_one(fake_decode, img, edge) == (None, False)
     assert called is False
 
 
@@ -182,7 +187,7 @@ def test_dmtx_decode_one_non_utf8_uses_replacement() -> None:
         det,
     )
     # b"\xff" and b"\xfe" are each invalid UTF-8 lead bytes -> one U+FFFD each.
-    assert out == "��DM"
+    assert out == ("\ufffd\ufffdDM", False)
 
 
 def _engine_with_failing_zxing_and_fake_dmtx(
