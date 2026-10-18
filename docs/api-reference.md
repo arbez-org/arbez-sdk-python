@@ -427,7 +427,14 @@ Code 39 + EAN-13 + Aztec + Data Matrix + PDF417 + UPC-A + 1D
 catch-all). Returns `score=1.0` for every successful decode (no
 real confidence). zxing-cpp is a **core dependency** — it ships
 with the bare `pip install arbez`; the `[zxing]` extra remains as
-a no-op back-compat alias (S-034).
+a no-op back-compat alias (S-034). Whole-frame reads run in a spawned
+worker (S-098). The RGB image is sent as BGR, which is what the numpy
+binding reads. `formats=` is applied inside that worker. A crash or a
+deadline returns no detections and, when the call went through
+`Scanner`, is recorded on `Result.extras`. One instance queues
+concurrent native reads when isolation is on. The in-process fallback
+calls `read_barcodes` in the caller, outside the engine lock and the
+pool lock. Separate instances each have a worker.
 
 QR requests `BarcodeFormat.QRCodeModel2`, not the QR family bit
 (S-099). Micro QR and rMQR are off unless `micro_qr=True` /
@@ -547,7 +554,11 @@ parsed format, or `DATA_MATRIX` for the libdmtx fallback), not the YOLOX
 detector's class — the detector both localizes and *guesses* a class, and the
 guess is unreliable on square 2D codes (e.g. a Data Matrix filed as "QR"). The
 detector's class is used only when nothing the SDK models decoded. An
-unmapped zxing format is not published under that class.
+unmapped zxing format is not published under that class. Those zxing crop
+and full-image reads run in one shared worker per format set (S-098),
+separate from any `ZXingEngine`. A crash or a deadline on that read leaves
+the payload unset and stops the remaining pad and full-image stages for
+that detection. A read with no code still escalates.
 
 **Detection.extras** populated by this engine:
 
@@ -723,7 +734,7 @@ for the named engine. Always `>= 1`. Never raises.
 |---|---|
 | `"auto"` (default) | Resolves the engine a stock install would pick first (`arbez`), then dispatches |
 | `"arbez"` | `min(8, max(2, cpu_count // 2))` — ONNX Runtime already parallelizes within a session, so extra Python-side workers see diminishing returns |
-| `"zxing"` | `os.cpu_count()` — stateless C++ call, releases the GIL, full parallelism |
+| `"zxing"` | `os.cpu_count()` — unchanged (S-098). One shared `ZXingEngine` queues native reads on its worker when isolation is on. Separate instances each have a worker. The in-process fallback calls `read_barcodes` in the caller, outside the engine lock and the pool lock. Those reads can overlap, and a hang on that path is unbounded. |
 | `"wechat"` | `min(8, max(2, physical_cores * 3 // 4))` — heavy detector (~80 MB/instance), memory-bandwidth-bound. Empirical M1 sweet spot: 6 workers. |
 | `"apple_vision"` | Chip-aware: `min(cpu_count, 8)` on standard Apple Silicon (16-core ANE), `min(cpu_count, 16)` on Ultra (32-core ANE), 2 on Intel Mac. Validated by empirical benchmark on M1 — 4 workers gave 3.32×, 8 workers gave 4.15×. |
 | `"consensus"` | `len(installed_consensus_engines())` — per-image fan-out width for multi-engine voting. One dedicated thread per engine; total time = max(per-engine time). |

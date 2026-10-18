@@ -80,6 +80,13 @@ from arbez.engines.base import ThreadSafety
 from arbez.engines.helpers import coerce_to_pil
 from arbez.engines.zxing import (
     _NO_BARCODE_FORMATS,
+    _barcode_format,
+    _crop_request,
+    _crop_zxing_pool,
+    _drop_crop_zxing_pool_if_given_up,
+    _is_zxingcpp_module,
+    _isolated_hits,
+    _LadderHalt,
     barcode_formats_for,
     symbology_for_zxing_format,
 )
@@ -266,11 +273,12 @@ class ArbezEngine:
 
     Thread-safety (S-012)
     ---------------------
-    Safe to share across threads with full parallelism.
-    ``onnxruntime.InferenceSession.run`` is documented thread-safe;
-    we hold no per-scan mutable state. The classical decoder
-    (zxing-cpp) is stateless. One ``ArbezEngine`` instance serves any
-    number of concurrent ``detect_and_decode`` calls.
+    Safe to share across threads. ``onnxruntime.InferenceSession.run``
+    is documented thread-safe; we hold no per-scan mutable state.
+    zxing-cpp crop and full-image reads go through one shared worker
+    when the isolation pool can run (S-098), so those reads queue.
+    One ``ArbezEngine`` instance serves any number of concurrent
+    ``detect_and_decode`` calls.
 
     Parameters
     ----------
@@ -367,11 +375,12 @@ class ArbezEngine:
     # S-015 / S-023: stable string name + declared optimal input format.
     name: str = "arbez"
     native_format: str = "pil_rgb"
-    # S-038: one ArbezEngine instance is reentrant under thread pools —
-    # ``onnxruntime.InferenceSession.run`` is documented thread-safe,
-    # the zxing-cpp staged decoder is stateless, and the only
-    # per-instance mutable state (session, zxing module ref, class
-    # tables) is guarded by ``_session_lock`` / set during ``__init__``.
+    # S-038 / S-098: one ArbezEngine instance is reentrant under thread
+    # pools. Inference is thread-safe. zxing reads share one worker
+    # per format set when isolation is on, and the only per-instance
+    # mutable state
+    # (session, zxing module ref, class tables) is guarded by
+    # ``_session_lock`` / set during ``__init__``.
     thread_safety: ThreadSafety = "shared"
 
     def __init__(
@@ -675,7 +684,22 @@ class ArbezEngine:
         from arbez.engines.helpers import prewarm_pil
 
         self._get_session()
-        self._get_zxing()
+        zxing = self._get_zxing()
+        # S-098: the crop worker loads zxing-cpp now, off the first scan.
+        # decode=False never calls it. A missing zxing stays detect-only.
+        if (
+            self._decode_enabled
+            and zxing is not None
+            and self._zxing_formats is not _NO_BARCODE_FORMATS
+        ):
+            # Warm the set this engine will actually request. The
+            # default pool is a different worker when micro_qr or
+            # an allow-list changes the S-099 set.
+            request = _crop_request.set(self._zxing_formats)
+            try:
+                _crop_zxing_pool().start()
+            finally:
+                _crop_request.reset(request)
         # S-080: trigger PIL plugin discovery during warmup so the
         # first ``coerce_to_pil`` call inside ``detect_and_decode``
         # runs at steady state. PIL.Image.init() costs ~190 ms on
@@ -769,6 +793,9 @@ class ArbezEngine:
         the session on next call (same path as a freshly-constructed engine). Most callers treat
         ``close()`` as terminal; the lazy-reinit behavior is primarily there so test fixtures +
         context managers compose.
+
+        A shared libdmtx or zxing crop worker stays up. ``close`` drops one only after it has
+        abandoned its worker, so the next decode can spawn again.
         """
         with self._session_lock:
             self._session = None
@@ -783,9 +810,10 @@ class ArbezEngine:
             # it without triggering a session reload. Resetting it
             # would mean ``ArbezEngine().close().model_version`` would
             # surprise users by reloading the session.
-        # A shared libdmtx worker stays up. A pool that abandoned its
-        # worker can be dropped so the next decode may spawn again.
+        # A shared libdmtx or zxing worker stays up. A pool that abandoned
+        # its worker can be dropped so the next decode may spawn again.
         drop_libdmtx_pool_if_given_up()
+        _drop_crop_zxing_pool_if_given_up()
 
     def detect_and_decode(
         self,
@@ -1452,45 +1480,52 @@ class ArbezEngine:
 
         img_w, img_h = pil_image.width, pil_image.height
 
-        # Stage 1-3: escalating crops. First successful decode wins.
-        for stage_idx, frac in enumerate(ArbezEngine._DECODE_PAD_FRACTIONS):
-            pad = max(float(ArbezEngine._DECODE_PAD_FLOOR_PX), frac * bbox_min)
-            x1 = max(0, int(det.x1 - pad))
-            y1 = max(0, int(det.y1 - pad))
-            x2 = min(img_w, int(det.x2 + pad))
-            y2 = min(img_h, int(det.y2 + pad))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            # Numpy-slice fast path; falls back to PIL.crop if caller
-            # didn't materialize an np view.
-            crop: Any
-            if np_image is not None:
-                crop = np_image[y1:y2, x1:x2]
-            else:
-                crop = pil_image.crop((x1, y1, x2, y2))
-            payload, decoded_sym = ArbezEngine._zxing_read_first_valid(
-                zxing,
-                crop,
-                formats,
-            )
-            if payload is not None:
-                return payload, ArbezEngine._STAGE_LABELS[stage_idx], decoded_sym
+        # A timeout or a crash stops the rest of this detection, including
+        # the full-image read. A real miss (no code) still escalates.
+        try:
+            # Stage 1-3: escalating crops. First successful decode wins.
+            for stage_idx, frac in enumerate(ArbezEngine._DECODE_PAD_FRACTIONS):
+                pad = max(float(ArbezEngine._DECODE_PAD_FLOOR_PX), frac * bbox_min)
+                x1 = max(0, int(det.x1 - pad))
+                y1 = max(0, int(det.y1 - pad))
+                x2 = min(img_w, int(det.x2 + pad))
+                y2 = min(img_h, int(det.y2 + pad))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                # Numpy-slice fast path; falls back to PIL.crop if caller
+                # didn't materialize an np view.
+                crop: Any
+                if np_image is not None:
+                    crop = np_image[y1:y2, x1:x2]
+                else:
+                    crop = pil_image.crop((x1, y1, x2, y2))
+                payload, decoded_sym = ArbezEngine._zxing_read_first_valid(
+                    zxing,
+                    crop,
+                    formats,
+                    propagate_halt=True,
+                )
+                if payload is not None:
+                    return payload, ArbezEngine._STAGE_LABELS[stage_idx], decoded_sym
 
-        # Stage 4: full-image fallback. zxing-cpp has its own detector
-        # and may find the code where every padded crop failed (e.g.
-        # the model's bbox is significantly off, or the QR straddles
-        # the bbox edge in a way our padding couldn't recover). We
-        # only accept results whose decoded position center is INSIDE
-        # the detection bbox - guards against multi-code images where
-        # zxing finds a different code than the one we detected.
-        fb_payload, fb_sym = ArbezEngine._zxing_read_within_bbox(
-            zxing,
-            pil_image if np_image is None else np_image,
-            det,
-            img_w=img_w,
-            img_h=img_h,
-            formats=formats,
-        )
+            # Stage 4: full-image fallback. zxing-cpp has its own detector
+            # and may find the code where every padded crop failed (e.g.
+            # the model's bbox is significantly off, or the QR straddles
+            # the bbox edge in a way our padding couldn't recover). We
+            # only accept results whose decoded position center is INSIDE
+            # the detection bbox - guards against multi-code images where
+            # zxing finds a different code than the one we detected.
+            fb_payload, fb_sym = ArbezEngine._zxing_read_within_bbox(
+                zxing,
+                pil_image if np_image is None else np_image,
+                det,
+                img_w=img_w,
+                img_h=img_h,
+                formats=formats,
+                propagate_halt=True,
+            )
+        except _LadderHalt:
+            return None, None, None
         if fb_payload is not None:
             return fb_payload, ArbezEngine._FALLBACK_STAGE_LABEL, fb_sym
         return None, None, None
@@ -1515,6 +1550,8 @@ class ArbezEngine:
         zxing: Any,
         image: Any,
         formats: Any = None,
+        *,
+        propagate_halt: bool = False,
     ) -> tuple[str, Symbology] | tuple[None, None]:
         """Run zxing on the image; return ``(payload, decoded_symbology)``.
 
@@ -1524,7 +1561,12 @@ class ArbezEngine:
         ``decoded_symbology`` (S-094) is the symbology zxing-cpp actually parsed —
         ECC-validated, hence authoritative — mapped to :class:`Symbology`.
         Returns ``(None, None)`` when nothing the SDK models decoded
-        (zxing exception, no codes, invalid results, or an unmapped format).
+        (zxing exception, no codes, invalid results, an unmapped format,
+        or a native crash or deadline). ``propagate_halt`` re-raises that
+        crash or deadline so the crop ladder can stop.
+        ``EngineRuntimeError`` and ``EngineUnavailable`` propagate: a broken
+        worker is not a silent miss. Unmapped formats are skipped, so their
+        text is not published under the detector class.
         """
         # None means "caller did not choose a set" — use the safe
         # default (Model 2, no Micro QR, no rMQR). The match-nothing
@@ -1535,10 +1577,28 @@ class ArbezEngine:
         if formats is _NO_BARCODE_FORMATS:
             return None, None
         try:
+            if _is_zxingcpp_module(zxing):
+                # S-098: the real reader can hang. A crash or a deadline
+                # is a miss unless the ladder asked to stop. An init
+                # failure still propagates, and the pool does not retry
+                # it in this process. The format set is applied in the
+                # worker (S-099), not by omitting ``formats=``.
+                for text, fmt_name, _corners, _sym, _ec in _isolated_hits(image, formats):
+                    decoded = symbology_for_zxing_format(_barcode_format(fmt_name))
+                    if decoded is None:
+                        continue
+                    return text, decoded
+                return None, None
             for r in zxing.read_barcodes(image, formats=formats):
                 accepted = ArbezEngine._accepted_crop_read(r)
                 if accepted is not None:
                     return accepted
+        except _LadderHalt:
+            if propagate_halt:
+                raise
+            return None, None
+        except (EngineRuntimeError, EngineUnavailable):
+            raise
         except Exception as e:
             _log.debug("ArbezEngine: zxing read failed: %r", e)
         return None, None
@@ -1552,6 +1612,7 @@ class ArbezEngine:
         img_w: int | None = None,
         img_h: int | None = None,
         formats: Any = None,
+        propagate_halt: bool = False,
     ) -> tuple[str, Symbology] | tuple[None, None]:
         """Full-image zxing read with position-match filter (S-033).
 
@@ -1570,7 +1631,28 @@ class ArbezEngine:
         if formats is _NO_BARCODE_FORMATS:
             return None, None
         try:
+            if _is_zxingcpp_module(zxing):
+                # S-098. Same center as before: top-left with bottom-right,
+                # not the midpoint of all four corners. Unmapped formats
+                # are not a decode (S-099).
+                for text, fmt_name, corners, _sym, _ec in _isolated_hits(image, formats):
+                    if corners is None:
+                        continue
+                    decoded = symbology_for_zxing_format(_barcode_format(fmt_name))
+                    if decoded is None:
+                        continue
+                    cx = (corners[0][0] + corners[2][0]) / 2.0
+                    cy = (corners[0][1] + corners[2][1]) / 2.0
+                    if det.x1 <= cx <= det.x2 and det.y1 <= cy <= det.y2:
+                        return text, decoded
+                return None, None
             results = zxing.read_barcodes(image, formats=formats)
+        except _LadderHalt:
+            if propagate_halt:
+                raise
+            return None, None
+        except (EngineRuntimeError, EngineUnavailable):
+            raise
         except Exception as e:
             _log.debug("ArbezEngine: full-image fallback failed: %r", e)
             return None, None

@@ -11,6 +11,79 @@ ID prefix is `S-` (for SDK).
 
 ---
 
+## S-098 — zxing-cpp reads run in the isolation pool (2026-10-18)
+
+**Context.** S-097 put WeChat and the libdmtx fallback in `EnginePool` and
+left zxing-cpp in the caller. zxing-cpp's own reader can hang the host:
+a synthetic 1D-bar texture, upscaled 2×, does not return from
+`read_barcodes` on the QR path. A thread cannot cancel that. The same
+pool already has the deadline (2 s direct, 10 s on `Scanner.scan`), the
+spawn worker, and the in-process fallback.
+
+Whole-frame `ZXingEngine` reads and `ArbezEngine` crop and full-image
+reads are different call sites. A format filter has to be applied inside
+`read_barcodes`. Filtering after the call still runs the QR reader,
+which is the hang. A zxing `Result` is not a safe pickle, and it must
+not keep a view of the shared-memory segment the parent unlinks.
+
+**Decision.** Both call sites use the existing `EnginePool`. No second
+pool class, and no `fork`. `ZXingEngine` has one pool per instance. The
+format filter travels as `init_args` (zxing `BarcodeFormat` member
+names from the S-099 request, including `QRCodeModel2` and an
+opted-in `RMQRCode`). The child always passes that set into
+`read_barcodes`. `None` is the safe default, not an omitted
+`formats=` argument. `ArbezEngine` crop and full-image reads share
+one process-wide pool per request set, separate from any
+`ZXingEngine`, so a consensus scan does not queue both on one
+deadline. The child copies each valid read into a tuple (text, format
+name, four corners, symbology id, EC level) before the parent unlinks
+the segment. The parent checks that shape and rebuilds the small object
+`_translate` already accepts.
+
+A crash or a deadline is an empty read. It is not raised. `Scanner`
+records it on `Result.extras`. A Python error from the engine still
+propagates. `ArbezEngine` still treats a decode error on one crop as a
+miss, and re-raises `EngineRuntimeError` and `EngineUnavailable` so a
+broken worker is not a silent miss.
+
+The in-process path is the one S-097 already uses: `ARBEZ_ISOLATION=off`,
+a daemonic caller, Linux with no writable `/dev/shm`, or no `__main__`
+guard. That path calls the same entrypoint, including the format filter.
+Injected readers that are not the `zxingcpp` module stay in-process.
+The failure-only ladder is not part of this change. Deadlines, pixel
+caps, and `recommended_workers("zxing")` stay as they are. On 3.13+ the
+segment uses `track=False`. On 3.10–3.12 the child attaches by name and
+does not unregister the parent's tracker entry.
+
+**Alternatives considered.** A second pool class just for zxing.
+Rejected: S-097's pool already has the deadline and the fallback.
+Filtering formats in the parent after an all-formats read. Rejected:
+the QR reader still runs, so a Code 128 scan can hang. One worker
+shared by `ZXingEngine` and `ArbezEngine`. Rejected: consensus would
+serialize the two, and a hang in one spends the other's deadline.
+Staying in-process for speed. Rejected: that is the path that cannot
+stop the hang. A lane of workers per instance. Rejected: one worker is
+the bound this change needs; a lane is a second pool shape.
+
+**Consequences.** A direct `ZXingEngine.detect_and_decode` that hangs
+comes back empty at 2 s. The same frame through `Scanner.scan` gets
+10 s. Concurrent scans on one `ZXingEngine` stay safe and queue on that
+worker when isolation is on. Separate instances each have a worker.
+`ArbezEngine` crops share one worker per request set. The in-process fallback cannot
+promise to stop a hang. In-process reads run outside the engine lock
+and the pool lock, so `close()` is not stuck behind that read and those
+reads can overlap. Whole-frame RGB is channel-swapped to BGR before the
+pool, because the numpy binding assumes BGR. Crops are not swapped. An
+instance pool is replaced when `isolation_block_reason()` no longer
+matches, same as the crop pool, and the previous pool is closed after
+the engine lock is released. A timeout or a crash stops the rest of
+that detection's existing pad and full-image ladder. A real miss still
+escalates. The failure-only ladder is still not part of this change.
+The paired decode difference and the overhead gate are measured later,
+not in this change.
+
+---
+
 ## S-101 — EXIF on load, a hard pixel limit, per-stage timings (2026-10-17)
 
 **Context.** `coerce_to_pil` decoded whatever Pillow stored. A JPEG with

@@ -157,21 +157,33 @@ returns.
 
 ## Native crashes stay in a worker
 
-WeChat, and the libdmtx Data Matrix fallback inside `ArbezEngine`, run
-in a `spawn` worker. The engine is loaded once there. `fork` is not
-used: forking after Apple Vision or onnxruntime is loaded segfaults
-the worker. Each call has a deadline. A direct engine call gets 2
-seconds. `Scanner.scan` gets 10 seconds, because a bare `Scanner()` is
-maximum recall. A crash or a deadline kills that worker, starts
-another, and comes back as no detection from that engine. It is not
-raised.
+WeChat, zxing-cpp, and the libdmtx Data Matrix fallback inside
+`ArbezEngine` run in a `spawn` worker. The engine is loaded once there.
+`fork` is not used: forking after Apple Vision or onnxruntime is loaded
+segfaults the worker. Each call has a deadline. A direct engine call
+gets 2 seconds. `Scanner.scan` gets 10 seconds, because a bare
+`Scanner()` is maximum recall. A crash or a deadline kills that worker,
+starts another, and comes back as no detection from that engine. It is
+not raised.
+
+`ZXingEngine` has one worker per instance. `ArbezEngine` crop and
+full-image reads share one process-wide worker, so a consensus scan
+does not queue both on the same deadline. Concurrent calls on one
+`ZXingEngine` are safe and queue on that worker when isolation is on.
+Separate instances each have a worker. The in-process fallback calls
+`read_barcodes` in the caller, outside the engine lock and the pool
+lock, so `close()` can return during that read. Those reads can
+overlap, and a hang on that path is unbounded. A timeout or a crash
+on an `ArbezEngine` crop stops the remaining pad and full-image
+stages for that detection. A read with no code still escalates.
+Whole-frame RGB is sent as BGR, because the numpy binding treats an
+unlabeled 3-channel array as BGR. Crop arrays stay as they were.
 
 The pool runs in the calling process when `ARBEZ_ISOLATION=off`, when
 the caller is a daemon, when Linux cannot write `/dev/shm`, or when
 the program has no `if __name__ == "__main__"` guard (`python -c`, a
 REPL). In-process mode cannot stop a native crash. The choice is
-logged once and copied onto `Result.extras`. zxing-cpp still runs in
-the caller.
+logged once and copied onto `Result.extras`.
 
 ## Symbology — the barcode classes
 
@@ -506,7 +518,7 @@ depends on which engine got picked:
 
 | Engine | Shared instance | Parallelism | Why |
 |---|:-:|:-:|---|
-| `ZXingEngine` | safe | **full** | `zxing-cpp` releases the GIL inside `read_barcodes`; the function is stateless. N threads = N parallel scans. |
+| `ZXingEngine` | safe | **queued** | One spawned worker per instance when isolation is on (S-098). Concurrent scans on that instance queue. The in-process fallback calls `read_barcodes` in the caller, outside the engine lock and the pool lock, so `close()` can return during that read. Those reads can overlap, and a hang on that path is unbounded. Separate instances each have a worker. |
 | `AppleVisionEngine` | safe | **full** | Each scan builds a fresh `VNDetectBarcodesRequest` + `VNImageRequestHandler`. Apple's Vision is doc'd thread-safe at the handler level. |
 | `WeChatEngine` | safe | **serialized** | OpenCV's WeChat detector is thread-unsafe; we serialize calls on a shared instance with a per-instance `threading.Lock`. Concurrent scans queue up — no crashes, no parallelism. |
 
@@ -680,6 +692,7 @@ relevant to users:
 
 | ADR | Subject |
 |---|---|
+| S-098 | zxing-cpp whole-frame and crop reads run in the S-097 worker; a hang is an empty read |
 | S-097 | WeChat and libdmtx run in a spawned worker; crashes and deadlines land on `Result.extras` |
 | S-007 | Public `Engine` Protocol + `coerce_to_pil` — the "write your own engine" contract |
 | S-008 | Per-platform engine probing (superseded by S-093 union default in 0.2.0) |
