@@ -116,6 +116,21 @@ class _PoolUnavailable(Exception):
     """The worker could not be spawned. The caller runs in-process."""
 
 
+class _WorkerStartupFault(Exception):
+    """The worker never became ready. This is not an engine Python error.
+
+    ``kind`` is ``"crash"`` (the process died while loading) or
+    ``"timeout"`` (it was still loading when the startup budget ended).
+    ``call`` turns it into a :class:`PoolResult`. It is not retried in
+    the parent: the same native fault would hit this process.
+    """
+
+    def __init__(self, kind: str, detail: str) -> None:
+        super().__init__(detail)
+        self.kind = kind
+        self.detail = detail
+
+
 @dataclass(frozen=True, slots=True)
 class PoolResult:
     """One pool call.
@@ -775,6 +790,10 @@ class EnginePool:
                 # Spawn failed. Same fallback a later call() would take,
                 # so warmup does not abort the host.
                 self._load_inprocess()
+            except _WorkerStartupFault:
+                # Died or still loading. The next call records that.
+                # Do not load the native engine in this process.
+                return
 
     def call(self, image: npt.NDArray[Any], deadline: float | None = None) -> PoolResult:
         """Run one image. ``deadline`` wins, else the bound scan, else 2 s."""
@@ -869,7 +888,15 @@ class EnginePool:
         # Reject it before the frame is sent, and before a worker is started.
         if not math.isfinite(deadline) or deadline < 0:
             return self._timeout_result(deadline)
-        self._ensure_worker()
+        try:
+            self._ensure_worker()
+        except _WorkerStartupFault as exc:
+            return PoolResult(
+                status=exc.kind,
+                value=None,
+                detail=exc.detail,
+                isolation="process",
+            )
         conn = self._conn
         proc = self._proc
         if conn is None or proc is None:
@@ -882,6 +909,15 @@ class EnginePool:
             try:
                 shm, shape, dtype_str = _create_shared_image(image)
             except _SharedMemoryCapacityError as exc:
+                return PoolResult(
+                    status="crash",
+                    value=None,
+                    detail=str(exc),
+                    isolation="process",
+                )
+            except OSError as exc:
+                # macOS and Windows have no fallocate guard. A segment
+                # limit or a full backing store is a contained miss.
                 return PoolResult(
                     status="crash",
                     value=None,
@@ -1027,17 +1063,20 @@ class EnginePool:
     def _wait_ready(self, conn: Connection, proc: mp.Process) -> None:
         if not conn.poll(_STARTUP_S):
             if not proc.is_alive():
-                raise EngineRuntimeError(
-                    f"engine {self.engine} worker died during init exit {proc.exitcode}"
+                raise _WorkerStartupFault(
+                    "crash",
+                    f"engine {self.engine} worker died during init exit {proc.exitcode}",
                 )
-            raise EngineRuntimeError(
-                f"engine {self.engine} worker was not ready within {_STARTUP_S:.0f}s"
+            raise _WorkerStartupFault(
+                "timeout",
+                f"engine {self.engine} worker was not ready within {_STARTUP_S:.0f}s",
             )
         try:
             message: Any = conn.recv()
         except (EOFError, OSError) as exc:
-            raise EngineRuntimeError(
-                f"engine {self.engine} worker died during init exit {proc.exitcode}"
+            raise _WorkerStartupFault(
+                "crash",
+                f"engine {self.engine} worker died during init exit {proc.exitcode}",
             ) from exc
         if not isinstance(message, tuple) or not message:
             raise EngineRuntimeError(f"engine {self.engine} worker sent {message!r} during init")
