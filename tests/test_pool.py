@@ -1430,7 +1430,9 @@ def test_replacement_ready_wait_uses_the_call_deadline() -> None:
     pool._ready = False
     try:
         result = pool.call(_image(0), deadline=2.0)
-        assert 1.5 < seen["timeout"] <= 2.0
+        # ``monotonic() + 2.0`` minus a later reading can sit a few
+        # ulps over 2. The 120 s cold-start budget is still rejected.
+        assert 1.5 < seen["timeout"] <= 2.0 + 1e-6
         assert result.status == "timeout"
         assert result.isolation == "process"
         assert pool.last_was_startup_fault is True
