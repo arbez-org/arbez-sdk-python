@@ -369,10 +369,12 @@ def test_blurred_small_qr_on_noise_needs_the_nets() -> None:
 
 
 def test_clean_tiny_qr_on_a_large_canvas_still_decodes() -> None:
-    """S-096: the detector alone misses this code. The full-frame fallback must keep it.
+    """S-096: the detector alone misses this code. Scanner must keep it.
 
     54x54 QR at (533, 533) on a 1600x1600 white canvas. Measured on OpenCV 5.0.0.93:
-    no-argument constructor hits, two-path constructor misses.
+    no-argument constructor hits, two-path constructor misses. S-097 gives a
+    direct ``detect_and_decode`` 2 s, which can return empty when the
+    fallback is close to that. ``Scanner`` is the 10 s path.
     """
     import cv2
 
@@ -395,8 +397,12 @@ def test_clean_tiny_qr_on_a_large_canvas_still_decodes() -> None:
         ).detectAndDecode(bgr)
     assert _RECALL_PAYLOAD not in list(net_payloads)
 
-    detections = WeChatEngine().detect_and_decode(Image.fromarray(canvas, "RGB"))
-    assert [d.payload for d in detections] == [_RECALL_PAYLOAD]
+    engine = WeChatEngine()
+    try:
+        result = Scanner(engine=engine).scan(Image.fromarray(canvas, "RGB"))
+    finally:
+        engine.close()
+    assert [d.payload for d in result.detections] == [_RECALL_PAYLOAD]
 
 
 def test_scanner_wechat_runs_in_a_worker_with_the_ten_second_deadline(
