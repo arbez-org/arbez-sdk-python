@@ -670,6 +670,11 @@ def test_coerce_to_pil_rereads_tiff_fp_when_path_open_fails(tmp_path: Path) -> N
     ``Image.open(filename)`` raises. The open file pointer still has
     the bytes. Orientation is applied to a private image, and the
     caller stays unloaded.
+
+    The file stays on disk. Windows rejects ``unlink`` while Pillow
+    holds the handle (WinError 32). ``_reopen_unloaded`` retries
+    ``image.filename``, so that name points at a path that is not
+    there.
     """
     from PIL.TiffImagePlugin import TiffImageFile
 
@@ -677,7 +682,9 @@ def test_coerce_to_pil_rereads_tiff_fp_when_path_open_fails(tmp_path: Path) -> N
     path = tmp_path / "oriented.tiff"
     path.write_bytes(raw)
     src = Image.open(path)
-    path.unlink()
+    missing = tmp_path / "missing.tiff"
+    assert not missing.exists()
+    src.filename = str(missing)
     assert isinstance(src, TiffImageFile)
     try:
         assert src.tag_v2.get(_EXIF_ORIENTATION) == 6
