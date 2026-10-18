@@ -64,6 +64,7 @@ from arbez.engines._pool import (
     bind_diagnostics,
     drop_libdmtx_pool_if_given_up,
     libdmtx_pool,
+    libdmtx_pool_if_any,
     reset_diagnostics,
 )
 from arbez.engines._yolox import (
@@ -1201,6 +1202,9 @@ class ArbezEngine:
         # S-092: libdmtx Data Matrix fallback decoder (probed once; None if the
         # arbez-dmtx companion isn't installed -> behaviour unchanged).
         dmtx_decode = self._get_dmtx() if self._decode_enabled else None
+        # One startup failure per image. The next crop must not pay
+        # another cold-start budget for a worker that just died.
+        dmtx_startup_failed = False
 
         # S-035 perf: materialize the image once as a numpy view so the
         # staged decoder (up to 4 zxing passes per detection) can slice
@@ -1255,6 +1259,7 @@ class ArbezEngine:
                 if (
                     payload is None
                     and dmtx_decode is not None
+                    and not dmtx_startup_failed
                     and _should_try_libdmtx_fallback(
                         detector_symbology,
                         allow=self._symbology_allow,
@@ -1264,13 +1269,17 @@ class ArbezEngine:
                         dmtx_payload = self._dmtx_decode_one(dmtx_decode, pil_image, d)
                     except Exception as exc:
                         # One crop. Earlier zxing hits in ``out`` stay, and
-                        # later boxes still decode. The helper itself still
-                        # raises, so a startup error is not retried here.
+                        # later boxes still decode. Do not pay this again.
                         _log.warning(
                             "ArbezEngine: libdmtx fallback failed on one crop: %r",
                             exc,
                         )
                         dmtx_payload = None
+                        dmtx_startup_failed = True
+                    else:
+                        pool = libdmtx_pool_if_any()
+                        if pool is not None and pool.last_was_startup_fault:
+                            dmtx_startup_failed = True
                     if dmtx_payload is not None:
                         payload = dmtx_payload
                         decode_stage = "libdmtx"

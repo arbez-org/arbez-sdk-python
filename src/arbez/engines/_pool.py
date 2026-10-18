@@ -700,6 +700,10 @@ class EnginePool:
         self.last_deadline_s = self._deadline
         self._closed = False
         self._ready = False
+        # True after a worker has loaded once. A replacement then waits
+        # only for the call's deadline, not the cold-start budget.
+        self._ever_ready = False
+        self.last_was_startup_fault = False
         self._lock = threading.RLock()
         self._proc: mp.Process | None = None
         self._conn: Connection | None = None
@@ -748,9 +752,8 @@ class EnginePool:
             try:
                 self._ensure_worker()
             except _PoolUnavailable:
-                # Spawn failed. Same fallback a later call() would take,
-                # so warmup does not abort the host.
-                self._load_inprocess()
+                # Spawn failed. Do not load the native engine here.
+                return
             except _WorkerStartupFault:
                 # Died or still loading. The next call records that.
                 # Do not load the native engine in this process.
@@ -763,13 +766,21 @@ class EnginePool:
             if self._closed:
                 raise RuntimeError("EnginePool is closed")
             self.last_deadline_s = resolved
+            self.last_was_startup_fault = False
             if self.isolation == "inprocess":
                 result = self._call_inprocess(image)
             else:
                 try:
                     result = self._call_process(image, resolved)
-                except _PoolUnavailable:
-                    result = self._call_inprocess(image)
+                except _PoolUnavailable as exc:
+                    # A failed spawn is a miss. Running the native engine
+                    # in this process is how a SIGBUS kills the host.
+                    result = PoolResult(
+                        status="crash",
+                        value=None,
+                        detail=str(exc),
+                        isolation="process",
+                    )
             self._note(result)
             return result
 
@@ -834,8 +845,9 @@ class EnginePool:
         if not math.isfinite(deadline) or deadline < 0:
             return self._timeout_result(deadline)
         try:
-            self._ensure_worker()
+            self._ensure_worker(deadline)
         except _WorkerStartupFault as exc:
+            self.last_was_startup_fault = True
             return PoolResult(
                 status=exc.kind,
                 value=None,
@@ -947,9 +959,9 @@ class EnginePool:
     def _replace_worker(self) -> None:
         """Kill the current worker and start the next one.
 
-        Ready is the next call's wait. This call already missed its
-        deadline or lost the worker, and startup can take the whole
-        model-load budget.
+        Ready is the next call's wait, and that wait uses the call's
+        deadline once a worker has loaded. This call already missed its
+        deadline or lost the worker.
         """
         self._kill_worker()
         if self._gave_up:
@@ -961,14 +973,17 @@ class EnginePool:
         except Exception:
             _log.warning("engine %s worker respawn failed", self.engine, exc_info=True)
 
-    def _ensure_worker(self) -> None:
+    def _ensure_worker(self, ready_budget: float = _STARTUP_S) -> None:
+        # The first load may take the cold-start budget. A replacement
+        # for a worker that already loaded waits only for this call.
+        budget = ready_budget if self._ever_ready else _STARTUP_S
         if self._proc is not None and self._proc.is_alive() and self._conn is not None:
             if not self._ready:
-                self._finish_ready()
+                self._finish_ready(budget)
             return
         self._kill_worker()
         self._spawn_worker()
-        self._finish_ready()
+        self._finish_ready(budget)
 
     def _spawn_worker(self) -> None:
         ctx = _spawn_context()
@@ -984,29 +999,31 @@ class EnginePool:
         except OSError as exc:
             parent.close()
             child.close()
-            self._trip_inprocess(f"spawn failed: {exc}")
-            raise _PoolUnavailable(str(exc)) from exc
+            # Leave isolation as process. call() records a crash result
+            # instead of running this engine in the parent.
+            raise _PoolUnavailable(f"spawn failed: {exc}") from exc
         child.close()
         self._proc = proc
         self._conn = parent
         self._ready = False
 
-    def _finish_ready(self) -> None:
+    def _finish_ready(self, budget: float) -> None:
         conn = self._conn
         proc = self._proc
         if conn is None or proc is None:
             raise EngineRuntimeError(f"engine {self.engine} worker is not running")
         try:
-            self._wait_ready(conn, proc)
+            self._wait_ready(conn, proc, budget)
         except BaseException:
             # A worker that dies while loading must not fall back in-process:
             # the same native fault would hit the parent.
             self._kill_worker()
             raise
         self._ready = True
+        self._ever_ready = True
 
-    def _wait_ready(self, conn: Connection, proc: mp.Process) -> None:
-        if not conn.poll(_STARTUP_S):
+    def _wait_ready(self, conn: Connection, proc: mp.Process, budget: float) -> None:
+        if not conn.poll(budget):
             if not proc.is_alive():
                 raise _WorkerStartupFault(
                     "crash",
@@ -1014,7 +1031,7 @@ class EnginePool:
                 )
             raise _WorkerStartupFault(
                 "timeout",
-                f"engine {self.engine} worker was not ready within {_STARTUP_S:.0f}s",
+                f"engine {self.engine} worker was not ready within {budget:.0f}s",
             )
         try:
             message: Any = conn.recv()
