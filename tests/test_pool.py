@@ -36,6 +36,7 @@ from arbez.engines._pool import (
     MAX_RECALL_DEADLINE_S,
     START_METHOD,
     EnginePool,
+    PoolResult,
     ScanDiagnostics,
     _attach_shared_memory,
     active_deadline,
@@ -1363,6 +1364,207 @@ def test_shared_memory_create_oserror_is_a_crash_result(
         pool._proc = None
         pool._conn = None
         pool.close()
+
+
+def test_spawn_failure_is_a_crash_and_does_not_run_in_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """EMFILE must not put WeChat or libdmtx back in the host."""
+    _require_process_pools()
+    import arbez.engines._pool as pool_mod
+
+    pool = _pool()
+    ran: list[str] = []
+
+    def _refuse(_image: object) -> None:
+        ran.append("inprocess")
+        raise AssertionError("in-process fallback")
+
+    def _no_spawn() -> None:
+        raise pool_mod._PoolUnavailable("spawn failed: [Errno 24] Too many open files")
+
+    pool._inprocess_fn = _refuse
+    monkeypatch.setattr(pool, "_spawn_worker", _no_spawn)
+    try:
+        result = pool.call(_image(0))
+        assert result.status == "crash"
+        assert result.isolation == "process"
+        assert "Too many open files" in result.detail
+        assert ran == []
+        assert pool.isolation == "process"
+        assert pool.gave_up is False
+    finally:
+        pool._proc = None
+        pool._conn = None
+        pool.close()
+
+
+def test_replacement_ready_wait_uses_the_call_deadline() -> None:
+    """After one successful load, the next worker waits for this call only."""
+    _require_process_pools()
+    pool = _pool()
+    seen: dict[str, float] = {}
+
+    class _BudgetConn:
+        def poll(self, timeout: float) -> bool:
+            seen["timeout"] = timeout
+            return False
+
+        def close(self) -> None:
+            return None
+
+    pool._ever_ready = True
+    proc = _AliveUntilKill()
+    pool._proc = proc  # type: ignore[assignment]
+    pool._conn = _BudgetConn()  # type: ignore[assignment]
+    pool._ready = False
+    try:
+        result = pool.call(_image(0), deadline=2.0)
+        assert seen["timeout"] == 2.0
+        assert result.status == "timeout"
+        assert result.isolation == "process"
+        assert pool.last_was_startup_fault is True
+        assert proc.is_alive() is False
+        assert pool.isolation == "process"
+    finally:
+        pool._proc = None
+        pool._conn = None
+        pool.close()
+
+
+def test_libdmtx_startup_fault_is_not_paid_on_the_next_crop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One image pays one startup failure. The next box does not call again."""
+    from arbez.engines._yolox import RawDetection
+    from arbez.engines.arbez import ArbezEngine
+
+    calls = {"n": 0}
+
+    class _Startup:
+        last_was_startup_fault = False
+
+        def call(self, _image_arg: object, deadline: float | None = None) -> PoolResult:
+            calls["n"] += 1
+            self.last_was_startup_fault = True
+            return PoolResult(
+                status="timeout",
+                value=None,
+                detail="worker was not ready within 120s",
+                isolation="process",
+            )
+
+    pool = _Startup()
+    monkeypatch.setattr("arbez.engines.arbez.libdmtx_pool", lambda: pool)
+    monkeypatch.setattr("arbez.engines.arbez.libdmtx_pool_if_any", lambda: pool)
+
+    engine = ArbezEngine(decode=True)
+    engine._zxing_module = object()
+    engine._zxing_probed = True
+
+    def decode_one(*_a: object, **_k: object) -> tuple[None, None, None]:
+        return (None, None, None)
+
+    monkeypatch.setattr(engine, "_decode_one", decode_one)
+
+    def real_decode(*_a: object, **_k: object) -> None:
+        raise AssertionError("libdmtx ran in-process")
+
+    real_decode.__module__ = "arbez_dmtx._libdmtx.pylibdmtx"
+    real_decode.__name__ = "decode"
+    engine._dmtx_decode = real_decode
+    engine._dmtx_probed = True
+
+    img = Image.new("RGB", (300, 300), "white")
+    first = RawDetection(20.0, 20.0, 140.0, 140.0, 0.9, 2)
+    second = RawDetection(160.0, 160.0, 280.0, 280.0, 0.9, 2)
+    dets = engine._decode_detections([first, second], img)
+    assert calls["n"] == 1
+    assert [d.payload for d in dets] == [None, None]
+
+
+def test_libdmtx_timeout_is_recorded_on_the_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scanner.scan records a libdmtx deadline. The bind in detect_and_decode is required."""
+    _require_process_pools()
+    from arbez.engines._yolox import RawDetection
+    from arbez.engines.arbez import ArbezEngine
+
+    engine = ArbezEngine(decode=True)
+    engine._zxing_module = object()
+    engine._zxing_probed = True
+
+    class _Session:
+        def get_inputs(self) -> list[Any]:
+            return [types.SimpleNamespace(name="images")]
+
+        def run(self, *_a: object, **_k: object) -> list[None]:
+            return [None]
+
+    engine._session = _Session()
+
+    def one_box(*_a: object, **_k: object) -> list[RawDetection]:
+        return [RawDetection(20.0, 20.0, 140.0, 140.0, 0.9, 2)]
+
+    monkeypatch.setattr("arbez.engines.arbez.yolox_postprocess", one_box)
+    monkeypatch.setattr(engine, "_decode_one", lambda *_a, **_k: (None, None, None))
+
+    def real_decode(*_a: object, **_k: object) -> None:
+        raise AssertionError("libdmtx ran in-process")
+
+    real_decode.__module__ = "arbez_dmtx._libdmtx.pylibdmtx"
+    real_decode.__name__ = "decode"
+    engine._dmtx_decode = real_decode
+    engine._dmtx_probed = True
+
+    pool = EnginePool(_ENTRY, engine="libdmtx", deadline=2.0)
+
+    def hang(image: object, deadline: float | None = None) -> PoolResult:
+        del image, deadline
+        return EnginePool.call(pool, _image(2), 0.3)
+
+    pool.call = hang  # type: ignore[method-assign]
+    monkeypatch.setattr("arbez.engines.arbez.libdmtx_pool", lambda: pool)
+    try:
+        result = Scanner(engine=engine).scan(Image.new("RGB", (64, 64), "white"))
+        assert len(result.detections) == 1
+        assert result.detections[0].payload is None
+        faults = result.extras["engine_faults"]
+        assert isinstance(faults, tuple)
+        fault = faults[0]
+        assert isinstance(fault, dict)
+        assert fault["engine"] == "libdmtx"
+        assert fault["kind"] == "timeout"
+    finally:
+        pool.close()
+
+
+def test_wechat_timeout_returns_empty_and_records_a_fault() -> None:
+    """A WeChat deadline is an empty tuple and a fault, not only last_deadline_s."""
+    _require_process_pools()
+    from arbez.engines.wechat import WeChatEngine
+
+    engine = WeChatEngine()
+    pool = EnginePool(_ENTRY, engine="wechat", deadline=2.0)
+
+    def hang(image: object, deadline: float | None = None) -> PoolResult:
+        del image, deadline
+        return EnginePool.call(pool, _image(2), 0.3)
+
+    pool.call = hang  # type: ignore[method-assign]
+    engine._pool = pool
+    try:
+        result = Scanner(engine=engine).scan(Image.new("RGB", (8, 8), "white"))
+        assert result.detections == ()
+        faults = result.extras["engine_faults"]
+        assert isinstance(faults, tuple)
+        fault = faults[0]
+        assert isinstance(fault, dict)
+        assert fault["engine"] == "wechat"
+        assert fault["kind"] == "timeout"
+    finally:
+        engine.close()
 
 
 def test_dropped_wechat_engine_does_not_keep_its_pool_alive(
