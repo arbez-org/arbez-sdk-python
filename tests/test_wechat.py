@@ -374,7 +374,8 @@ def test_clean_tiny_qr_on_a_large_canvas_still_decodes() -> None:
     54x54 QR at (533, 533) on a 1600x1600 white canvas. Measured on OpenCV 5.0.0.93:
     no-argument constructor hits, two-path constructor misses. S-097 gives a
     direct ``detect_and_decode`` 2 s, which can return empty when the
-    fallback is close to that. ``Scanner`` is the 10 s path.
+    fallback is close to that. ``Scanner`` is the 10 s path. Both deadlines
+    are recorded on this image, on the same engine.
     """
     import cv2
 
@@ -398,8 +399,15 @@ def test_clean_tiny_qr_on_a_large_canvas_still_decodes() -> None:
     assert _RECALL_PAYLOAD not in list(net_payloads)
 
     engine = WeChatEngine()
+    image = Image.fromarray(canvas, "RGB")
     try:
-        result = Scanner(engine=engine).scan(Image.fromarray(canvas, "RGB"))
+        # The direct call may miss. The lock is which deadline it used.
+        engine.detect_and_decode(image)
+        assert engine._pool is not None
+        assert engine._pool.isolation == "process"
+        assert engine._pool.last_deadline_s == 2.0
+        result = Scanner(engine=engine).scan(image)
+        assert engine._pool.last_deadline_s == 10.0
     finally:
         engine.close()
     assert [d.payload for d in result.detections] == [_RECALL_PAYLOAD]

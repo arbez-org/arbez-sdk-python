@@ -186,8 +186,10 @@ schedule + macOS's malloc-reclamation timing.
   mode, single-engine failures are isolated (logged as WARNING; that
   engine's contribution is empty); only catastrophic dispatch
   failures bubble up. A native crash or a deadline in a pooled
-  engine (WeChat, libdmtx) does not raise: the detection list is
-  empty and `Result.extras["engine_faults"]` records it.
+  engine (WeChat, libdmtx) does not raise. That engine adds nothing
+  on this call. Detections from the other engines stay, and so do
+  barcodes already decoded from earlier crops of the same image.
+  `Result.extras["engine_faults"]` records the fault.
 
 **Examples:**
 
