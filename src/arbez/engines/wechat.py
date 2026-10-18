@@ -468,8 +468,10 @@ class WeChatEngine:
             pool = self._pool_under_lock()
             if pool.isolation == "process":
                 pool.start()
-            # start() falls back in-process when spawn fails. Build the
-            # detector here in that case, and only then.
+                if pool.last_was_startup_fault:
+                    raise EngineRuntimeError("WeChat worker did not become ready")
+            # In-process is the four S-097 reasons, not a failed spawn.
+            # Build the detector here in that case, and only then.
             if pool.isolation == "inprocess":
                 self._get_detector()
         prewarm_pil()

@@ -51,6 +51,7 @@ Removed in v0.0.17 (S-031)
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import threading
 from collections.abc import Iterable
@@ -64,7 +65,6 @@ from arbez.engines._pool import (
     bind_diagnostics,
     drop_libdmtx_pool_if_given_up,
     libdmtx_pool,
-    libdmtx_pool_if_any,
     reset_diagnostics,
 )
 from arbez.engines._yolox import (
@@ -192,6 +192,12 @@ if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
 
 _log = logging.getLogger(__name__)
+# Set by ``_dmtx_decode_one`` for the crop that just returned. A pool
+# flag would be cleared by the next scan before this thread could read it.
+_dmtx_crop_startup: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "arbez_dmtx_crop_startup",
+    default=False,
+)
 
 
 def _probe_onnxruntime_or_raise() -> None:
@@ -1206,10 +1212,15 @@ class ArbezEngine:
         # Outside the swallow. A crash or a deadline, including a worker
         # that dies or is not ready while loading, is a PoolResult and a
         # miss. A Python error from decode still propagates from this
-        # helper, and the pool does not retry a failed init in-process.
-        # The detection loop catches that error so one crop does not
-        # discard barcodes already decoded on the image.
+        # helper. The pool does not retry a failed init in-process.
+        # ``startup_fault`` is on that result. Reading it off the pool
+        # after ``call`` returns races the next scan, which clears the
+        # flag under the lock.
+        _dmtx_crop_startup.set(False)
         outcome = libdmtx_pool().call(array)
+        if outcome.startup_fault:
+            _dmtx_crop_startup.set(True)
+            return None
         if outcome.status != "ok" or not isinstance(outcome.value, str):
             return None
         return outcome.value
@@ -1296,17 +1307,17 @@ class ArbezEngine:
                     try:
                         dmtx_payload = self._dmtx_decode_one(dmtx_decode, pil_image, d)
                     except Exception as exc:
-                        # One crop. Earlier zxing hits in ``out`` stay, and
-                        # later boxes still decode. Do not pay this again.
+                        # The pool raised. One crop stays a miss so earlier
+                        # hits in ``out`` survive. The worker is still in its
+                        # recv loop, so a later crop of this image can decode.
+                        # A startup fault is not this path.
                         _log.warning(
                             "ArbezEngine: libdmtx fallback failed on one crop: %r",
                             exc,
                         )
                         dmtx_payload = None
-                        dmtx_startup_failed = True
                     else:
-                        pool = libdmtx_pool_if_any()
-                        if pool is not None and pool.last_was_startup_fault:
+                        if _dmtx_crop_startup.get():
                             dmtx_startup_failed = True
                     if dmtx_payload is not None:
                         payload = dmtx_payload
