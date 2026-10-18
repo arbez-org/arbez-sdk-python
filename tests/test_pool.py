@@ -420,7 +420,7 @@ def test_child_attach_keeps_the_parent_tracker_entry(tmp_path: Any) -> None:
 def _quiet_pool(monkeypatch: pytest.MonkeyPatch) -> EnginePool:
     """A pool that does not spawn. Capacity failures are decided in-process."""
     pool = _pool()
-    monkeypatch.setattr(pool, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(pool, "_ensure_worker", lambda *_args: None)
 
     class _Conn:
         def send(self, _message: object) -> None:
@@ -1357,7 +1357,7 @@ def test_shared_memory_create_oserror_is_a_crash_result(
     import arbez.engines._pool as pool_mod
 
     pool = _pool()
-    monkeypatch.setattr(pool, "_ensure_worker", lambda: None)
+    monkeypatch.setattr(pool, "_ensure_worker", lambda *_args: None)
     pool._conn = _SilentConn()  # type: ignore[assignment]
     pool._proc = _AliveUntilKill()  # type: ignore[assignment]
 
