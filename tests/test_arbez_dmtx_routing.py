@@ -308,3 +308,44 @@ def test_no_libdmtx_call_when_zxing_succeeds(
     assert dm_out.extras["decoder"] == "zxing"
     assert dm_out.extras["decode_stage"] == "tight"
     assert dmtx_calls == []  # libdmtx never touched
+
+
+def test_libdmtx_error_keeps_barcodes_already_decoded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raised libdmtx call misses that crop and leaves the other boxes."""
+    from arbez.exceptions import EngineRuntimeError
+
+    engine = ArbezEngine(decode=True)
+    engine._zxing_module = object()
+    engine._zxing_probed = True
+    engine._dmtx_decode = lambda *_a, **_k: None
+    engine._dmtx_probed = True
+
+    def decode_one(*_a: object, **_k: object) -> tuple[str | None, str | None, Symbology | None]:
+        det = _a[3]
+        assert isinstance(det, RawDetection)
+        if det.class_id == _CLASS_QR:
+            return ("QR-KEEP", "tight", Symbology.QR)
+        return (None, None, None)
+
+    monkeypatch.setattr(engine, "_decode_one", decode_one)
+
+    def boom(*_a: object, **_k: object) -> None:
+        raise EngineRuntimeError("worker was not ready within 120s")
+
+    monkeypatch.setattr(ArbezEngine, "_dmtx_decode_one", staticmethod(boom))
+
+    img = Image.new("RGB", (300, 300), "white")
+    dm = RawDetection(
+        x1=20.0, y1=20.0, x2=140.0, y2=140.0, score=0.9, class_id=_CLASS_DATAMATRIX,
+    )
+    qr = RawDetection(
+        x1=160.0, y1=160.0, x2=280.0, y2=280.0, score=0.9, class_id=_CLASS_QR,
+    )
+    dets = engine._decode_detections([dm, qr], img)
+    by_class = {d.extras["model_class_id"]: d for d in dets}
+    assert by_class[_CLASS_QR].payload == "QR-KEEP"
+    assert by_class[_CLASS_QR].extras["decoder"] == "zxing"
+    assert by_class[_CLASS_DATAMATRIX].payload is None
+    assert by_class[_CLASS_DATAMATRIX].extras["decoder"] == "none"
