@@ -96,6 +96,9 @@ schedule + macOS's malloc-reclamation timing.
 | `consensus` | `1` | Integer agreement threshold. `1` (the default) = **union** — keep any code that any participating engine detected. `N > 1` = keep only codes that **>= N engines agree on**, clustered per detected code via IoU. Greater than the number of participating engines raises `ValueError`. |
 | `model` | `None` | Reserved for `Scanner`-level model paths. Today passing anything other than `None` raises `NotImplementedError`. For an actual user-supplied model use `ArbezEngine(model_path=...)` directly. Keyword-only. |
 | `iou_threshold` | `0.5` | On the multi-engine path, bbox IoU >= this value groups detections from different engines as the same physical barcode. Out-of-range values (outside `[0, 1]`) raise `ValueError` at construction. Keyword-only. |
+| `symbologies` | `None` | Allow-list of `Symbology` members or value strings (`{"qr"}`, `{Symbology.QR}`). `None` does not filter. Mapped onto zxing formats and Apple Vision's request, then enforced after consensus on the **decoding** engine's symbology, not the voted cluster label (S-099). A kept cluster is labelled with that symbology when a payload is present. A bare string or a single `Symbology` raises `TypeError`. An empty iterable raises `ValueError`. A prebuilt `engine=` instance is not rebuilt with these flags, including after `close()`; `scan` still filters. Keyword-only. |
+| `micro_qr` | `False` | Also read Micro QR. With an allow-list, `MICRO_QR` is unioned in. Keyword-only. |
+| `rmqr` | `False` | Also read rMQR (zxing and the arbez crop decoder). Reported as `Symbology.QR`. Ignored when the allow-list excludes QR. Apple Vision has no rMQR symbology. Keyword-only. |
 
 **Properties:**
 
@@ -171,10 +174,12 @@ schedule + macOS's malloc-reclamation timing.
   `ArbezEngine(model_path=...)` directly).
 - `ValueError` — `consensus` greater than the number of participating
   engines, `consensus` combined with `engine=`, `engine=` combined
-  with `engines=`, `iou_threshold` outside `[0, 1]`, or empty
-  `engines` sequence.
+  with `engines=`, `iou_threshold` outside `[0, 1]`, empty
+  `engines` sequence, empty `symbologies`, or an unknown symbology
+  value string.
 - `TypeError` — `engine` is neither a string nor an `Engine` Protocol
-  instance.
+  instance; `micro_qr` / `rmqr` are not bools; or `symbologies` is a
+  bare string or a single `Symbology`.
 - `InvalidInputError` — `scan(image)` couldn't coerce `image` into a
   usable PIL image. Wraps the underlying error; chained via `__cause__`.
 - `EngineRuntimeError` — engine failed at scan time. In consensus
@@ -428,6 +433,13 @@ real confidence). zxing-cpp is a **core dependency** — it ships
 with the bare `pip install arbez`; the `[zxing]` extra remains as
 a no-op back-compat alias (S-034).
 
+QR requests `BarcodeFormat.QRCodeModel2`, not the QR family bit
+(S-099). Micro QR and rMQR are off unless `micro_qr=True` /
+`rmqr=True`, or `formats` names `Symbology.MICRO_QR`. An rMQR read
+is reported as `Symbology.QR`. `formats=[]` matches nothing.
+`formats=None` is every requestable symbology except those two
+opt-ins.
+
 ### `arbez.engines.wechat.WeChatEngine`
 
 ```python
@@ -508,6 +520,9 @@ bundled YOLOX-s + a user-trained YOLOX-s fine-tune) through one
 | `providers` | `None` (auto) | ORT execution-provider preference (`["CPUExecutionProvider"]`, `["CoreMLExecutionProvider"]`, etc.). `None` = auto-pick (CoreML+CPU on Mac, CUDA+CPU on Linux w/ [cuda], CPU otherwise). Keyword-only. |
 | `arch` | `None` (auto) | Architecture identifier — `"yolox_s"`, `"rtdetr_v2_r18vd"`, `"yolo11s"`, or any fuzzy-prefix-matched variant. `None` = auto-detect from the ONNX's `arbez_arch` metadata, falling back to `"yolox_s"`. Explicit value always wins. Keyword-only. |
 | `name` | `None` | Explicit instance name override. `None` = derive from arch (the back-compat default — `"arbez"` for yolox_s, etc.). Set explicitly when you need two same-architecture ArbezEngine instances to coexist in a single `run_consensus` call — e.g. bundled YOLOX-s + a user-trained YOLOX-s fine-tune. Keyword-only. |
+| `symbologies` | `None` | Allow-list for the crop decoder (S-099). `None` requests every zxing symbology except Micro QR and rMQR. Keyword-only. |
+| `micro_qr` | `False` | Also decode Micro QR crops. Keyword-only. |
+| `rmqr` | `False` | Also decode rMQR crops. Reported as `Symbology.QR`. Keyword-only. |
 
 **Properties:**
 
@@ -535,14 +550,16 @@ decodes, the symbology is the decoder's ECC-validated format (zxing-cpp's
 parsed format, or `DATA_MATRIX` for the libdmtx fallback), not the YOLOX
 detector's class — the detector both localizes and *guesses* a class, and the
 guess is unreliable on square 2D codes (e.g. a Data Matrix filed as "QR"). The
-detector's class is used only when nothing decodes (or the decoded format isn't
-one the SDK models).
+detector's class is used only when nothing the SDK models decoded. An
+unmapped zxing format is not published under that class.
 
 **Detection.extras** populated by this engine:
 
 - `decoder`: `"zxing"` (decoded by zxing-cpp), `"libdmtx"` (Data Matrix
   recovered by the arbez-dmtx fallback after zxing-cpp failed the crop,
-  S-092), or `"none"` (not decoded)
+  S-092), or `"none"` (not decoded). libdmtx runs for Data Matrix and
+  Aztec proposals only. It does not run on QR or Micro QR (S-099), and
+  it does not run when `symbologies` omits `DATA_MATRIX`.
 - `decode_stage`: present only when a payload was decoded — which strategy
   produced it: `"tight"` / `"medium"` / `"large"` / `"fallback"` (the staged
   zxing-cpp crops) or `"libdmtx"` (the S-092 Data Matrix fallback)
@@ -576,6 +593,7 @@ def run_consensus(
     *,
     min_votes: int = 2,
     iou_threshold: float = 0.5,
+    symbologies: Iterable[Symbology | str] | None = None,
 ) -> tuple[Detection, ...]: ...
 ```
 
@@ -596,11 +614,16 @@ Full deterministic field-by-field spec: see
    with the highest-score detection, absorb others with IoU >=
    threshold.
 3. **Vote filter** — keep clusters whose UNIQUE-engine count >=
-   `min_votes`.
+   `min_votes`. When `symbologies` is set (S-099), also drop a
+   cluster whose winning payload came from a symbology outside the
+   list. If nobody decoded, the voted label is used instead. When a
+   payload is present, the merged symbology is the winning decoder's.
+   `per_engine` is not filtered. `agreed_payloads` omits raw strings
+   from symbologies outside the list.
 4. **Aggregation**:
    - `bbox`: per-corner median
-   - `symbology`: most common (tiebreak: highest-score)
-   - `payload`: most-common non-None (tiebreak: highest-score)
+   - `symbology`: winning decoder when a payload is present; otherwise most common (tiebreak: score, then symbology value)
+   - `payload`: most common canonical form (tiebreak: score, then symbology value, then canonical string)
    - `score`: mean
    - `engine`: literal `"consensus"`
    - `extras`: `voted_by` (sorted tuple of engine names),
@@ -608,8 +631,11 @@ Full deterministic field-by-field spec: see
 
 **Raises:**
 
-- `ValueError` — empty `engines`, `min_votes < 1`, or
-  `iou_threshold` outside `[0, 1]`.
+- `ValueError` — empty `engines`, `min_votes < 1`,
+  `iou_threshold` outside `[0, 1]`, an empty `symbologies` list, or
+  an unknown symbology value string.
+- `TypeError` — `symbologies` is a bare string or a single
+  `Symbology`.
 
 ---
 

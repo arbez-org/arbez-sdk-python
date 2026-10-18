@@ -35,6 +35,7 @@ imports are function-local). Heavy bundle resolution (~500 ms) happens
 on the first scan or explicit :meth:`AppleVisionEngine.warmup`. The S-081
 init-time pyobjc probe is a sub-millisecond ``__import__`` check.
 """
+
 from __future__ import annotations
 
 import functools
@@ -170,15 +171,19 @@ def _vision_value_to_arbez() -> dict[str, Symbology]:
 # variants out of this set into first-class Symbology members; only
 # MSI Plessey (truly niche; no other engine surfaces it either)
 # remains.
-_OTHER_1D_VALUES: frozenset[str] = frozenset({
-    "VNBarcodeSymbologyMSIPlessey",
-})
+_OTHER_1D_VALUES: frozenset[str] = frozenset(
+    {
+        "VNBarcodeSymbologyMSIPlessey",
+    }
+)
 
 # Vision values we drop (no Arbez Symbology equivalent today).
 # S-036 promoted MicroQR out of this set into a first-class member.
-_DROP_VALUES: frozenset[str] = frozenset({
-    "VNBarcodeSymbologyMicroPDF417",
-})
+_DROP_VALUES: frozenset[str] = frozenset(
+    {
+        "VNBarcodeSymbologyMicroPDF417",
+    }
+)
 
 
 def _probe_pyobjc_or_raise() -> None:
@@ -291,7 +296,9 @@ class AppleVisionEngine:
         formats:
             Iterable of :class:`~arbez.Symbology` members to request.
             ``None`` (default) requests every symbology Vision supports.
-            See class docstring for the requestable set.
+            An empty iterable matches nothing: Vision treats an empty
+            symbology list as "all", so this engine does not pass that
+            list through (S-099). See class docstring for the requestable set.
         path_input_fast_path:
             **S-080.** When ``True`` (default), ``detect_and_decode``
             takes a CoreGraphics-native fast path for ``str`` / ``Path``
@@ -320,11 +327,12 @@ class AppleVisionEngine:
             from.
         """
         if formats is not None:
+            # Materialize once. A one-shot iterable is exhausted by
+            # validation, and the stored empty set is Vision's "all"
+            # if it later reaches setSymbologies_([]) (S-099).
+            requested = tuple(formats)
             arbez_to_names = _arbez_to_vision_names()
-            unsupported = [
-                s for s in formats
-                if s not in arbez_to_names or not arbez_to_names[s]
-            ]
+            unsupported = [s for s in requested if s not in arbez_to_names or not arbez_to_names[s]]
             if unsupported:
                 # Build a hint dynamically from which symbologies the
                 # user actually tripped over — pre-S-039 the message
@@ -343,15 +351,13 @@ class AppleVisionEngine:
                         "Vision returns UPC-A as a leading-zero EAN-13, "
                         "so request EAN_13 to surface UPC-A detections"
                     )
-                hint = " ".join(hints) if hints else (
-                    "the listed symbologies are not requestable as "
-                    "Vision detection formats."
+                hint = (
+                    " ".join(hints)
+                    if hints
+                    else ("the listed symbologies are not requestable as Vision detection formats.")
                 )
-                raise ValueError(
-                    f"AppleVisionEngine: {unsupported} not requestable. "
-                    f"{hint}"
-                )
-            self._formats: frozenset[Symbology] | None = frozenset(formats)
+                raise ValueError(f"AppleVisionEngine: {unsupported} not requestable. {hint}")
+            self._formats: frozenset[Symbology] | None = frozenset(requested)
         else:
             self._formats = None
 
@@ -407,6 +413,7 @@ class AppleVisionEngine:
         ``threading.Event`` and return immediately.
         """
         from arbez.engines.helpers import prewarm_pil
+
         self._prewarm_pyobjc()
         prewarm_pil()
 
@@ -431,15 +438,7 @@ class AppleVisionEngine:
 
     def detect_and_decode(
         self,
-        image: (
-            PILImage
-            | npt.NDArray[Any]
-            | str
-            | Path
-            | bytes
-            | bytearray
-            | IO[bytes]
-        ),
+        image: (PILImage | npt.NDArray[Any] | str | Path | bytes | bytearray | IO[bytes]),
     ) -> tuple[Detection, ...]:
         """Detect + decode every barcode in ``image`` via Apple Vision.
 
@@ -457,6 +456,12 @@ class AppleVisionEngine:
         promptly. Cost is microseconds; benefit is a real leak fix that helps any long-running Apple
         Vision user, not just the benchmark.
         """
+        # S-099: an empty symbology list is NOT "detect nothing". Vision
+        # treats setSymbologies_([]) as "every symbology". Match nothing
+        # here, after the input is validated, and never hand Vision [].
+        if self._formats is not None and len(self._formats) == 0:
+            coerce_to_pil(image)
+            return ()
         # ``objc`` is the pyobjc-core module; available iff pyobjc is
         # installed (which is required to even import this engine).
         import objc
@@ -474,11 +479,14 @@ class AppleVisionEngine:
         if self._path_input_fast_path and isinstance(image, (str, Path)):
             try:
                 from arbez.engines.formats import to_cgimage_from_path
+
                 cg_image_direct = to_cgimage_from_path(image)
             except Exception as e:
                 _log.debug(
                     "AppleVisionEngine: CGImage direct path failed for %r "
-                    "(%s); falling back to PIL coerce path.", image, e,
+                    "(%s); falling back to PIL coerce path.",
+                    image,
+                    e,
                 )
                 cg_image_direct = None
 
@@ -487,6 +495,7 @@ class AppleVisionEngine:
             # need a PIL.Image just for its .size. ``CGImageGetWidth``/
             # ``GetHeight`` are pure-Quartz, no PIL involvement.
             from Quartz import CGImageGetHeight, CGImageGetWidth
+
             width = int(CGImageGetWidth(cg_image_direct))
             height = int(CGImageGetHeight(cg_image_direct))
         else:
@@ -532,9 +541,7 @@ class AppleVisionEngine:
                 # err is an NSError* when ok is False. Surface its description
                 # rather than swallow — a real-world Vision failure here
                 # (out of memory, malformed image) should be loud.
-                raise EngineRuntimeError(
-                    f"VNImageRequestHandler.performRequests failed: {err}"
-                )
+                raise EngineRuntimeError(f"VNImageRequestHandler.performRequests failed: {err}")
 
             results = request.results() or []
             detections: list[Detection] = []
@@ -546,7 +553,10 @@ class AppleVisionEngine:
         detections.sort(key=lambda d: d.score, reverse=True)
         _log.debug(
             "Apple Vision scan: raw=%d kept=%d image=%dx%d",
-            len(results), len(detections), width, height,
+            len(results),
+            len(detections),
+            width,
+            height,
         )
         return tuple(detections)
 
@@ -586,6 +596,7 @@ class AppleVisionEngine:
                 CGImageSourceCreateImageAtIndex,
                 CGImageSourceCreateWithData,
             )
+
             _ = (NSData, CGImageSourceCreateImageAtIndex, CGImageSourceCreateWithData)
             vision = self._get_vision_module()
             # Force the Vision request + handler class loads too.
@@ -616,8 +627,10 @@ class AppleVisionEngine:
                 names.extend(arbez_to_names[sym])
             # The Vision constants in the Python binding ARE the
             # string values themselves — pass them directly. No
-            # need to look up the symbol by name.
-            req.setSymbologies_(names)
+            # need to look up the symbol by name. An empty list
+            # means every symbology; never pass that.
+            if names:
+                req.setSymbologies_(names)
         return req
 
     def _get_vision_module(self) -> Any:
@@ -673,7 +686,8 @@ class AppleVisionEngine:
         than re-fetched via ``_get_vision_module``.
         """
         return vision.VNImageRequestHandler.alloc().initWithCGImage_options_(
-            cg_image, None,
+            cg_image,
+            None,
         )
 
     @staticmethod
