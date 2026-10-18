@@ -180,7 +180,9 @@ schedule + macOS's malloc-reclamation timing.
 - `EngineRuntimeError` — engine failed at scan time. In consensus
   mode, single-engine failures are isolated (logged as WARNING; that
   engine's contribution is empty); only catastrophic dispatch
-  failures bubble up.
+  failures bubble up. A native crash or a deadline in a pooled
+  engine (WeChat, libdmtx) does not raise: the detection list is
+  empty and `Result.extras["engine_faults"]` records it.
 
 **Examples:**
 
@@ -256,6 +258,7 @@ class Result:
     image_size: tuple[int, int]
     timings_ms: dict[str, float] = field(default_factory=dict)
     per_engine: Mapping[str, tuple[Detection, ...]] = field(default_factory=dict)
+    extras: Mapping[str, object] = field(default_factory=dict)
 
     def __len__(self) -> int: ...
 ```
@@ -270,6 +273,7 @@ The full output of one `Scanner.scan()` call. Immutable.
 | `image_size` | `(width, height)` int | Input image dimensions in pixels. |
 | `timings_ms` | `dict[str, float]` | Per-stage wall-clock. Keys: `"engine"` (the single-engine path), `"consensus"` (the multi-engine path — bare `Scanner()` or `consensus=N`), `"preprocess"` (when `preprocess="auto"` triggers). Read-only `MappingProxyType` view. |
 | `per_engine` | `Mapping[str, tuple[Detection, ...]]` | Each engine's **own raw detections** — what it independently saw, before the merge — keyed by engine name. Always populated for every engine that ran (on the single-engine path, the one engine's key). Use it to see which engine contributed what, independent of the consensus merge. Read-only `MappingProxyType` view. |
+| `extras` | `Mapping[str, object]` | Scan-level notes (S-097). `isolation` maps an engine name to `"process"` or `"inprocess"`. `isolation_reason` is set only for an in-process fallback. `engine_faults` is a tuple of `{engine, kind, detail}` with `kind` `"crash"` or `"timeout"`. Empty keys are omitted. Read-only. |
 
 `len(result)` returns `len(result.detections)`.
 
@@ -369,7 +373,8 @@ your class doesn't need to inherit — just match the signature.
 - Raise `EngineUnavailable` if the underlying library isn't installed.
 - Raise `EngineRuntimeError` if the detector / decoder fails on this
   specific image. (An empty tuple is the correct return for "found
-  nothing".)
+  nothing".) A pooled native crash or deadline is that empty tuple,
+  not the exception; `Scanner` records it on `Result.extras`.
 
 **Example custom engine:**
 
@@ -876,7 +881,9 @@ output, decode error, image conversion failed, etc. Distinct from
 `RuntimeError`.
 
 Not raised for "found nothing" — that's an empty tuple from
-`detect_and_decode`.
+`detect_and_decode`. A native crash or a deadline in a pooled
+engine is also that empty tuple, recorded on `Result.extras`,
+not this exception.
 
 ### `InvalidInputError(ArbezError, ValueError)`
 
@@ -980,6 +987,7 @@ busy-scene recall.
 | Surface | Stable from | Promise |
 |---|---|---|
 | `Scanner.scan`, `Detection` / `Result` / `Symbology` fields | `0.1.0` | Names + signatures locked; additive changes only |
+| `Result.extras` keys `isolation`, `isolation_reason`, `engine_faults` | unreleased (0.3.0) | Additive. Omitted when empty. A pooled native crash or deadline is a fault entry, not an exception |
 | `Engine` Protocol | `0.1.0` | Method name + input union + return shape locked |
 | `coerce_to_pil` | `0.1.0` | Signature locked |
 | `cuda_is_available` / `coreml_is_available` / `execution_providers` | `0.1.0` | Return-type + caching contract |
