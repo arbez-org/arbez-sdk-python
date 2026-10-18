@@ -228,7 +228,10 @@ the explicit maintainer act of tagging is the gate.
   worker that dies or is not ready while loading is a crash or a
   timeout on `Result.extras`, and is not run in the caller. That
   startup failure is on the returned result and is not paid again for
-  later crops of the same image. The ready frame shares that budget.
+  later crops of the same image. The next image still calls libdmtx.
+  A replacement worker is a cold load: the call that lost the worker
+  returns after the kill, and the next call may use the 120 s startup
+  budget. The ready frame shares that budget.
   The worker exits if the parent dies. A failed spawn is the same
   contained miss. Creating the shared-memory segment can fail the same
   way.
