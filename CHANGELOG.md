@@ -50,7 +50,26 @@ the explicit maintainer act of tagging is the gate.
 
 ## Unreleased
 
+### Added
+
+* **Native engine isolation (S-097).** WeChat and the libdmtx Data Matrix
+  fallback run in a spawned worker, loaded once, with the image passed
+  through shared memory. The parent unlinks those segments. A crash or a
+  deadline kills the worker, starts another, and is recorded on
+  `Result.extras` (`isolation`, `isolation_reason`, `engine_faults`)
+  instead of raised. The deadline is 2 s on a direct engine call and 10 s
+  on `Scanner.scan`. `ARBEZ_ISOLATION=off`, a daemonic caller, Linux
+  without a writable `/dev/shm`, or a program with no
+  `if __name__ == "__main__"` guard runs the engine in-process. That
+  choice is logged once.
+
 ### Changed
+
+* **Direct WeChat calls use the 2 s deadline (S-097).** `Scanner.scan`
+  asks for 10 s, which covers the WeChat full-frame fallback (p95 about
+  1.95 s). A direct `WeChatEngine.detect_and_decode` that exceeds 2 s
+  comes back empty and sets `engine_faults` when a `Scanner` bound the
+  call. Scan through `Scanner` when that frame matters.
 
 * **WeChatEngine loads the vendored WeChat QR nets (S-096).**
   `detect.onnx` and `sr.onnx` ship in the package and are passed to
@@ -62,6 +81,28 @@ the explicit maintainer act of tagging is the gate.
   OpenCV 4 no longer satisfies the extra. The core numpy floor stays
   1.24. That pin and the OpenCV pin are installed separately, because
   OpenCV 5.0.0.93 does not resolve against numpy 1.24.
+
+### Fixed
+
+* **A libdmtx failure no longer drops barcodes already decoded on that
+  image (S-097).** A Python error from the pooled decoder is a miss for
+  that crop, and later crops of the same image still call libdmtx. A
+  worker that dies or is not ready while loading is a crash or a
+  timeout on `Result.extras`, and is not run in the caller. That
+  startup failure is on the returned result and is not paid again for
+  later crops of the same image. The next image still calls libdmtx.
+  A replacement worker is a cold load: the call that lost the worker
+  returns after the kill, and the next call may use the 120 s startup
+  budget. The ready frame shares that budget.
+  The worker exits if the parent dies. A failed spawn is the same
+  contained miss. Creating the shared-memory segment can fail the same
+  way.
+
+### Security
+
+* **A WeChat or libdmtx native crash no longer takes down the host**
+  when the isolation pool can run (S-097). The worker dies instead.
+  The in-process fallback cannot make that promise.
 
 ## 0.2.1 — 2026-10-16
 

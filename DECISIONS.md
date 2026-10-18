@@ -11,6 +11,60 @@ ID prefix is `S-` (for SDK).
 
 ---
 
+## S-097 — Native engines run in a spawned worker (2026-10-17)
+
+**Context.** A Python thread cannot stop a native crash or a native hang.
+WeChat has aborted the host with SIGBUS. zxing-cpp has hung the host on
+some ladder outputs. Forking a worker after Apple Vision or onnxruntime
+is already loaded segfaults that worker. Measured median cost of passing
+the image through shared memory into a fresh interpreter, on a 120-photo
+set, was +0.50 ms for WeChat and +0.22 ms for zxing.
+
+**Decision.** `EnginePool` loads an engine once in a `spawn` worker.
+`fork` is refused. The parent copies the image into
+`multiprocessing.shared_memory` and unlinks the segment after the reply,
+and after a kill. The default deadline is 2 s. `Scanner.scan` is maximum
+recall in this release (S-093), so it asks for 10 s. A crash or a
+deadline kills the worker, starts another, and is recorded on
+`Result.extras`. It is not raised. Python exceptions from the engine
+still propagate.
+
+The pool stays in-process, and logs that once, when `ARBEZ_ISOLATION=off`,
+when the caller is daemonic, when Linux has no writable `/dev/shm`, or
+when the program has no `if __name__ == "__main__"` guard. In-process
+mode cannot enforce a native deadline.
+
+`WeChatEngine` uses one pool per instance, and one call covers the ONNX
+pass and the no-argument full-frame fallback. The real libdmtx `decode`
+uses one process-global pool. Injected libdmtx doubles stay in-process.
+A worker that dies while the model is loading is not retried in-process.
+zxing-cpp is unchanged here.
+
+**Consequences.** A direct `WeChatEngine.detect_and_decode` can return
+nothing for a frame whose full-frame fallback exceeds 2 s. The same
+frame through `Scanner` gets 10 s. The measured fallback p95 is about
+1.95 s, under 10 s and close to 2 s. Callers who need the longer budget
+go through `Scanner`. The first time a worker loads, and every time
+a replacement loads, that wait uses a 120 s startup budget so a cold
+model import is not cut off by the 2 s decode deadline. The call that
+lost the worker returns after the kill. The next call pays the startup
+budget. A spawn that fails does not run the native engine in the caller.
+One startup failure is not paid again for
+later crops of the same image. That fact rides on the returned result,
+so another scan cannot clear it. A Python error from one libdmtx crop
+propagates out of the pool call and is a miss for that crop only; the
+detection loop catches it so barcodes already decoded stay, and later
+crops of the same image still call libdmtx. The ready wait's poll and
+its frame read share one budget. The worker exits when the parent dies,
+including after SIGKILL, so the child does not keep the resource-tracker
+fd. A cold start that fails is not sticky: `start` does not run the
+engine in this process, and the next call may use the 120 s budget
+again. `Result.extras` is read-only and additive:
+`isolation`, `isolation_reason` (only for a fallback), and
+`engine_faults` (`crash` or `timeout`).
+
+---
+
 ## S-096 — WeChatEngine loads vendored ONNX nets (2026-10-17)
 
 **Context.** `WeChatEngine` called `cv2.wechat_qrcode.WeChatQRCode()`

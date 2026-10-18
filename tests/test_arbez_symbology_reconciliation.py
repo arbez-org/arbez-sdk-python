@@ -67,7 +67,7 @@ def test_libdmtx_decode_forces_data_matrix(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(eng, "_decode_one", lambda zxing, pil, np_img, d: (None, None, None))
     monkeypatch.setattr(
         ArbezEngine, "_dmtx_decode_one",
-        staticmethod(lambda dmtx, pil, d: "DM-PAYLOAD"),
+        staticmethod(lambda dmtx, pil, d: ("DM-PAYLOAD", False)),
     )
     dets = eng._decode_detections([rd], _img())
     d = dets[0]
