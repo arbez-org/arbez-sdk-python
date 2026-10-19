@@ -11,7 +11,7 @@
 
 ## What it does
 
-- **Highest yield, out of the box.** `Scanner()` merges every engine's reads, surfacing codes no single engine finds on its own. On a 4,290-image real-world corpus it decoded **5,014 distinct codes and found at least one in 98% of images** — more than any single engine ([see the numbers ↓](#benchmarks)).
+- **Highest yield, out of the box.** `Scanner()` merges every engine's reads, surfacing codes no single engine finds on its own. On 4,276 photographs it decoded **5,026 distinct codes and found at least one in 4,230 of them** — more than any single engine ([see the numbers ↓](#benchmarks)).
 - **One install, every platform.** `pip install arbez` works on macOS, Linux, and Windows (Python 3.10 – 3.14) with **no system libraries to set up** — the engines, the bundled model, and the common image formats come in the wheels (HEIC / AVIF and WeChat are optional extras). Then it's one `Scanner()` call.
 - **Broad symbology coverage.** QR, Micro QR, Data Matrix, Aztec, PDF417, Code 128, Code 39, Code 93, EAN-13/8, UPC-A/E, GS1 DataBar, and a 1D catch-all out of the box — with ITF, Codabar and more surfaced by the zxing engine (a core dependency).
 - **Decoder-accurate symbology labels.** When a code decodes, its label is the decoder's **ECC-validated** format, not the detector's guess — so a decoded Data Matrix reads as Data Matrix, never "QR". (When nothing decodes, the detector's class is kept.)
@@ -76,50 +76,64 @@ res.per_engine["zxing"]    # any engine's own raw detections, for inspection
 
 ## Benchmarks
 
-**Across 4,290 images — 4,276 real-world natural-scene photographs plus 14 synthesized format probes — the default `Scanner()` (every installed engine, results unioned) decoded 5,014 distinct codes and found at least one in 98% of images: more than any single engine.** *A snapshot on one private corpus (macOS, all four engines) with default settings; these are decode-yield counts, not a human-labeled ground truth (see Limitations), and not a universal ranking.*
+**On 4,276 photographs the default `Scanner()` decoded 5,026 distinct codes and found at least one in 4,230 of them (98.9%).** *One pass, macOS, engines `arbez`, `apple_vision`, `zxing`, and `wechat`. These are decode-yield counts, not a human-labeled ground truth. Counting rules and the machine-readable snapshot: [docs/benchmarks/yield.md](docs/benchmarks/yield.md).*
 
 ### Yield by configuration
 
-Distinct codes decoded over 4,290 images (4,276 corpus + 14 synthesized exotic-format). `Scanner()` is the 0.2.0 default — the union of all installed engines; `consensus=N` keeps only codes that **≥ N engines agree on** (per detected code).
+Distinct payload strings from one `Scanner()` pass per photograph. `consensus=2` and `consensus=3` count payloads whose `vote_count` on that same pass was at least 2 or at least 3.
 
 | Configuration | Images with ≥1 code | Distinct codes decoded |
 |---|--:|--:|
-| **`Scanner()`** — all engines, union | **4,224  (98%)** | **5,014** |
-| `engine="apple_vision"` *(macOS-only)* | 4,188 | 4,932 |
-| `engine="zxing"` | 3,661 | 3,956 |
-| `engine="arbez"` *(bundled detector)* | 3,284 | 3,480 |
-| `engine="wechat"` *(QR-only)* | 2,226 | 2,084 |
-| `consensus=2` *(≥2 engines agree)* | 3,746 | 4,197 |
-| `consensus=3` *(≥3 engines agree)* | 3,043 | 3,093 |
+| **`Scanner()`** | **4,230** (98.9%) | **5,026** |
+| `engine="apple_vision"` | 4,175 | 4,930 |
+| `engine="zxing"` | 3,933 | 4,205 |
+| `engine="arbez"` | 3,291 | 3,482 |
+| `engine="wechat"` | 2,280 | 2,343 |
+| `consensus=2` | 3,805 | 4,265 |
+| `consensus=3` | 3,152 | 3,183 |
 
-`Scanner()` leads every configuration here — the union recovers codes any single engine alone misses (**+82 distinct** beyond the strongest macOS engine; likely more on Linux/Windows, where Apple Vision isn't available, though that isn't benchmarked here). `consensus=2`/`=3` trade yield for cross-engine agreement (precision).
+`Scanner()` returned 96 more distinct payloads than Apple Vision, the highest single engine on this pass. Linux and Windows were not measured.
 
 ### By symbology
 
-Distinct codes decoded by symbology — each engine's own decoded codes, by their (decoder-accurate) symbology. `Scanner()` ≥ every engine on each row. Different engines lead different symbologies — which is exactly why `Scanner()` unions them:
+Distinct payload strings by the decoder's symbology label. Bold in an engine column is the highest single-engine count on that row. A tie is bold on each tied engine. `Scanner()` meets or beats every single engine on every row below.
 
 | Symbology | arbez | Apple Vision | ZXing | WeChat | **`Scanner()`** |
 |---|--:|--:|--:|--:|--:|
-| QR | 2,355 | **2,357** | **2,357** | 2,084 | **2,385** |
-| Code 128 | 635 | **1,564** | 996 | – | **1,583** |
-| Data Matrix | 322 | **505** | 254 | – | **517** |
-| Code 39 | 61 | **156** | 121 | – | **163** |
-| ITF | 17 | **154** | 100 | – | **156** |
-| PDF417 | 44 | **85** | 54 | – | **92** |
-| EAN-13 | 33 | **81** | 50 | – | **81** |
-| Aztec | 10 | **14** | 10 | – | **14** |
-| **Exclusive to engine** ¹ | 13 | 514 | 30 | 0 | — |
+| QR | 2,355 | 2,356 | **2,375** | 2,343 | **2,396** |
+| Code 128 | 631 | **1,565** | 1,124 | – | **1,591** |
+| Data Matrix | 327 | **504** | 280 | – | **516** |
+| Code 39 | 61 | **156** | 131 | – | **161** |
+| ITF | 16 | **154** | 139 | – | **158** |
+| PDF417 | 44 | **85** | 74 | – | **91** |
+| EAN-13 | 33 | **81** | 56 | – | **82** |
+| Aztec | 13 | **14** | **14** | – | **14** |
+| Code 93 | 3 | **16** | **16** | – | **17** |
+| EAN-8 | – | **6** | 1 | – | **6** |
+| UPC-E | – | **5** | – | – | **5** |
+| Codabar | – | – | **1** | – | **1** |
 
-*Bold (engine columns) = best single engine for that symbology. Symbology is decoder-accurate: arbez is both a detector and a decoder, and since v0.2.0 (S-094) it adopts the decoder's ECC-validated format as the label — so codes its detector had filed as "QR" but are really Data Matrix / ITF / Aztec are now labeled correctly. On this **macOS** host Apple Vision leads or ties most symbologies, but it is macOS-only; arbez and ZXing are the always-present **cross-platform** pair (bare `Scanner()` adds Apple Vision automatically on macOS). The headline is the union: `Scanner()` meets or beats every single engine on every symbology.*
-
-¹ **Exclusive to engine** = distinct codes whose merged cluster in the `Scanner()` result was agreed by **only that engine** (its `extras["voted_by"]` tuple names just that one engine) — i.e. what the union would lose if you dropped it. Of the 5,014 union codes, **557 are single-engine and 4,457 are corroborated by ≥2 engines**. WeChat's **0** is honest: every QR it read, another engine read too (it is QR-only, and the others are already strong on QR), so it earns its slot on agreement/precision rather than unique yield. Apple Vision's 514 is mostly the 1D linear family on this macOS host; on Linux/Windows, where it is unavailable, the always-present cross-platform pair (arbez + ZXing) carries the union. *(This counts a physical code once via spatial clustering, so it does not double-count the same code read with slightly different bytes by two engines — a raw payload-hash basis would inflate every engine's "exclusive" count roughly 2×.)*
+WeChat read QR only on this pass (2,343 distinct payloads). The 14 synthesized format probes from the June 2026 note were not in this directory, so they are not in these counts.
 
 ### Methodology
 
-- **Corpus:** 4,276 real-world natural-scene photographs spanning 1D and 2D symbologies under varied lighting, angle, focus, and clutter — plus 14 synthesized images that exercise the exotic input formats (HEIC, AVIF, WebP, BMP, TIFF, GIF) end to end.
-- **Configurations:** each engine alone, `Scanner()` (all installed engines, union), and `consensus=2` / `consensus=3`. All seven derive from a **single scan per image** — `Scanner()` runs every engine once, `Result.per_engine` exposes each engine's own detections, and the consensus thresholds re-vote those cached detections — so the configurations are exactly comparable.
-- **Metric:** **distinct codes decoded** = distinct decoded payloads (deduplicated by hash). "Images with ≥1 code" = images where the configuration decoded at least one payload. These are decode-**yield** counts.
-- **Environment:** a fresh `pip install arbez[all]`, Python 3.12, Apple Silicon (macOS arm64), arbez 0.2.0. **Date:** 2026-06-17 — every number above comes from one consistent corpus pass.
+- **Corpus:** 4,276 photographs. Formats, counted with the suffixes the run accepted:
+
+  | Format | Files |
+  |---|--:|
+  | .jpg | 1,944 |
+  | .jpeg | 1,350 |
+  | .png | 951 |
+  | .heic | 15 |
+  | .tif | 14 |
+  | .gif | 1 |
+  | .tiff | 1 |
+
+- **Absent:** 14 synthesized format probes. They were not scanned. Their older totals are not carried forward.
+- **Configurations:** one `Scanner()` call per file. The four engines above loaded. `per_engine` supplies each engine row. `consensus=2` and `consensus=3` read `vote_count` from that same call.
+- **Metric:** a distinct code is one payload string. An image counts when the configuration had at least one payload. A misread still counts. This is yield, not a check against printed text.
+- **Environment:** commit `3d4ab0fd774ee8b3d075103f717adb8396e18013`, package version 0.2.1, Python 3.13.14, macOS arm64. **Date:** 2026-10-18. Timeouts: 0. Errors: 0.
+- **Source:** [docs/benchmarks/yield-snapshot.json](docs/benchmarks/yield-snapshot.json). The numbers above are that file.
 
 ### Reproduce
 

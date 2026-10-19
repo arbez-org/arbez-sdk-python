@@ -119,6 +119,16 @@ the explicit maintainer act of tagging is the gate.
 
 ### Changed
 
+* **README yield snapshot is the 4,276-photograph pass (2026-10-18).**
+  The previous table said 4,290 images and 5,014 codes. That count
+  included 14 synthesized probes that were not in the scanned
+  directory, so those figures are removed rather than reused. This
+  pass, commit `3d4ab0f`, bare `Scanner()` on macOS: 5,026 distinct
+  payloads, a code in 4,230 photographs, 0 timeouts. The counting
+  rules and the pinned numbers are `docs/benchmarks/yield.md` and
+  `docs/benchmarks/yield-snapshot.json`. The README copies that file,
+  and `tests/test_readme_benchmark.py` fails when they diverge.
+
 * **Concurrent scans on one `ZXingEngine` share one worker (S-098).**
   The instance stays safe to share. Native reads queue when isolation is
   on. Separate instances each have a worker. The in-process fallback
