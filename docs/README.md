@@ -18,6 +18,7 @@ QR detector.
 | Drop in my own trained weights (YOLOX-S / RT-DETR / YOLO11-s) | [Bring your own weights](bring-your-own-weights.md) |
 | Debug an install or runtime issue | [Troubleshooting](troubleshooting.md) |
 | Profile latency / find hotspots | [Profiling](profiling.md) |
+| See where the README yield numbers come from | [Yield snapshot](benchmarks/yield.md) |
 | Understand *why* the SDK is shaped this way | [`DECISIONS.md`](../DECISIONS.md) (newest first) |
 | See what changed in a release | [`CHANGELOG.md`](../CHANGELOG.md) |
 | Contribute | [`CONTRIBUTING.md`](../CONTRIBUTING.md) |

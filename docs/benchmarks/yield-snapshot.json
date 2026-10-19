@@ -1,0 +1,95 @@
+{
+  "commit": "3d4ab0fd774ee8b3d075103f717adb8396e18013",
+  "measured_on": "2026-10-18",
+  "python": "3.13.14",
+  "package_version": "0.2.1",
+  "platform": "macOS arm64",
+  "call": "Scanner()",
+  "photos": 4276,
+  "probes_absent": 14,
+  "timeouts": 0,
+  "errors": 0,
+  "formats": {
+    ".jpg": 1944,
+    ".jpeg": 1350,
+    ".png": 951,
+    ".tif": 14,
+    ".heic": 15,
+    ".gif": 1,
+    ".tiff": 1
+  },
+  "engines": ["arbez", "apple_vision", "zxing", "wechat"],
+  "yield": {
+    "scanner": {"images": 4230, "distinct": 5026},
+    "apple_vision": {"images": 4175, "distinct": 4930},
+    "zxing": {"images": 3933, "distinct": 4205},
+    "arbez": {"images": 3291, "distinct": 3482},
+    "wechat": {"images": 2280, "distinct": 2343},
+    "consensus2": {"images": 3805, "distinct": 4265},
+    "consensus3": {"images": 3152, "distinct": 3183}
+  },
+  "symbology": {
+    "scanner": {
+      "aztec": 14,
+      "codabar": 1,
+      "code_128": 1591,
+      "code_39": 161,
+      "code_93": 17,
+      "data_matrix": 516,
+      "ean_13": 82,
+      "ean_8": 6,
+      "itf": 158,
+      "pdf417": 91,
+      "qr": 2396,
+      "upc_e": 5
+    },
+    "apple_vision": {
+      "aztec": 14,
+      "code_128": 1565,
+      "code_39": 156,
+      "code_93": 16,
+      "data_matrix": 504,
+      "ean_13": 81,
+      "ean_8": 6,
+      "itf": 154,
+      "pdf417": 85,
+      "qr": 2356,
+      "upc_e": 5
+    },
+    "zxing": {
+      "aztec": 14,
+      "codabar": 1,
+      "code_128": 1124,
+      "code_39": 131,
+      "code_93": 16,
+      "data_matrix": 280,
+      "ean_13": 56,
+      "ean_8": 1,
+      "itf": 139,
+      "pdf417": 74,
+      "qr": 2375
+    },
+    "arbez": {
+      "aztec": 13,
+      "code_128": 631,
+      "code_39": 61,
+      "code_93": 3,
+      "data_matrix": 327,
+      "ean_13": 33,
+      "itf": 16,
+      "pdf417": 44,
+      "qr": 2355
+    },
+    "wechat": {
+      "qr": 2343
+    }
+  },
+  "exclusive": {
+    "apple_vision": 410,
+    "arbez": 11,
+    "wechat": 3,
+    "zxing": 31
+  },
+  "single_engine_payloads": 455,
+  "corroborated_payloads": 4265
+}
