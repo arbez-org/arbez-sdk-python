@@ -290,7 +290,7 @@ jobs:
         # SHA-pinned (not tag-pinned): this job holds ``id-token: write``,
         # so the action it hands the OIDC token to is pinned to an exact,
         # immutable commit for supply-chain safety.
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
         with:
           repository-url: https://test.pypi.org/legacy/
           # ``skip-existing: true`` makes re-runs idempotent if the same
@@ -319,7 +319,7 @@ jobs:
         # SHA-pinned (not tag-pinned): this job holds ``id-token: write``,
         # so the action it hands the OIDC token to is pinned to an exact,
         # immutable commit for supply-chain safety.
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # v1.14.2
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
         # No ``repository-url`` → action defaults to https://upload.pypi.org/legacy/
         with:
           # Tag publishes must be fresh — collisions on prod indicate
